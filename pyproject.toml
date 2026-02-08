@@ -34,6 +34,8 @@ classifiers = [
 ]
 keywords = ["machine-learning", "deep-learning", "vision", "ML", "DL", "AI", "DETR", "RF-DETR", "Roboflow"]
 
+# Note: supervision moved to the optional cv-deps group to avoid pulling
+# opencv-python-headless from PyPI (OpenCV is built from source in fletch).
 dependencies = [
     "requests",                        # weight download from remote URLs
     "torch>=2.2.0",                    # core tensor ops and model forward pass
@@ -41,11 +43,13 @@ dependencies = [
     "tqdm",                            # progress bars during weight download
     "transformers>=5.1.0,<6.0.0",     # DINOv2 backbone loading
     "pydantic>=2.0,<3",               # ModelConfig / TrainConfig validation
-    "supervision",                     # inference output (Detections, Masks)
     "pyDeprecate>=0.6,<0.8",             # deprecation warnings for legacy APIs; >=0.6 for deprecated_class
 ]
 
 [project.optional-dependencies]
+cv-deps = [
+    "supervision",                     # inference output (Detections, Masks); pulls opencv-python-headless
+]
 lora = [
     "peft",                            # LoRA backbone fine-tuning
 ]
