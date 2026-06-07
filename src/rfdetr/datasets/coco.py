@@ -181,6 +181,18 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             self.label2cat = None
         self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
 
+    def _load_image(self, id: int) -> Image.Image:
+        # Override torchvision's RGB-forcing loader so imagery with an appended
+        # motion/flow channel (saved as 4-channel RGBA) keeps all its channels.
+        # Standard 3-channel imagery is still returned as RGB.
+        path = self.coco.loadImgs(id)[0]["file_name"]
+        image = Image.open(str(Path(self.root) / path))
+        if image.mode in ("RGBA", "LA", "CMYK") or (
+            image.mode == "P" and "transparency" in image.info
+        ):
+            return image.convert("RGBA")
+        return image.convert("RGB")
+
     def __getitem__(self, idx: int) -> Tuple[Any, Any]:
         img, target = super(CocoDetection, self).__getitem__(idx)
         image_id = self.ids[idx]

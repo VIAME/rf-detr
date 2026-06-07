@@ -43,12 +43,26 @@ class Normalize(object):
         mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
         std: Tuple[float, ...] = (0.229, 0.224, 0.225),
     ) -> None:
-        self._normalize = _TVNormalize(mean, std)
+        self._mean = tuple(mean)
+        self._std = tuple(std)
+        # Built lazily per channel count so that >3-channel inputs (e.g. RGB
+        # plus an appended motion/flow channel) reuse the RGB statistics by
+        # cycling, matching how RFDETR extends means/stds for inference.
+        self._normalizers: Dict[int, Any] = {}
+
+    def _normalizer_for(self, channels: int) -> Any:
+        if channels not in self._normalizers:
+            from itertools import cycle, islice
+
+            mean = list(islice(cycle(self._mean), channels))
+            std = list(islice(cycle(self._std), channels))
+            self._normalizers[channels] = _TVNormalize(mean, std)
+        return self._normalizers[channels]
 
     def __call__(
         self, image: torch.Tensor, target: Optional[Dict[str, Any]] = None
     ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
-        image = self._normalize(image)
+        image = self._normalizer_for(image.shape[-3])(image)
         if target is None:
             return image, None
         target = target.copy()
