@@ -359,6 +359,25 @@ class SetCriterion(nn.Module):
         Expects outputs to contain 'pred_masks' of shape [B, Q, H, W] and targets with key 'masks'.
         """
         assert "pred_masks" in outputs, "pred_masks missing in model outputs"
+
+        # Cap matched instances per image used for the mask loss to bound GPU
+        # memory on densely-annotated imagery: the mask-loss tensors scale with
+        # the number of matched objects per image and OOM on dense chips (e.g.
+        # sea-lion colony tiles with hundreds of animals), independent of input
+        # resolution or batch size. Box/classification losses are unaffected.
+        # Off by default (0); enable by setting RFDETR_MAX_MASK_INSTANCES.
+        import os
+        _max_mi = int(os.environ.get("RFDETR_MAX_MASK_INSTANCES", "0"))
+        if _max_mi > 0:
+            _capped = []
+            for _s, _t in indices:
+                if _s.numel() > _max_mi:
+                    _perm = torch.randperm(_s.numel(), device=_s.device)[:_max_mi]
+                    _capped.append((_s[_perm], _t[_perm]))
+                else:
+                    _capped.append((_s, _t))
+            indices = _capped
+
         idx = self._get_src_permutation_idx(indices)
         pred_masks = outputs["pred_masks"]  # [B, Q, H, W]
 
