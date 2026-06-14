@@ -712,7 +712,7 @@ class TrainConfig(BaseModel):
     # Single-machine DDP users should leave this at 1 (the default).
     num_nodes: int = 1
     fp16_eval: bool = False
-    lr_scheduler: Literal["step", "cosine"] = "step"
+    lr_scheduler: Literal["step", "cosine", "multistep"] = "step"
     lr_min_factor: float = 0.0
     dont_save_weights: bool = False
     # PTL runtime/perf tuning knobs.

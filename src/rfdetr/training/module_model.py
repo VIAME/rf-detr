@@ -272,6 +272,11 @@ class RFDETRModelModule(LightningModule):
             if tc.lr_scheduler == "cosine":
                 progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
                 return tc.lr_min_factor + (1 - tc.lr_min_factor) * 0.5 * (1 + math.cos(math.pi * progress))
+            if tc.lr_scheduler == "multistep":
+                # Recurring step decay: drop by 10× every `lr_drop` epochs
+                # (StepLR-style, vs the single drop of the "step" schedule).
+                interval_steps = max(1, tc.lr_drop * steps_per_epoch)
+                return 0.1 ** (current_step // interval_steps)
             # Step decay: drop by 10× after lr_drop epochs.
             if current_step < tc.lr_drop * steps_per_epoch:
                 return 1.0
