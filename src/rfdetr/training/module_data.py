@@ -308,9 +308,16 @@ class RFDETRDataModule(LightningDataModule):
         Returns:
             DataLoader for the validation dataset with sequential sampling.
         """
+        # Segmentation validation cannot batch images with differing mask counts
+        # (the matcher raises a size-mismatch), so pin val to batch 1 for seg.
+        # This lets training use batch_size > 1 independently of validation.
+        val_batch_size = (
+            1 if getattr(self.model_config, "segmentation_head", False)
+            else self.train_config.batch_size
+        )
         return DataLoader(
             self._dataset_val,
-            batch_size=self.train_config.batch_size,
+            batch_size=val_batch_size,
             sampler=torch.utils.data.SequentialSampler(self._dataset_val),
             drop_last=False,
             collate_fn=self._collate_fn,
