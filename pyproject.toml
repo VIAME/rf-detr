@@ -43,7 +43,7 @@ dependencies = [
     "tqdm",                            # progress bars during weight download
     "transformers>=5.1.0,<6.0.0",     # DINOv2 backbone loading
     "pydantic>=2.0,<3",               # ModelConfig / TrainConfig validation
-    "pyDeprecate>=0.6,<0.8",             # deprecation warnings for legacy APIs; >=0.6 for deprecated_class
+    "pyDeprecate>=0.9,<0.10",            # deprecation warnings; >=0.9 keeps deprecated_class and re-exports TargetMode (supervision needs it)
 ]
 
 [project.optional-dependencies]
