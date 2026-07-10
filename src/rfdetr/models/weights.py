@@ -30,13 +30,52 @@ from rfdetr.utilities.state_dict import _ckpt_args_get, validate_checkpoint_comp
 
 logger = get_logger()
 
-__all__ = ["load_pretrain_weights", "apply_lora", "interpolate_position_embeddings"]
+__all__ = ["load_pretrain_weights", "apply_lora", "interpolate_position_embeddings", "adapt_input_channels"]
 
 _PE_KEY_SUFFIX = "embeddings.position_embeddings"
 
 # Query-related parameters that LWDETR packs as nn.Embedding(num_queries * group_detr, ...).
 # Any new query parameter packed the same way must be added here.
 _QUERY_PARAM_SUFFIXES: tuple[str, ...] = ("refpoint_embed.weight", "query_feat.weight")
+
+
+def _adapt_input_conv(num_channels: int, conv_weight: torch.Tensor) -> torch.Tensor:
+    """Adapt a 3-channel pretrained conv weight to ``num_channels`` input channels.
+
+    ``num_channels == 3`` returns the weight unchanged; ``== 1`` averages the 3
+    channels; otherwise the 3-channel pattern is tiled and scaled by
+    ``3 / num_channels`` to preserve activation magnitude.
+    """
+    if num_channels == 3:
+        return conv_weight
+    if num_channels == 1:
+        return conv_weight.mean(dim=1, keepdim=True)
+    repeats = (num_channels + 2) // 3
+    weight_out = torch.cat([conv_weight] * repeats, dim=1)[:, :num_channels]
+    return weight_out * (3.0 / num_channels)
+
+
+def adapt_input_channels(model: torch.nn.Module, num_channels: int) -> None:
+    """Adapt the DINOv2 patch-embedding projection to a non-RGB channel count.
+
+    Replaces the pretrained 3-channel projection with a ``num_channels``-input
+    Conv2d whose weights are tiled/scaled from the original. No-op for 3 channels.
+    Shared by the inference facade and the training LightningModule so both build
+    identical multi-channel stems.
+    """
+    if num_channels == 3:
+        return
+
+    import copy
+
+    patch_embeddings = model.backbone[0].encoder.encoder.embeddings.patch_embeddings
+    proj = patch_embeddings.projection
+    new_proj = copy.deepcopy(proj)
+    new_proj.in_channels = num_channels
+    new_proj.weight = torch.nn.Parameter(_adapt_input_conv(num_channels, proj.weight))
+    new_proj.weight.requires_grad = proj.weight.requires_grad
+    patch_embeddings.projection = new_proj
+    patch_embeddings.num_channels = num_channels
 
 
 def _slice_query_param_per_group(

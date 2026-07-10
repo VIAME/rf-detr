@@ -20,7 +20,7 @@ from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
-from rfdetr.models.weights import apply_lora, interpolate_position_embeddings, load_pretrain_weights
+from rfdetr.models.weights import adapt_input_channels, apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
 
@@ -52,6 +52,11 @@ class RFDETRModelModule(LightningModule):
             load_pretrain_weights(self.model, self.model_config)
         if model_config.backbone_lora:
             apply_lora(self.model)
+
+        # Adapt the patch-embedding stem for non-RGB inputs (e.g. RGB+flow). The
+        # model and pretrained weights are built for 3 channels; this tiles the
+        # projection to model_config.num_channels after loading.
+        adapt_input_channels(self.model, self.model_config.num_channels)
 
         # Build criterion/postprocessors after potential num_classes alignment so
         # they are constructed with a config that matches the current model head.
