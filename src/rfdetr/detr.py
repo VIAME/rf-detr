@@ -588,7 +588,7 @@ class RFDETR:
             block_size = self.model_config.patch_size * self.model_config.num_windows
             if _res_pair[0] % block_size or _res_pair[1] % block_size:
                 raise ValueError(
-                    f"resolution={_res_pair} is not divisible by "
+                    f"resolution={_resolution} is not divisible by "
                     f"patch_size ({self.model_config.patch_size}) * num_windows "
                     f"({self.model_config.num_windows}) = {block_size}. "
                     f"Choose a resolution whose height and width are both multiples of {block_size}."

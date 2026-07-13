@@ -19,6 +19,7 @@ from pytorch_lightning import LightningModule, seed_everything
 from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
+from rfdetr.utilities.shapes import as_pair
 from rfdetr.models.lwdetr import build_criterion_from_config, build_model_from_config
 from rfdetr.models.weights import adapt_input_channels, apply_lora, interpolate_position_embeddings, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
@@ -406,7 +407,10 @@ class RFDETRModelModule(LightningModule):
         if "state_dict" in checkpoint:
             interpolate_position_embeddings(
                 checkpoint["state_dict"],
-                self.model_config.pe_grid,
+                # as_pair rather than model_config.pe_grid: callers duck-type
+                # model_config (e.g. a SimpleNamespace), so this must not depend
+                # on the ModelConfig property.
+                as_pair(self.model_config.positional_encoding_size),
             )
 
         # Stash legacy EMA weights for RFDETREMACallback.setup(), which restores

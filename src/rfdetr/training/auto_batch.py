@@ -336,9 +336,13 @@ def resolve_auto_batch_config(
         )
         # Worst case is the largest *area*, not the largest single side — for a non-square
         # ladder the two can disagree, and area is what drives activation memory.
-        probe_resolution = max(scales, key=lambda hw: hw[0] * hw[1]) if scales else model_config.input_shape
+        # as_pair rather than model_config.input_shape: callers duck-type model_config
+        # (e.g. a SimpleNamespace), so this must not depend on the ModelConfig property.
+        probe_resolution = (
+            max(scales, key=lambda hw: hw[0] * hw[1]) if scales else as_pair(model_config.resolution)
+        )
     else:
-        probe_resolution = model_config.input_shape
+        probe_resolution = as_pair(model_config.resolution)
 
     max_targets_per_image = getattr(train_config, "auto_batch_max_targets_per_image", 100)
 

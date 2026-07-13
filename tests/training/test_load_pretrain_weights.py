@@ -40,7 +40,7 @@ from rfdetr.config import (
     RFDETRSmallConfig,
     TrainConfig,
 )
-from rfdetr.models.weights import load_pretrain_weights
+from rfdetr.models.weights import interpolate_position_embeddings, load_pretrain_weights
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -361,11 +361,16 @@ class TestLoadPretrainWeightsPEInterpolation:
             "BaseConfig's non-formula-derived PE must be the interpolation target."
         )
 
-    def test_non_square_source_pe_logs_warning_and_is_not_modified(self, monkeypatch):
-        """Non-square source PE grids are skipped with a warning and left unchanged.
+    def test_uninferable_source_pe_raises(self, monkeypatch):
+        """An un-inferable source PE grid raises rather than being skipped with a warning.
 
-        When ``n_source`` is not a perfect square the interpolation is skipped to avoid producing malformed embeddings.
-        The tensor must remain untouched and a warning must be emitted via the weights module logger.
+        When ``n_source`` is not a perfect square its (height, width) cannot be recovered from the token count alone, so
+        the interpolation cannot be done.  Previously this was skipped with a warning, which left the PE at the source
+        shape and then failed further downstream in ``load_state_dict`` with an opaque shape-mismatch ``RuntimeError``.
+        Failing here instead names the actual problem and points at ``source_pe_size``.
+
+        Note this is *not* the non-square-target path: a square source interpolating to a non-square target (the
+        1728x960 fine-tune) is supported and covered by ``test_square_source_to_non_square_target``.
         """
         mc = RFDETRNanoConfig(pretrain_weights="/fake/weights.pth", device="cpu")
         # positional_encoding_size=24 → n_target=576 (perfect square, so the
@@ -378,16 +383,28 @@ class TestLoadPretrainWeightsPEInterpolation:
         checkpoint = _make_checkpoint(num_classes=91)
         checkpoint["model"][PE_KEY] = original_pe.clone()
 
-        warning_calls: list[tuple] = []
-        monkeypatch.setattr("rfdetr.models.weights.logger.warning", lambda *a, **kw: warning_calls.append(a))
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
         fake_model = MagicMock()
-        load_pretrain_weights(fake_model, mc)
 
-        pe = checkpoint["model"][PE_KEY]
-        assert torch.equal(pe, original_pe), "Non-square source PE must not be modified."
-        assert any("not a perfect square" in str(args) for args in warning_calls), (
-            f"Expected a 'not a perfect square' warning; got calls: {warning_calls}"
+        with pytest.raises(ValueError, match="not a perfect square"):
+            load_pretrain_weights(fake_model, mc)
+
+    def test_square_source_to_non_square_target(self):
+        """A square checkpoint interpolates onto a non-square target grid.
+
+        This is the 1728x960 fine-tune path: COCO weights carry a square PE grid, and the model is built with a
+        non-square one.  The old sqrt-based reshape could not express the target grid at all.
+        """
+        dim = 384
+        src_grid, tgt_grid = 44, (60, 108)
+        state = {PE_KEY: torch.randn(1, src_grid * src_grid + 1, dim)}
+
+        interpolate_position_embeddings(state, tgt_grid)
+
+        expected_n = tgt_grid[0] * tgt_grid[1] + 1
+        assert state[PE_KEY].shape == torch.Size([1, expected_n, dim]), (
+            f"Expected PE interpolated onto the {tgt_grid} grid ([1, {expected_n}, {dim}]), "
+            f"got {tuple(state[PE_KEY].shape)}."
         )
 
 
