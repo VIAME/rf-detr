@@ -379,6 +379,22 @@ def _build_train_resize_config(
     return [{"OneOf": {"transforms": [option_a, option_b]}}]
 
 
+def _build_resize(config: List[Dict[str, Any]], image_set: str) -> List[Any]:
+    """Build the resize stage, refusing to return an empty pipeline.
+
+    :meth:`AlbumentationsWrapper.from_config` logs and skips transforms it cannot construct, which is tolerable for
+    augmentations but not for the resize: dropping it leaves images at their native size while boxes are normalised
+    against that size, so the model trains on a geometry inference never reproduces.
+    """
+    wrappers = AlbumentationsWrapper.from_config(config)
+    if not wrappers:
+        raise RuntimeError(
+            f"Resize stage for image_set={image_set!r} built zero transforms from {config!r}. Training without it "
+            "would feed the model images at their native size instead of the configured resolution."
+        )
+    return wrappers
+
+
 def make_coco_transforms(
     image_set: str,
     resolution: int,
@@ -453,8 +469,8 @@ def make_coco_transforms(
 
     if image_set == "train":
         resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = AlbumentationsWrapper.from_config(
-            _build_train_resize_config(scales, square=False, max_size=1333)
+        resize_wrappers = _build_resize(
+            _build_train_resize_config(scales, square=False, max_size=1333), image_set
         )
         pipeline = [*resize_wrappers]
         if not gpu_postprocess:
@@ -466,15 +482,16 @@ def make_coco_transforms(
         return Compose(pipeline)
 
     if image_set in ("val", "test"):
-        resize_wrappers = AlbumentationsWrapper.from_config(
+        resize_wrappers = _build_resize(
             [
                 {"SmallestMaxSize": {"max_size": resolution}},
                 {"LongestMaxSize": {"max_size": 1333}},
-            ]
+            ],
+            image_set,
         )
         return Compose([*resize_wrappers, to_image, to_float, normalize])
     if image_set == "val_speed":
-        resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
+        resize_wrappers = _build_resize([{"Resize": {"height": resolution, "width": resolution}}], image_set)
         return Compose([*resize_wrappers, to_image, to_float, normalize])
 
     raise ValueError(f"unknown {image_set}")
@@ -540,7 +557,7 @@ def make_coco_transforms_square_div_64(
 
     if image_set == "train":
         resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = AlbumentationsWrapper.from_config(_build_train_resize_config(scales, square=True))
+        resize_wrappers = _build_resize(_build_train_resize_config(scales, square=True), image_set)
         pipeline = [*resize_wrappers]
         if not gpu_postprocess:
             aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
@@ -551,7 +568,7 @@ def make_coco_transforms_square_div_64(
         return Compose(pipeline)
 
     if image_set in ("val", "test", "val_speed"):
-        resize_wrappers = AlbumentationsWrapper.from_config([{"Resize": {"height": resolution, "width": resolution}}])
+        resize_wrappers = _build_resize([{"Resize": {"height": resolution, "width": resolution}}], image_set)
         return Compose([*resize_wrappers, to_image, to_float, normalize])
 
     raise ValueError(f"unknown {image_set}")

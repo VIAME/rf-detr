@@ -160,6 +160,21 @@ def _is_geometric_transform(transform: alb.BasicTransform) -> bool:
     return False
 
 
+def _require_albumentations() -> None:
+    """Raise if ``albumentations`` is unavailable.
+
+    The resize to the model's training resolution is built through the same Albumentations config path as the
+    optional augmentations, so a missing install silently produces zero transforms: images then reach the model at
+    their native size while boxes are normalised against it, and the resulting geometry no longer matches what
+    inference feeds the network. Fail loudly instead.
+    """
+    if alb is None:
+        raise ImportError(
+            "albumentations is required to build the transform pipeline (it provides the resize to the model's "
+            "training resolution, not just augmentation). Install it with `pip install albumentations`."
+        )
+
+
 def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransform:
     """Build a single Albumentations transform from its name and parameter dict.
 
@@ -728,6 +743,8 @@ class AlbumentationsWrapper:
         if not entries:
             logger.warning("Empty augmentation config provided, no transforms will be applied")
             return []
+
+        _require_albumentations()
 
         transforms = []
         for entry in entries:
