@@ -156,7 +156,18 @@ class DinoV2(nn.Module):
         self._export = True
         shape = self.shape
 
-        pe_grid = self.encoder.embeddings.patch_grid_size
+        # The windowed encoder carries its PE grid explicitly; the stock HF encoder
+        # (use_windowed_attn=False) does not, but its grid is always square, so it
+        # can be recovered from the token count.
+        pe_grid = getattr(self.encoder.embeddings, "patch_grid_size", None)
+        if pe_grid is None:
+            num_positions = self.encoder.embeddings.position_embeddings.shape[1] - 1
+            side = int(round(num_positions ** 0.5))
+            assert side * side == num_positions, (
+                f"Cannot infer a square PE grid from {num_positions} tokens on a "
+                f"backbone without patch_grid_size"
+            )
+            pe_grid = (side, side)
 
         def make_new_interpolated_pos_encoding(position_embeddings, patch_size, height, width):
 
