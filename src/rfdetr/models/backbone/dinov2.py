@@ -5,7 +5,6 @@
 # ------------------------------------------------------------------------
 
 import json
-import math
 import os
 import types
 
@@ -19,6 +18,7 @@ from rfdetr.models.backbone.dinov2_with_windowed_attn import (
     WindowedDinov2WithRegistersConfig,
 )
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.shapes import as_pair
 
 logger = get_logger()
 
@@ -71,7 +71,7 @@ class DinoV2(nn.Module):
 
         name = f"facebook/dinov2-with-registers-{size}" if use_registers else f"facebook/dinov2-{size}"
 
-        self.shape = shape
+        self.shape = as_pair(shape)
         self.patch_size = patch_size
         self.num_windows = num_windows
 
@@ -101,15 +101,17 @@ class DinoV2(nn.Module):
             dino_config["out_features"] = [f"stage{i}" for i in out_feature_indexes]
             dino_config["drop_path_rate"] = drop_path_rate
 
-            implied_resolution = positional_encoding_size * patch_size
+            pe_height, pe_width = as_pair(positional_encoding_size)
+            implied_resolution = (pe_height * patch_size, pe_width * patch_size)
 
-            if implied_resolution != dino_config["image_size"]:
+            if implied_resolution != as_pair(dino_config["image_size"]):
                 logger.warning(
                     "Using a different number of positional encodings than DINOv2, which means"
                     " we're not loading DINOv2 backbone weights. This is not a problem if"
                     " finetuning a pretrained RF-DETR model."
                 )
-                dino_config["image_size"] = implied_resolution
+                # PatchEmbeddings accepts an (height, width) iterable, so a non-square grid works here.
+                dino_config["image_size"] = list(implied_resolution)
                 load_dinov2_weights = False
 
             if patch_size != 14:
@@ -154,9 +156,10 @@ class DinoV2(nn.Module):
         self._export = True
         shape = self.shape
 
+        pe_grid = self.encoder.embeddings.patch_grid_size
+
         def make_new_interpolated_pos_encoding(position_embeddings, patch_size, height, width):
 
-            num_positions = position_embeddings.shape[1] - 1
             dim = position_embeddings.shape[-1]
             height = height // patch_size
             width = width // patch_size
@@ -164,10 +167,9 @@ class DinoV2(nn.Module):
             class_pos_embed = position_embeddings[:, 0]
             patch_pos_embed = position_embeddings[:, 1:]
 
-            # Reshape and permute
-            patch_pos_embed = patch_pos_embed.reshape(
-                1, int(math.sqrt(num_positions)), int(math.sqrt(num_positions)), dim
-            )
+            # Reshape and permute using the explicit stored grid rather than sqrt(num_positions),
+            # which is only correct for a square grid.
+            patch_pos_embed = patch_pos_embed.reshape(1, pe_grid[0], pe_grid[1], dim)
             patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
 
             # Use bicubic interpolation, disabling antialias only on MPS devices
@@ -194,15 +196,21 @@ class DinoV2(nn.Module):
             )
         # Create a new Parameter with the new size
         old_interpolate_pos_encoding = self.encoder.embeddings.interpolate_pos_encoding
+        patch_size = self.encoder.config.patch_size
+        # The baked-in PE now lives on the export grid, not the grid it was constructed with.
+        exported_grid = (shape[0] // patch_size, shape[1] // patch_size)
 
         def new_interpolate_pos_encoding(self_mod, embeddings, height, width):
             num_patches = embeddings.shape[1] - 1
             num_positions = self_mod.position_embeddings.shape[1] - 1
-            if num_patches == num_positions and height == width:
+            # Match on the (h, w) grid, not just the token count — a transposed grid has the
+            # same number of tokens but different embeddings.
+            if num_patches == num_positions and (height // patch_size, width // patch_size) == exported_grid:
                 return self_mod.position_embeddings
             return old_interpolate_pos_encoding(embeddings, height, width)
 
         self.encoder.embeddings.position_embeddings = nn.Parameter(new_positions)
+        self.encoder.embeddings.patch_grid_size = exported_grid
         self.encoder.embeddings.interpolate_pos_encoding = types.MethodType(
             new_interpolate_pos_encoding, self.encoder.embeddings
         )

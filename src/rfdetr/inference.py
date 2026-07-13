@@ -31,7 +31,7 @@ class ModelContext:
         model: The underlying ``nn.Module`` (LWDETR instance).
         postprocess: PostProcess instance for converting raw outputs to boxes.
         device: Device the model lives on.
-        resolution: Input resolution (square side length in pixels).
+        resolution: Input resolution — a square side length, or an explicit (height, width).
         args: Namespace produced by :func:`build_namespace`.
         class_names: Optional list of class name strings loaded from checkpoint.
     """
@@ -41,7 +41,7 @@ class ModelContext:
         model: torch.nn.Module,
         postprocess: PostProcess,
         device: torch.device,
-        resolution: int,
+        resolution: int | tuple[int, int],
         args: Any,
         class_names: Optional[List[str]] = None,
     ) -> None:

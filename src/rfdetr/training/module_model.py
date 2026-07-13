@@ -406,7 +406,7 @@ class RFDETRModelModule(LightningModule):
         if "state_dict" in checkpoint:
             interpolate_position_embeddings(
                 checkpoint["state_dict"],
-                self.model_config.positional_encoding_size,
+                self.model_config.pe_grid,
             )
 
         # Stash legacy EMA weights for RFDETREMACallback.setup(), which restores

@@ -296,11 +296,15 @@ class Dinov2WithRegistersPatchEmbeddings(nn.Module):
 
         image_size = image_size if isinstance(image_size, collections.abc.Iterable) else (image_size, image_size)
         patch_size = patch_size if isinstance(patch_size, collections.abc.Iterable) else (patch_size, patch_size)
-        num_patches = (image_size[1] // patch_size[1]) * (image_size[0] // patch_size[0])
+        grid_size = (image_size[0] // patch_size[0], image_size[1] // patch_size[1])
+        num_patches = grid_size[0] * grid_size[1]
         self.image_size = image_size
         self.patch_size = patch_size
         self.num_channels = num_channels
         self.num_patches = num_patches
+        # Explicit (height, width) patch grid. Carried so the positional-encoding grid never
+        # has to be recovered from num_patches via sqrt, which is wrong for non-square inputs.
+        self.grid_size = grid_size
 
         self.projection = nn.Conv2d(num_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
 
@@ -333,6 +337,8 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         self.position_embeddings = nn.Parameter(torch.randn(1, num_patches + 1, config.hidden_size))
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.patch_size = config.patch_size
+        # (height, width) of the stored positional-encoding grid; see PatchEmbeddings.grid_size.
+        self.patch_grid_size = self.patch_embeddings.grid_size
         self.config = config
 
     def interpolate_pos_encoding(self, embeddings: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -347,8 +353,16 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         num_patches = embeddings.shape[1] - 1
         num_positions = self.position_embeddings.shape[1] - 1
 
-        # Skip interpolation for matching dimensions (unless tracing)
-        if not torch.jit.is_tracing() and num_patches == num_positions and height == width:
+        # Calculate new dimensions
+        height = height // self.config.patch_size
+        width = width // self.config.patch_size
+
+        pe_height, pe_width = self.patch_grid_size
+
+        # Skip interpolation when the requested grid already matches the stored one (unless tracing).
+        # Compare the (h, w) grid rather than the token count: a transposed grid (e.g. 60x108 vs
+        # 108x60) has an identical token count but entirely different positional embeddings.
+        if not torch.jit.is_tracing() and num_patches == num_positions and (height, width) == (pe_height, pe_width):
             return self.position_embeddings
 
         # Handle class token and patch embeddings separately
@@ -356,13 +370,9 @@ class WindowedDinov2WithRegistersEmbeddings(nn.Module):
         patch_pos_embed = self.position_embeddings[:, 1:]
         dim = embeddings.shape[-1]
 
-        # Calculate new dimensions
-        height = height // self.config.patch_size
-        width = width // self.config.patch_size
-
-        # Reshape for interpolation
-        sqrt_num_positions = torch_int(num_positions**0.5)
-        patch_pos_embed = patch_pos_embed.reshape(1, sqrt_num_positions, sqrt_num_positions, dim)
+        # Reshape for interpolation using the explicit stored grid. Deriving it as
+        # sqrt(num_positions) silently mis-reshapes whenever the grid is non-square.
+        patch_pos_embed = patch_pos_embed.reshape(1, torch_int(pe_height), torch_int(pe_width), dim)
         patch_pos_embed = patch_pos_embed.permute(0, 3, 1, 2)
 
         # Store original dtype for restoration after interpolation

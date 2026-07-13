@@ -28,6 +28,7 @@ from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
 from rfdetr.models import build_criterion_from_config
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.shapes import as_pair
 from rfdetr.utilities.tensors import NestedTensor
 
 logger = get_logger()
@@ -57,7 +58,7 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 def _make_synthetic_batch(
     micro_batch_size: int,
-    resolution: int,
+    resolution: int | tuple[int, int],
     device: torch.device,
     num_classes: int,
     segmentation_head: bool = False,
@@ -67,10 +68,14 @@ def _make_synthetic_batch(
     """Build a minimal (samples, targets) batch for probing.
 
     Uses max_targets_per_image targets per image so memory reflects worst-case matcher and loss. When segmentation_head
-    is True, each target dict includes "masks" of shape (max_targets_per_image, resolution, resolution).
+    is True, each target dict includes "masks" of shape (max_targets_per_image, height, width).
+
+    *resolution* may be a side length (square) or an explicit ``(height, width)``; the probe must
+    match the real input shape or it sizes the batch against the wrong memory footprint.
     """
-    tensors = torch.randn(micro_batch_size, num_channels, resolution, resolution, device=device)
-    mask = torch.zeros(micro_batch_size, resolution, resolution, dtype=torch.bool, device=device)
+    height, width = as_pair(resolution)
+    tensors = torch.randn(micro_batch_size, num_channels, height, width, device=device)
+    mask = torch.zeros(micro_batch_size, height, width, dtype=torch.bool, device=device)
     samples = NestedTensor(tensors, mask)
 
     max_label = max(0, num_classes - 1)
@@ -86,13 +91,13 @@ def _make_synthetic_batch(
             "boxes": boxes,
             "labels": labels,
             "image_id": torch.tensor(idx, dtype=torch.int64, device=device),
-            "orig_size": torch.tensor([resolution, resolution], dtype=torch.int64, device=device),
-            "size": torch.tensor([resolution, resolution], dtype=torch.int64, device=device),
+            "orig_size": torch.tensor([height, width], dtype=torch.int64, device=device),
+            "size": torch.tensor([height, width], dtype=torch.int64, device=device),
             "iscrowd": iscrowd,
             "area": area,
         }
         if segmentation_head:
-            t["masks"] = torch.zeros(n, resolution, resolution, dtype=torch.bool, device=device)
+            t["masks"] = torch.zeros(n, height, width, dtype=torch.bool, device=device)
         targets.append(t)
     return samples, targets
 
@@ -101,7 +106,7 @@ def _probe_step(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
     micro_batch_size: int,
-    resolution: int,
+    resolution: int | tuple[int, int],
     device: torch.device,
     num_classes: int,
     amp: bool,
@@ -152,7 +157,7 @@ def _probe_step(
 def probe_max_micro_batch(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
-    resolution: int,
+    resolution: int | tuple[int, int],
     device: torch.device,
     num_classes: int,
     amp: bool,
@@ -171,7 +176,7 @@ def probe_max_micro_batch(
     Args:
         model: The model to probe (will be set to train mode).
         criterion: The loss criterion (must match model output and target format).
-        resolution: Input spatial size (square).
+        resolution: Input spatial size — a side length (square) or ``(height, width)``.
         device: CUDA device to run on.
         num_classes: Number of classes (for synthetic targets).
         amp: Whether to use autocast for the forward.
@@ -329,9 +334,11 @@ def resolve_auto_batch_config(
             patch_size,
             num_windows,
         )
-        probe_resolution = max(scales) if scales else model_config.resolution
+        # Worst case is the largest *area*, not the largest single side — for a non-square
+        # ladder the two can disagree, and area is what drives activation memory.
+        probe_resolution = max(scales, key=lambda hw: hw[0] * hw[1]) if scales else model_config.input_shape
     else:
-        probe_resolution = model_config.resolution
+        probe_resolution = model_config.input_shape
 
     max_targets_per_image = getattr(train_config, "auto_batch_max_targets_per_image", 100)
 

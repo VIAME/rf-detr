@@ -13,6 +13,8 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticUndefined
 
+from rfdetr.utilities.shapes import as_pair
+
 EncoderName: TypeAlias = Literal["dinov2_windowed_small", "dinov2_windowed_base", "dinov2_registers_windowed_small"]
 
 
@@ -109,12 +111,15 @@ class ModelConfig(BaseConfig):
     pretrain_weights: Optional[str] = None
     # torch.device values are accepted at validation time and normalized to string.
     device: str = DEVICE
-    resolution: int
+    # Either a side length (square, the historical form) or an explicit (height, width).
+    # Both dims must be divisible by patch_size * num_windows.
+    resolution: int | tuple[int, int]
     group_detr: int = 13
     gradient_checkpointing: bool = False
     compile: bool = False
     fused_optimizer: bool = True
-    positional_encoding_size: int
+    # Patch grid: a side length (square) or an explicit (height, width) in patches.
+    positional_encoding_size: int | tuple[int, int]
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
@@ -184,9 +189,47 @@ class ModelConfig(BaseConfig):
         # Only update PE when the class default is formula-derived from the class
         # default resolution and patch size.
         if default_pe == default_resolution // default_patch_size:
-            self.positional_encoding_size = self.resolution // self.patch_size
+            height, width = as_pair(self.resolution)
+            pe_h, pe_w = height // self.patch_size, width // self.patch_size
+            # Keep the scalar form for square resolutions so existing configs and
+            # serialized checkpoints round-trip unchanged.
+            self.positional_encoding_size = pe_h if pe_h == pe_w else (pe_h, pe_w)
 
         return self
+
+    @model_validator(mode="after")
+    def _validate_shape_divisibility(self) -> "ModelConfig":
+        """Reject non-square input resolutions the windowed backbone cannot patch evenly.
+
+        The backbone partitions the input into ``num_windows`` x ``num_windows`` windows of whole patches, so each
+        spatial dim must be divisible by ``patch_size * num_windows``.  A non-square resolution makes this easy to get
+        subtly wrong (e.g. 720 is not divisible by 32) and the failure would otherwise surface deep in the backbone as
+        an assert, so catch it here.
+
+        Deliberately scoped to non-square resolutions only: square resolutions keep their historical behavior, where
+        divisibility is enforced by the backbone rather than the config.
+        """
+        if "resolution" not in self.model_fields_set or isinstance(self.resolution, int):
+            return self
+
+        block = self.patch_size * self.num_windows
+        height, width = as_pair(self.resolution)
+        if height % block or width % block:
+            raise ValueError(
+                f"resolution {(height, width)} must have both dims divisible by patch_size * num_windows"
+                f" = {block}. Nearest valid: {(round(height / block) * block, round(width / block) * block)}."
+            )
+        return self
+
+    @property
+    def input_shape(self) -> tuple[int, int]:
+        """Input resolution as an explicit ``(height, width)`` pair."""
+        return as_pair(self.resolution)
+
+    @property
+    def pe_grid(self) -> tuple[int, int]:
+        """Positional-encoding patch grid as an explicit ``(height, width)`` pair."""
+        return as_pair(self.positional_encoding_size)
 
     @model_validator(mode="after")
     def _warn_pretrain_compatibility(self) -> "ModelConfig":
@@ -408,8 +451,8 @@ class RFDETRBaseConfig(ModelConfig):
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
     out_feature_indexes: List[int] = [2, 5, 8, 11]
     pretrain_weights: Optional[str] = "rf-detr-base.pth"
-    resolution: int = 560
-    positional_encoding_size: int = 37
+    resolution: int | tuple[int, int] = 560
+    positional_encoding_size: int | tuple[int, int] = 37
 
 
 class RFDETRLargeDeprecatedConfig(RFDETRBaseConfig):
@@ -431,8 +474,8 @@ class RFDETRNanoConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 2
     patch_size: int = 16
-    resolution: int = 384
-    positional_encoding_size: int = 24
+    resolution: int | tuple[int, int] = 384
+    positional_encoding_size: int | tuple[int, int] = 24
     pretrain_weights: Optional[str] = "rf-detr-nano.pth"
 
 
@@ -443,8 +486,8 @@ class RFDETRSmallConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 3
     patch_size: int = 16
-    resolution: int = 512
-    positional_encoding_size: int = 32
+    resolution: int | tuple[int, int] = 512
+    positional_encoding_size: int | tuple[int, int] = 32
     pretrain_weights: Optional[str] = "rf-detr-small.pth"
 
 
@@ -455,8 +498,8 @@ class RFDETRMediumConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 16
-    resolution: int = 576
-    positional_encoding_size: int = 36
+    resolution: int | tuple[int, int] = 576
+    positional_encoding_size: int | tuple[int, int] = 36
     pretrain_weights: Optional[str] = "rf-detr-medium.pth"
 
 
@@ -473,9 +516,9 @@ class RFDETRLargeConfig(ModelConfig):
     projector_scale: List[Literal["P4",]] = ["P4"]
     out_feature_indexes: List[int] = [3, 6, 9, 12]
     num_classes: int = 90
-    positional_encoding_size: int = 704 // 16
+    positional_encoding_size: int | tuple[int, int] = 704 // 16
     pretrain_weights: Optional[str] = "rf-detr-large-2026.pth"
-    resolution: int = 704
+    resolution: int | tuple[int, int] = 704
     # Explicit so populate_args and _build_args_from_configs agree.
     # ModelConfig does not define these fields; without them the legacy path
     # picks up populate_args defaults (num_select=100) while the PTL path falls
@@ -490,8 +533,8 @@ class RFDETRSegPreviewConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 12
-    resolution: int = 432
-    positional_encoding_size: int = 36
+    resolution: int | tuple[int, int] = 432
+    positional_encoding_size: int | tuple[int, int] = 36
     num_queries: int = 200
     num_select: int = 200
     pretrain_weights: Optional[str] = "rf-detr-seg-preview.pt"
@@ -504,8 +547,8 @@ class RFDETRSegNanoConfig(RFDETRBaseConfig):
     num_windows: int = 1
     dec_layers: int = 4
     patch_size: int = 12
-    resolution: int = 312
-    positional_encoding_size: int = 312 // 12
+    resolution: int | tuple[int, int] = 312
+    positional_encoding_size: int | tuple[int, int] = 312 // 12
     num_queries: int = 100
     num_select: int = 100
     pretrain_weights: Optional[str] = "rf-detr-seg-nano.pt"
@@ -518,8 +561,8 @@ class RFDETRSegSmallConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 4
     patch_size: int = 12
-    resolution: int = 384
-    positional_encoding_size: int = 384 // 12
+    resolution: int | tuple[int, int] = 384
+    positional_encoding_size: int | tuple[int, int] = 384 // 12
     num_queries: int = 100
     num_select: int = 100
     pretrain_weights: Optional[str] = "rf-detr-seg-small.pt"
@@ -532,8 +575,8 @@ class RFDETRSegMediumConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 5
     patch_size: int = 12
-    resolution: int = 432
-    positional_encoding_size: int = 432 // 12
+    resolution: int | tuple[int, int] = 432
+    positional_encoding_size: int | tuple[int, int] = 432 // 12
     num_queries: int = 200
     num_select: int = 200
     pretrain_weights: Optional[str] = "rf-detr-seg-medium.pt"
@@ -546,8 +589,8 @@ class RFDETRSegLargeConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 5
     patch_size: int = 12
-    resolution: int = 504
-    positional_encoding_size: int = 504 // 12
+    resolution: int | tuple[int, int] = 504
+    positional_encoding_size: int | tuple[int, int] = 504 // 12
     num_queries: int = 200
     num_select: int = 200
     pretrain_weights: Optional[str] = "rf-detr-seg-large.pt"
@@ -560,8 +603,8 @@ class RFDETRSegXLargeConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 6
     patch_size: int = 12
-    resolution: int = 624
-    positional_encoding_size: int = 624 // 12
+    resolution: int | tuple[int, int] = 624
+    positional_encoding_size: int | tuple[int, int] = 624 // 12
     num_queries: int = 300
     num_select: int = 300
     pretrain_weights: Optional[str] = "rf-detr-seg-xlarge.pt"
@@ -574,8 +617,8 @@ class RFDETRSeg2XLargeConfig(RFDETRBaseConfig):
     num_windows: int = 2
     dec_layers: int = 6
     patch_size: int = 12
-    resolution: int = 768
-    positional_encoding_size: int = 768 // 12
+    resolution: int | tuple[int, int] = 768
+    positional_encoding_size: int | tuple[int, int] = 768 // 12
     num_queries: int = 300
     num_select: int = 300
     pretrain_weights: Optional[str] = "rf-detr-seg-xxlarge.pt"

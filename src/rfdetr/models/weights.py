@@ -26,6 +26,7 @@ from rfdetr.assets.model_weights import download_pretrain_weights, validate_pret
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.utilities.decorators import deprecated
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.shapes import as_pair as _as_pair
 from rfdetr.utilities.state_dict import _ckpt_args_get, validate_checkpoint_compatibility
 
 logger = get_logger()
@@ -237,7 +238,8 @@ def _warn_on_partial_load(incompatible: Any, pretrain_weights_path: str) -> None
 
 def interpolate_position_embeddings(
     checkpoint_state: dict,
-    pe_size: int,
+    pe_size: int | tuple[int, int],
+    source_pe_size: int | tuple[int, int] | None = None,
 ) -> None:
     """Interpolate DINOv2 positional embeddings in *checkpoint_state* to match *pe_size*.
 
@@ -248,12 +250,25 @@ def interpolate_position_embeddings(
     This function bicubic-interpolates every PE tensor in the checkpoint whose shape differs from the target grid,
     modifying *checkpoint_state* in-place before ``load_state_dict`` is called.
 
+    The target grid may be non-square (e.g. a 1728x960 input yields a 60x108 patch grid).  The source grid is
+    inferred as square from the checkpoint's token count unless *source_pe_size* is given; a non-square source grid
+    cannot be recovered from the token count alone, so it must be passed explicitly.
+
     Args:
         checkpoint_state: The ``"model"`` sub-dict from a loaded checkpoint.
-        pe_size: Target grid side length in patches (number of patches per spatial
-            dimension, assuming a square grid).  Typically ``model_config.positional_encoding_size``.
+        pe_size: Target patch grid, either a side length (square) or an explicit
+            ``(height, width)`` in patches.  Typically ``model_config.pe_grid``.
+        source_pe_size: Patch grid the checkpoint was trained with.  Required only when
+            the checkpoint itself has a non-square grid.
+
+    Raises:
+        ValueError: If the source grid cannot be inferred (token count is not a perfect
+            square and *source_pe_size* was not supplied).  Interpolating against a wrong
+            grid silently corrupts the positional embeddings, so this fails loudly rather
+            than skipping.
     """
-    n_target = pe_size * pe_size  # target number of patch tokens
+    h_tgt, w_tgt = _as_pair(pe_size)
+    n_target = h_tgt * w_tgt  # target number of patch tokens
 
     pe_keys = [k for k in checkpoint_state if k.endswith(_PE_KEY_SUFFIX)]
     for key in pe_keys:
@@ -262,23 +277,31 @@ def interpolate_position_embeddings(
         if n_source == n_target:
             continue  # no mismatch — skip
 
-        h_src = int(math.isqrt(n_source))
-        h_tgt = int(math.isqrt(n_target))
-        if h_src * h_src != n_source or h_tgt * h_tgt != n_target:
-            logger.warning(
-                f"Skipping PE interpolation for {key}:"
-                f" grid size is not a perfect square (source {n_source}, target {n_target}).",
-            )
-            continue
+        if source_pe_size is not None:
+            h_src, w_src = _as_pair(source_pe_size)
+            if h_src * w_src != n_source:
+                raise ValueError(
+                    f"source_pe_size {(h_src, w_src)} implies {h_src * w_src} patch tokens, but checkpoint"
+                    f" key {key!r} has {n_source}."
+                )
+        else:
+            h_src = w_src = int(math.isqrt(n_source))
+            if h_src * w_src != n_source:
+                raise ValueError(
+                    f"Cannot interpolate positional embeddings for {key!r}: the checkpoint's grid has"
+                    f" {n_source} patch tokens, which is not a perfect square, so its (height, width) cannot"
+                    f" be inferred. Pass source_pe_size explicitly. Refusing to continue, as loading"
+                    f" un-interpolated positional embeddings silently corrupts the model."
+                )
 
         dim = ckpt_pe.shape[-1]
         class_token = ckpt_pe[:, :1]  # [1, 1, dim] — keeps the sequence dimension
         patch_pe = ckpt_pe[:, 1:]  # [1, N_src, dim]
 
-        patch_pe = patch_pe.reshape(1, h_src, h_src, dim).permute(0, 3, 1, 2)  # [1, dim, H, W]
+        patch_pe = patch_pe.reshape(1, h_src, w_src, dim).permute(0, 3, 1, 2)  # [1, dim, H, W]
         patch_pe = F.interpolate(
             patch_pe.float(),
-            size=(h_tgt, h_tgt),
+            size=(h_tgt, w_tgt),
             mode="bicubic",
             align_corners=False,
             antialias=patch_pe.device.type != "mps",
@@ -287,10 +310,12 @@ def interpolate_position_embeddings(
 
         checkpoint_state[key] = torch.cat([class_token, patch_pe], dim=1)
         logger.debug(
-            "Interpolated positional embeddings %s: %s → %s.",
+            "Interpolated positional embeddings %s: %s → %s (grid %s → %s).",
             key,
             tuple(ckpt_pe.shape),
             tuple(checkpoint_state[key].shape),
+            (h_src, w_src),
+            (h_tgt, w_tgt),
         )
 
 
@@ -507,7 +532,7 @@ def load_pretrain_weights(
                 # multi-group training, so in practice they are all group_detr == 1.
                 checkpoint["model"][name] = tensor[: mc.num_queries * mc.group_detr]
 
-    interpolate_position_embeddings(checkpoint["model"], mc.positional_encoding_size)
+    interpolate_position_embeddings(checkpoint["model"], mc.pe_grid)
     incompatible = nn_model.load_state_dict(checkpoint["model"], strict=False)
     _warn_on_partial_load(incompatible, pretrain_weights)
 

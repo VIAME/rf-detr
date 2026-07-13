@@ -41,6 +41,7 @@ from rfdetr.inference import ModelContext, _build_model_context
 from rfdetr.utilities.decorators import deprecated
 from rfdetr.utilities.distributed import is_main_process
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.shapes import as_pair
 
 try:
     torch.set_float32_matmul_precision("high")
@@ -568,35 +569,47 @@ class RFDETR:
         _resolution = kwargs.pop("resolution", None)
         if _resolution is not None:
             if isinstance(_resolution, bool):
-                raise ValueError("resolution must be a positive integer")
+                raise ValueError("resolution must be a positive integer or an (height, width) pair")
             try:
+                # A single int stays an int so square configs serialize exactly as before;
+                # anything else must be a two-element (height, width) sequence.
                 _resolution = operator.index(_resolution)
-            except TypeError as error:
-                raise ValueError("resolution must be a positive integer") from error
-            if _resolution <= 0:
-                raise ValueError("resolution must be a positive integer")
+                _res_pair = (_resolution, _resolution)
+            except TypeError:
+                try:
+                    _res_pair = as_pair(_resolution)
+                    _resolution = _res_pair
+                except (TypeError, ValueError) as error:
+                    raise ValueError(
+                        "resolution must be a positive integer or an (height, width) pair"
+                    ) from error
+            if min(_res_pair) <= 0:
+                raise ValueError("resolution must be a positive integer or an (height, width) pair")
             block_size = self.model_config.patch_size * self.model_config.num_windows
-            if _resolution % block_size != 0:
+            if _res_pair[0] % block_size or _res_pair[1] % block_size:
                 raise ValueError(
-                    f"resolution={_resolution} is not divisible by "
+                    f"resolution={_res_pair} is not divisible by "
                     f"patch_size ({self.model_config.patch_size}) * num_windows "
                     f"({self.model_config.num_windows}) = {block_size}. "
-                    f"Choose a resolution that is a multiple of {block_size}."
+                    f"Choose a resolution whose height and width are both multiples of {block_size}."
                 )
             # Smart PE update: only recompute positional_encoding_size when the
             # current config derives it formulaically (PE == resolution // patch_size).
             # Configs with a pretrained-specific PE (e.g. RFDETRBase uses DINOv2's
             # PE=37 at 518 px, training at 560 px) must not have PE silently changed
             # — doing so causes shape mismatches when loading pretrained checkpoints.
-            _current_pe = self.model_config.positional_encoding_size
-            _derived_pe = self.model_config.resolution // self.model_config.patch_size
+            _current_pe = self.model_config.pe_grid
+            _cur_h, _cur_w = self.model_config.input_shape
+            _derived_pe = (_cur_h // self.model_config.patch_size, _cur_w // self.model_config.patch_size)
             if _current_pe == _derived_pe:
                 # Formula-derived: update PE proportionally to the new resolution.
-                new_pe = _resolution // self.model_config.patch_size
+                _pe_h = _res_pair[0] // self.model_config.patch_size
+                _pe_w = _res_pair[1] // self.model_config.patch_size
+                new_pe = _pe_h if _pe_h == _pe_w else (_pe_h, _pe_w)
                 self.model_config.positional_encoding_size = new_pe
             else:
                 # Pretrained-specific PE; leave it unchanged.
-                new_pe = _current_pe
+                new_pe = self.model_config.positional_encoding_size
             self.model_config.resolution = _resolution
 
             # Keep the cached inference/export context in sync with model_config so
@@ -776,8 +789,7 @@ class RFDETR:
                         torch.randn(
                             batch_size,
                             self.model_config.num_channels,
-                            self.model.resolution,
-                            self.model.resolution,
+                            *as_pair(self.model.resolution),
                             device=self.model.device,
                             dtype=dtype,
                         ),
@@ -786,7 +798,7 @@ class RFDETR:
                     self._optimized_batch_size = batch_size
 
                 # Set success flags only after all operations complete.
-                self._optimized_resolution = self.model.resolution
+                self._optimized_resolution = as_pair(self.model.resolution)
                 self._is_optimized_for_inference = True
                 self._optimized_dtype = dtype
         except Exception:
@@ -950,10 +962,10 @@ class RFDETR:
                 raise ValueError(f"num_windows must be a positive integer, got {num_windows!r}")
             block_size = patch_size * num_windows
             if shape is None:
-                shape = (self.model.resolution, self.model.resolution)
-                if shape[0] % block_size != 0:
+                shape = as_pair(self.model.resolution)
+                if shape[0] % block_size or shape[1] % block_size:
                     raise ValueError(
-                        f"Model's default resolution ({self.model.resolution}) is not divisible by "
+                        f"Model's default resolution ({shape}) is not divisible by "
                         f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
                         f"Provide an explicit shape divisible by {block_size}.",
                     )
@@ -1338,7 +1350,7 @@ class RFDETR:
             orig_sizes.append((h, w))
 
             img_tensor = img_tensor.to(self.model.device)
-            resize_to = list(shape) if shape is not None else [self.model.resolution, self.model.resolution]
+            resize_to = list(shape) if shape is not None else list(as_pair(self.model.resolution))
             img_tensor = F.resize(img_tensor, resize_to)
             img_tensor = F.normalize(img_tensor, self.means, self.stds)
 
@@ -1347,15 +1359,13 @@ class RFDETR:
         batch_tensor = torch.stack(processed_images)
 
         if self._is_optimized_for_inference:
-            if (
-                self._optimized_resolution != batch_tensor.shape[2]
-                or self._optimized_resolution != batch_tensor.shape[3]
-            ):
+            optimized_hw = as_pair(self._optimized_resolution)
+            if optimized_hw != (batch_tensor.shape[2], batch_tensor.shape[3]):
                 # this could happen if someone manually changes self.model.resolution after optimizing the model,
-                # or if predict(shape=...) is used with a shape that doesn't match the compiled square resolution.
+                # or if predict(shape=...) is used with a shape that doesn't match the compiled resolution.
                 raise ValueError(
                     f"Resolution mismatch. "
-                    f"Model was optimized for resolution {self._optimized_resolution}x{self._optimized_resolution}, "
+                    f"Model was optimized for resolution {optimized_hw[0]}x{optimized_hw[1]}, "
                     f"but got {batch_tensor.shape[2]}x{batch_tensor.shape[3]}."
                     " You can explicitly remove the optimized model by calling model.remove_optimized_model().",
                 )

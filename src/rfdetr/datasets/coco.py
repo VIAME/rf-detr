@@ -29,6 +29,7 @@ from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 from rfdetr.datasets.aug_config import AUG_CONFIG
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
 from rfdetr.utilities.logger import get_logger
+from rfdetr.utilities.shapes import as_pair
 
 logger = get_logger()
 
@@ -38,20 +39,47 @@ def is_valid_coco_dataset(dataset_dir: str) -> bool:
 
 
 def compute_multi_scale_scales(
-    resolution: int,
+    resolution: int | Tuple[int, int],
     expanded_scales: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-) -> List[int]:
-    # round to the nearest multiple of 4*patch_size to enable both patching and windowing
-    base_num_patches_per_window = resolution // (patch_size * num_windows)
+) -> List[Tuple[int, int]]:
+    """Derive the multi-scale jitter ladder around *resolution*.
+
+    Scales are stepped in whole blocks of ``patch_size * num_windows`` so every candidate remains patchable and
+    windowable.  For a non-square resolution the aspect ratio is held fixed: the shorter side is stepped in whole
+    blocks and the longer side is scaled proportionally, then snapped back to a whole number of blocks.
+
+    Args:
+        resolution: Base resolution, either a side length (square) or ``(height, width)``.
+        expanded_scales: Widen the jitter range.
+        patch_size: Model patch size.
+        num_windows: Windows per spatial dimension.
+
+    Returns:
+        Candidate ``(height, width)`` resolutions, each with both dims divisible by
+        ``patch_size * num_windows``.
+    """
+    block = patch_size * num_windows
+    height, width = as_pair(resolution)
+
+    # Step the shorter side in whole blocks and carry the longer side along at a fixed aspect.
+    short, long = (height, width) if height <= width else (width, height)
+    aspect = long / short
+    base_blocks = short // block
+
     offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
-    scales = [base_num_patches_per_window + offset for offset in offsets]
-    proposed_scales = [scale * patch_size * num_windows for scale in scales]
-    proposed_scales = [
-        scale for scale in proposed_scales if scale >= patch_size * num_windows * 2
-    ]  # ensure minimum image size
-    return proposed_scales
+
+    proposed: List[Tuple[int, int]] = []
+    for offset in offsets:
+        short_blocks = base_blocks + offset
+        if short_blocks < 2:  # ensure minimum image size
+            continue
+        long_blocks = max(2, round(short_blocks * aspect))
+        short_px, long_px = short_blocks * block, long_blocks * block
+        proposed.append((short_px, long_px) if height <= width else (long_px, short_px))
+
+    return proposed
 
 
 def _is_rle(segmentation: Any) -> bool:
@@ -332,10 +360,13 @@ def _build_train_resize_config(
     Returns:
         A single-element list containing a ``OneOf`` config entry.
     """
+    # Scales are (height, width) pairs; for a square model both components are equal.
+    pairs = [as_pair(s) for s in scales]
+
     if square:
         option_a: Dict[str, Any] = {
             "OneOf": {
-                "transforms": [{"Resize": {"height": s, "width": s}} for s in scales],
+                "transforms": [{"Resize": {"height": h, "width": w}} for h, w in pairs],
             }
         }
         option_b: Dict[str, Any] = {
@@ -345,8 +376,8 @@ def _build_train_resize_config(
                     {
                         "OneOf": {
                             "transforms": [
-                                {"RandomSizedCrop": {"min_max_height": [384, 600], "height": s, "width": s}}
-                                for s in scales
+                                {"RandomSizedCrop": {"min_max_height": [384, 600], "height": h, "width": w}}
+                                for h, w in pairs
                             ],
                         }
                     },
@@ -355,8 +386,10 @@ def _build_train_resize_config(
         }
     else:
         cap = max_size or 1333
+        # This branch resizes by shortest side and caps the longest, so it only needs the short edge.
+        short_sides = [min(h, w) for h, w in pairs]
         # SmallestMaxSize accepts a list and picks randomly — no OneOf needed
-        size_param: Any = scales[0] if len(scales) == 1 else scales
+        size_param: Any = short_sides[0] if len(short_sides) == 1 else short_sides
         option_a = {
             "Sequential": {
                 "transforms": [
@@ -397,7 +430,7 @@ def _build_resize(config: List[Dict[str, Any]], image_set: str) -> List[Any]:
 
 def make_coco_transforms(
     image_set: str,
-    resolution: int,
+    resolution: int | Tuple[int, int],
     multi_scale: bool = False,
     expanded_scales: bool = False,
     skip_random_resize: bool = False,
@@ -459,7 +492,7 @@ def make_coco_transforms(
     to_float = ToDtype(torch.float32, scale=True)
     normalize = Normalize()
 
-    scales = [resolution]
+    scales = [as_pair(resolution)]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
         scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
@@ -484,14 +517,15 @@ def make_coco_transforms(
     if image_set in ("val", "test"):
         resize_wrappers = _build_resize(
             [
-                {"SmallestMaxSize": {"max_size": resolution}},
+                {"SmallestMaxSize": {"max_size": min(as_pair(resolution))}},
                 {"LongestMaxSize": {"max_size": 1333}},
             ],
             image_set,
         )
         return Compose([*resize_wrappers, to_image, to_float, normalize])
     if image_set == "val_speed":
-        resize_wrappers = _build_resize([{"Resize": {"height": resolution, "width": resolution}}], image_set)
+        _res_h, _res_w = as_pair(resolution)
+        resize_wrappers = _build_resize([{"Resize": {"height": _res_h, "width": _res_w}}], image_set)
         return Compose([*resize_wrappers, to_image, to_float, normalize])
 
     raise ValueError(f"unknown {image_set}")
@@ -499,7 +533,7 @@ def make_coco_transforms(
 
 def make_coco_transforms_square_div_64(
     image_set: str,
-    resolution: int,
+    resolution: int | Tuple[int, int],
     multi_scale: bool = False,
     expanded_scales: bool = False,
     skip_random_resize: bool = False,
@@ -547,7 +581,7 @@ def make_coco_transforms_square_div_64(
     to_float = ToDtype(torch.float32, scale=True)
     normalize = Normalize()
 
-    scales = [resolution]
+    scales = [as_pair(resolution)]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
         scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
@@ -568,13 +602,14 @@ def make_coco_transforms_square_div_64(
         return Compose(pipeline)
 
     if image_set in ("val", "test", "val_speed"):
-        resize_wrappers = _build_resize([{"Resize": {"height": resolution, "width": resolution}}], image_set)
+        _res_h, _res_w = as_pair(resolution)
+        resize_wrappers = _build_resize([{"Resize": {"height": _res_h, "width": _res_w}}], image_set)
         return Compose([*resize_wrappers, to_image, to_float, normalize])
 
     raise ValueError(f"unknown {image_set}")
 
 
-def build_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
+def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> CocoDetection:
     root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
     if not root.exists():
         logger.error(f"COCO path {root} does not exist")
@@ -654,7 +689,7 @@ def _resolve_runtime_augmentation_backend(backend: str) -> str:
     return resolve_augmentation_backend(backend)
 
 
-def build_roboflow_from_coco(image_set: str, args: Any, resolution: int) -> CocoDetection:
+def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> CocoDetection:
     """Build a Roboflow COCO-format dataset.
 
     This uses Roboflow's standard directory structure (train/valid/test folders with _annotations.coco.json).
