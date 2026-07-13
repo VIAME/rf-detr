@@ -1288,8 +1288,8 @@ class RFDETR:
         block_size = patch_size * num_windows
 
         if shape is None:
-            default_res = self.model.resolution
-            if default_res % block_size != 0:
+            default_res = as_pair(self.model.resolution)
+            if default_res[0] % block_size or default_res[1] % block_size:
                 raise ValueError(
                     f"Model's default resolution ({default_res}) is not divisible by "
                     f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
