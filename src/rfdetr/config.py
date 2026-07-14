@@ -690,7 +690,11 @@ class TrainConfig(BaseModel):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
-    aug_config: Optional[Dict[str, Any]] = None
+    # A list of single-key dicts is equivalent to the dict form and is what
+    # build_albumentations_transforms already accepts; it is the only way to express
+    # a preset that repeats a transform (e.g. two ChannelSubset entries, one per
+    # group of channels), which a dict keyed by transform name cannot hold.
+    aug_config: Optional[Union[Dict[str, Any], List[Dict[str, Any]]]] = None
     augmentation_backend: Literal["cpu", "auto", "gpu"] = "cpu"
     save_dataset_grids: bool = False
     notes: Optional[Any] = Field(
