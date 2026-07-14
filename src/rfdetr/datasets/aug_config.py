@@ -175,91 +175,162 @@ AUG_INDUSTRIAL = {
 # augmentation pipeline writes. See VIAME's train_aug_* pipelines.
 # ---------------------------------------------------------------------------
 
-#: Intensity ops for the appearance channels. Additive/nonlinear, so they must
-#: never see a motion channel.
-_MOTION_INTENSITY_OPS = [
+#: --------------------------------------------------------------------------
+#: Building blocks. Every op below is probabilistic: nothing fires on every frame,
+#: so the model always sees a mixture of clean and perturbed inputs.
+#: --------------------------------------------------------------------------
+
+#: Additive/nonlinear intensity ops. Safe ONLY on appearance channels -- on a motion
+#: channel these lift stationary background off true zero and invent motion.
+_APPEARANCE_INTENSITY = [
     {"RandomBrightnessContrast": {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.5}},
     {"RandomGamma": {"gamma_limit": (80, 120), "p": 0.3}},
 ]
 
-#: Gain jitter for the motion channels: multiply by a single random factor in
-#: [0.7, 1.3] and clip at the dtype ceiling.
-#:
-#: This is the one photometric-family op that IS safe on a motion channel, and the
-#: reason is that it is purely multiplicative. Motion channels encode "no motion"
-#: as exactly zero, and 0 * k == 0, so stationary background is preserved bit for
-#: bit no matter what factor is drawn. Additive brightness is what breaks that
-#: invariant -- it lifts still background off zero and invents motion where the
-#: pipeline measured none.
-#:
-#: What it buys: the absolute scale of every motion channel is an artifact of
-#: choices made upstream -- the optical-flow `scale` parameter, the byte
-#: scale_factor after the variance and differencing filters, the frame rate, how
-#: fast the fish happened to be swimming. A model trained on one fixed scale can
-#: latch onto the absolute magnitude. Jittering the gain forces it to key on the
-#: spatial structure of the motion instead.
-#:
-#: per_channel is False on purpose: one factor is shared across all the selected
-#: channels, which models a global change in scene motion and preserves the ratios
-#: between channels (those ratios are informative -- they are what distinguishes a
-#: fast small target from a slow large one). elementwise is False because this is a
-#: gain, not per-pixel noise. Clipping at the ceiling is albumentations' default for
-#: integer dtypes and is what we want: motion that saturates simply reads as "very
-#: fast".
-_MOTION_GAIN = [
+#: Occlusion of the appearance channels only. The motion channels still show the
+#: fish, so this is the mirror image of motion dropout: it stops the model leaning
+#: entirely on appearance, exactly as motion dropout stops it leaning on motion.
+#: Deliberately applied inside ChannelSubset, so bounding boxes are untouched -- the
+#: target is still there, just hidden in this modality.
+_APPEARANCE_OCCLUSION = [
     {
+        "CoarseDropout": {
+            "num_holes_range": (1, 4),
+            "hole_height_range": (0.05, 0.15),
+            "hole_width_range": (0.05, 0.15),
+            "fill": 0,
+            "p": 0.2,
+        }
+    },
+]
+
+#: Underwater domain shift: backscatter/turbidity and defocus. RandomFog requires a
+#: 3-channel input, so it is only valid on an RGB subset -- on a single grey channel
+#: it raises and would be silently skipped by the builder.
+_APPEARANCE_TURBIDITY_RGB = [
+    {"RandomFog": {"fog_coef_range": (0.1, 0.35), "alpha_coef": 0.08, "p": 0.15}},
+    {"GaussianBlur": {"blur_limit": (3, 5), "p": 0.15}},
+]
+_APPEARANCE_TURBIDITY_GREY = [
+    {"GaussianBlur": {"blur_limit": (3, 5), "p": 0.15}},
+]
+
+#: Gain jitter for motion channels: one random factor per image, clipped at the
+#: dtype ceiling. Multiplication is the one intensity op that is safe on a motion
+#: channel, because 0 * k == 0 leaves stationary background exactly zero. It buys
+#: invariance to the absolute motion scale, which is an artifact of the optical-flow
+#: scale parameter, the byte scale_factors and how fast the fish happened to be
+#: swimming -- not a property of the fish.
+_MOTION_GAIN = {
+    "MultiplicativeNoise": {"multiplier": (0.7, 1.3), "per_channel": False, "elementwise": False, "p": 0.5}
+}
+
+#: Per-pixel multiplicative jitter: flow and variance estimates are genuinely noisy,
+#: and being multiplicative this also preserves the zero background exactly.
+_MOTION_NOISE = {
+    "MultiplicativeNoise": {"multiplier": (0.8, 1.2), "per_channel": False, "elementwise": True, "p": 0.3}
+}
+
+def _motion_blank(p: float) -> dict:
+    """Blank the channel entirely, on ``p`` of frames (multiply by zero).
+
+    This is modality dropout, and it targets a failure that provably occurs:
+    ocv_optical_flow emits an all-zero field on its first frame and after any
+    resolution change, and a scene cut has the same effect. A model that has learned
+    to lean on the motion channel produces garbage on exactly those frames. Firing
+    this on a slice of frames forces it to degrade gracefully to appearance instead.
+
+    Inside a OneOf, ``p`` is a selection weight rather than a firing probability, so
+    the two call sites pass different values.
+    """
+    return {
         "MultiplicativeNoise": {
-            "multiplier": (0.7, 1.3),
+            "multiplier": (0.0, 0.0),
             "per_channel": False,
             "elementwise": False,
-            "p": 0.5,
+            "p": p,
         }
-    },
-]
+    }
 
-#: Geometric ops shared by the motion presets. Safe on every channel.
-_MOTION_GEOMETRIC_OPS = [
+#: Geometric ops. Safe on every channel: they move pixels without reinterpreting
+#: their values. No VerticalFlip -- up is up in this footage, and flipping it
+#: manufactures upside-down subjects that never occur at inference.
+_MOTION_GEOMETRIC = [
     {"HorizontalFlip": {"p": 0.5}},
-    {
-        "Affine": {
-            "scale": (0.9, 1.1),
-            "translate_percent": (-0.05, 0.05),
-            "rotate": (-10, 10),
-            "p": 0.5,
-        }
-    },
+    {"Affine": {"scale": (0.9, 1.1), "translate_percent": (-0.05, 0.05), "rotate": (-10, 10), "p": 0.5}},
 ]
 
-# These are lists, not dicts, because a preset needs more than one ChannelSubset
-# entry (one for the appearance channels, one for the motion channels) and a dict
-# keyed by transform name cannot hold duplicates.
+# Presets are lists, not dicts: they carry more than one ChannelSubset entry (one per
+# group of channels) and a dict keyed by transform name cannot repeat a key.
 
-#: RGB + optical-flow magnitude, channel layout [ R, G, B, flow ].
+#: RGB + optical-flow magnitude, layout [ R, G, B, flow ].
 AUG_MOTION_RGB = [
-    *_MOTION_GEOMETRIC_OPS,
+    *_MOTION_GEOMETRIC,
     {
         "ChannelSubset": {
             "channels": [0, 1, 2],
-            "transforms": _MOTION_INTENSITY_OPS + [
-                {"ColorJitter": {"brightness": 0.0, "contrast": 0.0, "saturation": 0.2, "hue": 0.05, "p": 0.3}},
+            "transforms": _APPEARANCE_INTENSITY
+            + [{"ColorJitter": {"brightness": 0.0, "contrast": 0.0, "saturation": 0.2, "hue": 0.05, "p": 0.3}}]
+            + _APPEARANCE_TURBIDITY_RGB
+            + _APPEARANCE_OCCLUSION,
+            "p": 1.0,
+        }
+    },
+    {
+        "ChannelSubset": {
+            "channels": [3],
+            # 10% of frames lose the flow channel entirely and must fall back to RGB.
+            "transforms": [_MOTION_GAIN, _MOTION_NOISE, _motion_blank(0.10)],
+            "p": 1.0,
+        }
+    },
+]
+
+#: Two motion channels around a greyscale one, layout [ motion, grey, motion ].
+#: No ColorJitter or RandomFog: both need 3 channels, and the appearance subset is 1.
+AUG_MOTION_GREY = [
+    *_MOTION_GEOMETRIC,
+    {
+        "ChannelSubset": {
+            "channels": [1],
+            "transforms": _APPEARANCE_INTENSITY + _APPEARANCE_TURBIDITY_GREY + _APPEARANCE_OCCLUSION,
+            "p": 1.0,
+        }
+    },
+    {
+        "ChannelSubset": {
+            "channels": [0, 2],
+            # Both variance channels are the same modality, so they blank together:
+            # 10% of frames fall back to the grey channel alone.
+            "transforms": [
+                _MOTION_GAIN,
+                _MOTION_NOISE,
+                _motion_blank(0.10),
             ],
             "p": 1.0,
         }
     },
-    {"ChannelSubset": {"channels": [3], "transforms": _MOTION_GAIN, "p": 1.0}},
 ]
 
-#: Two motion channels around a greyscale one, layout [ motion, grey, motion ].
-#: No ColorJitter: saturation and hue are undefined on a single channel.
-AUG_MOTION_GREY = [
-    *_MOTION_GEOMETRIC_OPS,
-    {"ChannelSubset": {"channels": [1], "transforms": _MOTION_INTENSITY_OPS, "p": 1.0}},
-    {"ChannelSubset": {"channels": [0, 2], "transforms": _MOTION_GAIN, "p": 1.0}},
-]
-
-#: All-motion input with no appearance channel at all. Every channel is a motion
-#: channel, so the gain applies to the whole image and no subsetting is needed.
+#: All-motion input, layout [ flow, frame_difference, temporal_variance ]. Every
+#: channel is a motion channel, so gain and noise apply to the whole image.
+#:
+#: Dropout is different here: blanking every channel would leave an empty image that
+#: still carries boxes, which is label noise, not augmentation. The OneOf picks
+#: exactly ONE channel to blank (or, 85% of the time, none), so the model learns to
+#: cope when any single operator fails but never sees a blank frame.
 AUG_MOTION_ONLY = [
-    *_MOTION_GEOMETRIC_OPS,
-    *_MOTION_GAIN,
+    *_MOTION_GEOMETRIC,
+    _MOTION_GAIN,
+    _MOTION_NOISE,
+    {
+        "OneOf": {
+            "transforms": [
+                {"ChannelSubset": {"channels": [0], "transforms": [_motion_blank(1.0)], "p": 0.05}},
+                {"ChannelSubset": {"channels": [1], "transforms": [_motion_blank(1.0)], "p": 0.05}},
+                {"ChannelSubset": {"channels": [2], "transforms": [_motion_blank(1.0)], "p": 0.05}},
+                {"NoOp": {"p": 0.85}},
+            ]
+        }
+    },
 ]
