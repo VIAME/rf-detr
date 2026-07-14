@@ -130,6 +130,82 @@ GEOMETRIC_TRANSFORMS = {
 # Albumentations container/meta transforms that hold nested transforms
 ALBUMENTATIONS_CONTAINERS = frozenset({"OneOf", "SomeOf", "Sequential"})
 
+#: Container transforms defined here rather than by albumentations.
+CUSTOM_CONTAINERS = frozenset({"ChannelSubset"})
+
+#: Everything that takes a nested ``transforms`` list.
+CONTAINER_TRANSFORMS = ALBUMENTATIONS_CONTAINERS | CUSTOM_CONTAINERS
+
+_CHANNEL_SUBSET_CLS = None
+
+
+def _channel_subset_cls() -> type:
+    """Return the ``ChannelSubset`` transform class, building it on first use.
+
+    ``albumentations`` is an optional import, so its ``ImageOnlyTransform`` base class may not exist when this module is
+    imported.  Defining the subclass lazily keeps the module importable without it, matching the rest of the file.
+    """
+    global _CHANNEL_SUBSET_CLS
+    if _CHANNEL_SUBSET_CLS is not None:
+        return _CHANNEL_SUBSET_CLS
+
+    _require_albumentations()
+
+    class ChannelSubset(alb.ImageOnlyTransform):
+        """Apply nested transforms to a subset of the image's channels, leaving the rest untouched.
+
+        Photometric augmentation assumes its input is an intensity image: brightness and contrast add and scale pixel
+        values, and saturation and hue mix channels together as colour.  None of that is meaningful on a channel that
+        encodes motion rather than appearance -- a brightness offset applied to an optical-flow magnitude invents motion
+        in stationary background, and a hue rotation blends unrelated motion operators into each other.  Albumentations
+        applies a transform to every channel it is given, so on a motion-infused image the only way to augment the
+        appearance channels is to hand the transform nothing else.
+
+        This splits the image, runs the nested transforms on the selected channels alone, and writes the result back.
+        Each nested transform keeps its own probability.  It is deliberately not registered as a geometric transform:
+        it never moves a pixel, so bounding boxes are unaffected.
+
+        Args:
+            channels: Channel indices to augment, e.g. ``[0, 1, 2]`` for the RGB planes of an RGB+flow image.
+            transforms: Already-constructed albumentations transforms to run on those channels.
+            p: Probability of applying this wrapper at all.
+        """
+
+        def __init__(self, channels: Sequence[int], transforms: Sequence[Any], p: float = 1.0):
+            super().__init__(p=p)
+            if not channels:
+                raise ValueError("'ChannelSubset.channels' must be a non-empty list of channel indices")
+            if not transforms:
+                raise ValueError("'ChannelSubset.transforms' must contain at least one transform")
+            self.channels = [int(c) for c in channels]
+            self.transforms = list(transforms)
+
+        def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+            if img.ndim != 3:
+                raise ValueError(f"ChannelSubset expects an HxWxC image, got shape {img.shape}")
+
+            channel_count = img.shape[2]
+            out_of_range = [c for c in self.channels if not 0 <= c < channel_count]
+            if out_of_range:
+                raise ValueError(
+                    f"ChannelSubset channels {out_of_range} are out of range for a {channel_count}-channel image. "
+                    f"Check that the preset matches the channel layout the augmentation pipeline produces."
+                )
+
+            subset = np.ascontiguousarray(img[:, :, self.channels])
+            for transform in self.transforms:
+                subset = transform(image=subset)["image"]
+
+            augmented = img.copy()
+            augmented[:, :, self.channels] = subset
+            return augmented
+
+        def get_transform_init_args_names(self) -> Tuple[str, ...]:
+            return ("channels", "transforms")
+
+    _CHANNEL_SUBSET_CLS = ChannelSubset
+    return ChannelSubset
+
 
 def _is_geometric_transform(transform: alb.BasicTransform) -> bool:
     """Return True if transform (or any nested transform) affects spatial coordinates.
@@ -208,7 +284,7 @@ def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransfo
         >>> isinstance(container, OneOf)
         True
     """
-    if name in ALBUMENTATIONS_CONTAINERS:
+    if name in CONTAINER_TRANSFORMS:
         raw_nested = params.get("transforms", [])
         if not isinstance(raw_nested, list):
             raise ValueError(f"'{name}.transforms' must be a list, got {type(raw_nested).__name__}")
@@ -235,7 +311,10 @@ def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransfo
         else:
             other_params = {k: v for k, v in params.items() if k != "transforms"}
 
-        container_cls = getattr(alb, name, None)
+        if name in CUSTOM_CONTAINERS:
+            container_cls = _channel_subset_cls()
+        else:
+            container_cls = getattr(alb, name, None)
         if container_cls is None:
             raise ValueError(f"Unknown Albumentations container: {name!r}")
         return container_cls(transforms=nested_transforms, **other_params)
@@ -757,7 +836,7 @@ class AlbumentationsWrapper:
             aug_name, params = next(iter(entry.items()))
 
             # Shorthand: container value is a list -> treat as {"transforms": [...]}
-            if isinstance(params, list) and aug_name in ALBUMENTATIONS_CONTAINERS:
+            if isinstance(params, list) and aug_name in CONTAINER_TRANSFORMS:
                 params = {"transforms": params}
 
             if not isinstance(params, dict):

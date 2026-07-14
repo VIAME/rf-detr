@@ -150,3 +150,73 @@ AUG_INDUSTRIAL = {
     "GaussianBlur": {"blur_limit": 3, "p": 0.3},
     "GaussNoise": {"std_range": (0.01, 0.05), "p": 0.3},
 }
+
+# ---------------------------------------------------------------------------
+# Motion-infused imagery
+#
+# These are for models whose input carries motion channels alongside (or instead
+# of) appearance channels. Two rules shape all three:
+#
+#   1. No VerticalFlip. Every preset above flips vertically, which is fine for
+#      overhead imagery but not for a scene with a real up direction -- it
+#      manufactures upside-down subjects and a ceiling made of seabed, which the
+#      model never sees at inference.
+#
+#   2. Photometric augmentation is confined to the appearance channels with
+#      ChannelSubset. Brightness and contrast are meaningless on a motion channel
+#      -- an offset lifts stationary background off true zero, inventing motion --
+#      and saturation/hue are worse still, mixing unrelated motion operators
+#      together as if they were colour. Geometric augmentation, by contrast, is
+#      safe on every channel: it moves pixels without reinterpreting their values.
+#      This only holds because the motion channels are undirected (flow is encoded
+#      as magnitude, not as a (dx, dy) vector, which a flip would have to negate).
+#
+# The channel indices below are not generic -- they must match the layout the
+# augmentation pipeline writes. See VIAME's train_aug_* pipelines.
+# ---------------------------------------------------------------------------
+
+#: Intensity ops applied to whichever channels are handed to ChannelSubset.
+_MOTION_INTENSITY_OPS = [
+    {"RandomBrightnessContrast": {"brightness_limit": 0.2, "contrast_limit": 0.2, "p": 0.5}},
+    {"RandomGamma": {"gamma_limit": (80, 120), "p": 0.3}},
+]
+
+#: Geometric ops shared by the motion presets. Safe on every channel.
+_MOTION_GEOMETRIC_OPS = {
+    "HorizontalFlip": {"p": 0.5},
+    "Affine": {
+        "scale": (0.9, 1.1),
+        "translate_percent": (-0.05, 0.05),
+        "rotate": (-10, 10),
+        "p": 0.5,
+    },
+}
+
+#: RGB + optical-flow magnitude, channel layout [ R, G, B, flow ].
+#: Photometric ops hit the RGB planes only; the flow channel is left alone.
+AUG_MOTION_RGB = {
+    **_MOTION_GEOMETRIC_OPS,
+    "ChannelSubset": {
+        "channels": [0, 1, 2],
+        "transforms": _MOTION_INTENSITY_OPS + [
+            {"ColorJitter": {"brightness": 0.0, "contrast": 0.0, "saturation": 0.2, "hue": 0.05, "p": 0.3}},
+        ],
+        "p": 1.0,
+    },
+}
+
+#: Two motion channels around a greyscale one, layout [ motion, grey, motion ].
+#: Photometric ops hit the centre channel only. No ColorJitter: saturation and hue
+#: are undefined on a single channel.
+AUG_MOTION_GREY = {
+    **_MOTION_GEOMETRIC_OPS,
+    "ChannelSubset": {
+        "channels": [1],
+        "transforms": _MOTION_INTENSITY_OPS,
+        "p": 1.0,
+    },
+}
+
+#: All-motion input with no appearance channel at all. Geometric only -- there is
+#: no intensity here to augment.
+AUG_MOTION_ONLY = dict(_MOTION_GEOMETRIC_OPS)
