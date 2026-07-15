@@ -124,6 +124,8 @@ class ModelConfig(BaseConfig):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    keypoint_head: bool = False
+    num_keypoints: int = Field(default=2, ge=1)
     backbone_lora: bool = False
     freeze_encoder: bool = False
     license: str = "Apache-2.0"
@@ -834,3 +836,15 @@ class SegmentationTrainConfig(TrainConfig):
     mask_dice_loss_coef: float = 5.0
     cls_loss_coef: float = 5.0
     segmentation_head: bool = True
+
+
+class KeypointTrainConfig(TrainConfig):
+    """Training config for keypoint models.
+
+    Pair with a ``ModelConfig`` (or subclass) built with ``keypoint_head=True`` and the desired ``num_keypoints``.
+    Keypoint training requires the CPU augmentation backend (the default) because the GPU/kornia pipeline does not
+    transform keypoints.
+    """
+
+    keypoint_loss_coef: float = 5.0
+    keypoint_vis_loss_coef: float = 1.0

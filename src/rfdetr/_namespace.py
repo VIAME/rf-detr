@@ -35,6 +35,8 @@ _MC_NAMESPACE_FIELDS = {
     "layer_norm",
     "lite_refpoint_refine",
     "mask_downsample_ratio",
+    "keypoint_head",
+    "num_keypoints",
     "num_channels",
     "num_classes",
     "num_queries",
@@ -153,6 +155,9 @@ def _namespace_from_configs(
             "mask_ce_loss_coef": getattr(tc, "mask_ce_loss_coef", 5.0),
             "mask_dice_loss_coef": getattr(tc, "mask_dice_loss_coef", 5.0),
             "mask_point_sample_ratio": getattr(tc, "mask_point_sample_ratio", 16),
+            # Keypoint extras (KeypointTrainConfig only — absent from base TrainConfig).
+            "keypoint_loss_coef": getattr(tc, "keypoint_loss_coef", 5.0),
+            "keypoint_vis_loss_coef": getattr(tc, "keypoint_vis_loss_coef", 1.0),
             # Transformations: fields requiring a default sentinel or transitional priority.
             "cls_loss_coef": cls_loss_coef,
             "resume": tc.resume or "",

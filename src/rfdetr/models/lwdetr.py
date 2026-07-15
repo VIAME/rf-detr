@@ -42,6 +42,7 @@ from rfdetr.models.criterion import (  # noqa: F401 — backward compat
     sigmoid_focal_loss,
     sigmoid_varifocal_loss,
 )
+from rfdetr.models.heads.keypoint import KeypointHead
 from rfdetr.models.heads.segmentation import SegmentationHead
 from rfdetr.models.matcher import build_matcher
 from rfdetr.models.math import MLP
@@ -96,6 +97,7 @@ class LWDETR(nn.Module):
         two_stage=False,
         lite_refpoint_refine=False,
         bbox_reparam=False,
+        keypoint_head=None,
     ):
         """Initializes the model.
 
@@ -116,6 +118,7 @@ class LWDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, num_classes)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.segmentation_head = segmentation_head
+        self.keypoint_head = keypoint_head
 
         query_dim = 4
         self.refpoint_embed = nn.Embedding(num_queries * group_detr, query_dim)
@@ -183,6 +186,31 @@ class LWDETR(nn.Module):
             if hasattr(m, "export") and isinstance(m.export, Callable) and hasattr(m, "_export") and not m._export:
                 m.export()
 
+    def _compute_keypoints(self, hs, ref_unsigmoid):
+        """Combine keypoint head deltas with the box reference point.
+
+        Mirrors the box regression path so keypoints are anchored at each query's box centre and share the model's
+        ``bbox_reparam`` convention.  In reparametrised mode the delta scales with the reference width/height and adds
+        the reference centre directly; otherwise it is added to the reference centre in logit space and squashed with
+        a sigmoid.
+
+        Args:
+            hs: Decoder hidden states of shape ``(L, B, Q, C)``.
+            ref_unsigmoid: Reference points of shape ``(L, B, Q, 4)`` as ``(cx, cy, w, h)``.
+
+        Returns:
+            Keypoint predictions of shape ``(L, B, Q, num_keypoints, 3)`` as ``(x, y, visibility_logit)`` with ``x``,
+            ``y`` normalised to ``[0, 1]``.
+        """
+        coord_delta, vis_logit = self.keypoint_head(hs)  # [L,B,Q,K,2], [L,B,Q,K,1]
+        ref_cxcy = ref_unsigmoid[..., :2].unsqueeze(-2)  # [L,B,Q,1,2]
+        if self.bbox_reparam:
+            ref_wh = ref_unsigmoid[..., 2:4].unsqueeze(-2)  # [L,B,Q,1,2]
+            keypoints_xy = coord_delta * ref_wh + ref_cxcy
+        else:
+            keypoints_xy = (coord_delta + ref_cxcy).sigmoid()
+        return torch.cat([keypoints_xy, vis_logit], dim=-1)
+
     def forward(self, samples: NestedTensor, targets=None):
         """The forward expects a NestedTensor, which consists of:
 
@@ -240,14 +268,20 @@ class LWDETR(nn.Module):
             if self.segmentation_head is not None:
                 outputs_masks = seg_head_fwd(features[0].tensors, hs, samples.tensors.shape[-2:])
 
+            if self.keypoint_head is not None:
+                outputs_keypoints = self._compute_keypoints(hs, ref_unsigmoid)
+
             out = {"pred_logits": outputs_class[-1], "pred_boxes": outputs_coord[-1]}
             if self.segmentation_head is not None:
                 out["pred_masks"] = outputs_masks[-1]
+            if self.keypoint_head is not None:
+                out["pred_keypoints"] = outputs_keypoints[-1]
             if self.aux_loss:
                 out["aux_outputs"] = self._set_aux_loss(
                     outputs_class,
                     outputs_coord,
                     outputs_masks if self.segmentation_head is not None else None,
+                    outputs_keypoints if self.keypoint_head is not None else None,
                 )
 
         if self.two_stage:
@@ -330,17 +364,18 @@ class LWDETR(nn.Module):
             return outputs_coord, outputs_class
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks):
+    def _set_aux_loss(self, outputs_class, outputs_coord, outputs_masks=None, outputs_keypoints=None):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
+        aux = [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
         if outputs_masks is not None:
-            return [
-                {"pred_logits": a, "pred_boxes": b, "pred_masks": c}
-                for a, b, c in zip(outputs_class[:-1], outputs_coord[:-1], outputs_masks[:-1])
-            ]
-        else:
-            return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+            for i, c in enumerate(outputs_masks[:-1]):
+                aux[i]["pred_masks"] = c
+        if outputs_keypoints is not None:
+            for i, k in enumerate(outputs_keypoints[:-1]):
+                aux[i]["pred_keypoints"] = k
+        return aux
 
     def _get_backbone_encoder_layers(self) -> Optional[nn.ModuleList]:
         """Resolve the list of transformer blocks/layers from backbone[0].encoder.
@@ -445,6 +480,12 @@ def build_model(args: "BuilderArgs"):
         else None
     )
 
+    keypoint_head = (
+        KeypointHead(args.hidden_dim, getattr(args, "num_keypoints", 2))
+        if getattr(args, "keypoint_head", False)
+        else None
+    )
+
     model = LWDETR(
         backbone,
         transformer,
@@ -456,6 +497,7 @@ def build_model(args: "BuilderArgs"):
         two_stage=args.two_stage,
         lite_refpoint_refine=args.lite_refpoint_refine,
         bbox_reparam=args.bbox_reparam,
+        keypoint_head=keypoint_head,
     )
     return model
 
@@ -468,6 +510,9 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
     if args.segmentation_head:
         weight_dict["loss_mask_ce"] = args.mask_ce_loss_coef
         weight_dict["loss_mask_dice"] = args.mask_dice_loss_coef
+    if getattr(args, "keypoint_head", False):
+        weight_dict["loss_keypoint"] = getattr(args, "keypoint_loss_coef", 5.0)
+        weight_dict["loss_keypoint_vis"] = getattr(args, "keypoint_vis_loss_coef", 1.0)
     # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
@@ -480,6 +525,8 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
     losses = ["labels", "boxes", "cardinality"]
     if args.segmentation_head:
         losses.append("masks")
+    if getattr(args, "keypoint_head", False):
+        losses.append("keypoints")
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
     if args.segmentation_head:

@@ -50,6 +50,7 @@ class HungarianMatcher(nn.Module):
         mask_point_sample_ratio: int = 16,
         cost_mask_ce: float = 1,
         cost_mask_dice: float = 1,
+        cost_keypoint: float = 0,
     ):
         """Creates the matcher.
 
@@ -63,6 +64,8 @@ class HungarianMatcher(nn.Module):
             mask_point_sample_ratio: Downsampling ratio for mask point sampling.
             cost_mask_ce: Relative weight of the binary cross-entropy mask cost.
             cost_mask_dice: Relative weight of the Dice mask cost.
+            cost_keypoint: Relative weight of the keypoint L1 cost. ``0`` (default) disables the keypoint term so
+                matching depends only on class and box.
         """
         super().__init__()
         self.cost_class = cost_class
@@ -73,6 +76,7 @@ class HungarianMatcher(nn.Module):
         self.mask_point_sample_ratio = mask_point_sample_ratio
         self.cost_mask_ce = cost_mask_ce
         self.cost_mask_dice = cost_mask_dice
+        self.cost_keypoint = cost_keypoint
         self._warned_non_finite_costs = False
 
     @staticmethod
@@ -148,6 +152,7 @@ class HungarianMatcher(nn.Module):
         tgt_bbox = torch.cat([v["boxes"] for v in targets])
 
         masks_present = "masks" in targets[0]
+        keypoints_present = self.cost_keypoint != 0 and "keypoints" in targets[0] and "pred_keypoints" in outputs
 
         # Compute the giou cost between boxes
         giou = generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
@@ -207,10 +212,29 @@ class HungarianMatcher(nn.Module):
             # Dice loss cost (1 - dice coefficient)
             cost_mask_dice = batch_dice_loss(pred_masks_logits, tgt_masks_flat)
 
+        if keypoints_present:
+            out_keypoints = outputs["pred_keypoints"].flatten(0, 1)  # [B*Q, K, 3]
+            tgt_keypoints = torch.cat([v["keypoints"] for v in targets])  # [T, K, 3]
+            out_kp_xy = out_keypoints[..., :2]  # [B*Q, K, 2]
+            tgt_kp_xy = tgt_keypoints[..., :2]  # [T, K, 2]
+            tgt_kp_vis = (tgt_keypoints[..., 2] > 0).to(out_kp_xy.dtype)  # [T, K]
+
+            num_keypoints = out_kp_xy.shape[1]
+            cost_keypoint = out_kp_xy.new_zeros((out_kp_xy.shape[0], tgt_kp_xy.shape[0]))
+            for k in range(num_keypoints):
+                # pairwise L1 distance for keypoint slot k, masked by whether the target keypoint is visible
+                dist_k = torch.cdist(out_kp_xy[:, k, :], tgt_kp_xy[:, k, :], p=1)  # [B*Q, T]
+                cost_keypoint = cost_keypoint + dist_k * tgt_kp_vis[:, k].unsqueeze(0)
+            # average over the visible keypoints of each target
+            denom = tgt_kp_vis.sum(-1).clamp(min=1).unsqueeze(0)  # [1, T]
+            cost_keypoint = cost_keypoint / denom
+
         # Final cost matrix
         cost_matrix = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
         if masks_present:
             cost_matrix = cost_matrix + self.cost_mask_ce * cost_mask_ce + self.cost_mask_dice * cost_mask_dice
+        if keypoints_present:
+            cost_matrix = cost_matrix + self.cost_keypoint * cost_keypoint
         cost_matrix = (
             cost_matrix.view(bs, num_queries, -1).float().cpu()
         )  # convert to float because bfloat16 doesn't play nicely with CPU
@@ -249,20 +273,18 @@ class HungarianMatcher(nn.Module):
 
 
 def build_matcher(args):
+    kwargs = dict(
+        cost_class=args.set_cost_class,
+        cost_bbox=args.set_cost_bbox,
+        cost_giou=args.set_cost_giou,
+        focal_alpha=args.focal_alpha,
+    )
     if args.segmentation_head:
-        return HungarianMatcher(
-            cost_class=args.set_cost_class,
-            cost_bbox=args.set_cost_bbox,
-            cost_giou=args.set_cost_giou,
-            focal_alpha=args.focal_alpha,
+        kwargs.update(
             cost_mask_ce=args.mask_ce_loss_coef,
             cost_mask_dice=args.mask_dice_loss_coef,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
         )
-    else:
-        return HungarianMatcher(
-            cost_class=args.set_cost_class,
-            cost_bbox=args.set_cost_bbox,
-            cost_giou=args.set_cost_giou,
-            focal_alpha=args.focal_alpha,
-        )
+    if getattr(args, "keypoint_head", False):
+        kwargs["cost_keypoint"] = getattr(args, "set_cost_keypoint", 0.0)
+    return HungarianMatcher(**kwargs)

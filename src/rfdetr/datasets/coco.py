@@ -193,10 +193,14 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         transforms: Optional[Any],
         include_masks: bool = False,
         remap_category_ids: bool = False,
+        include_keypoints: bool = False,
+        num_keypoints: int = 2,
     ) -> None:
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
         self.include_masks = include_masks
+        self.include_keypoints = include_keypoints
+        self.num_keypoints = num_keypoints
         if remap_category_ids:
             # Mapping from original COCO category_id to contiguous label indices
             self.cat2label = {cat_id: i for i, cat_id in enumerate(sorted(self.coco.cats.keys()))}
@@ -207,7 +211,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         else:
             self.cat2label = None
             self.label2cat = None
-        self.prepare = ConvertCoco(include_masks=include_masks, cat2label=self.cat2label)
+        self.prepare = ConvertCoco(
+            include_masks=include_masks,
+            cat2label=self.cat2label,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
+        )
 
     def _load_image(self, id: int) -> Image.Image:
         # Override torchvision's RGB-forcing loader so imagery with an appended
@@ -259,9 +268,17 @@ class ConvertCoco(object):
             COCO-style datasets (e.g. IDs 1–90 with gaps) so that labels stay within the model's output range.
     """
 
-    def __init__(self, include_masks: bool = False, cat2label: Optional[Dict[int, int]] = None) -> None:
+    def __init__(
+        self,
+        include_masks: bool = False,
+        cat2label: Optional[Dict[int, int]] = None,
+        include_keypoints: bool = False,
+        num_keypoints: int = 2,
+    ) -> None:
         self.include_masks = include_masks
         self.cat2label = cat2label
+        self.include_keypoints = include_keypoints
+        self.num_keypoints = num_keypoints
 
     def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
         w, h = image.size
@@ -322,6 +339,25 @@ class ConvertCoco(object):
                 target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
 
             target["masks"] = target["masks"].bool()
+
+        # add keypoints if requested; shape [N, num_keypoints, 3] as (x, y, visibility)
+        # with x, y in absolute pixel coordinates (normalised later by ``Normalize``).
+        if self.include_keypoints:
+            k = self.num_keypoints
+            per_instance = []
+            for obj in anno:
+                raw = obj.get("keypoints", []) or []
+                kp = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
+                fixed = torch.zeros((k, 3), dtype=torch.float32)
+                n = min(kp.shape[0], k)
+                if n > 0:
+                    fixed[:n] = kp[:n]
+                per_instance.append(fixed)
+            if per_instance:
+                keypoints = torch.stack(per_instance, dim=0)[keep]
+            else:
+                keypoints = torch.zeros((0, k, 3), dtype=torch.float32)
+            target["keypoints"] = keypoints
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])
@@ -626,6 +662,8 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
 
     square_resize_div_64 = getattr(args, "square_resize_div_64", False)
     include_masks = getattr(args, "segmentation_head", False)
+    include_keypoints = getattr(args, "keypoint_head", False)
+    num_keypoints = getattr(args, "num_keypoints", 2)
     aug_config = getattr(args, "aug_config", None)
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
@@ -635,6 +673,7 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
             "disabling GPU postprocess transforms and retaining CPU normalization."
         )
     gpu_postprocess = resolved_augmentation_backend != "cpu"
+    _require_cpu_backend_for_keypoints(include_keypoints, gpu_postprocess)
 
     if square_resize_div_64:
         logger.info(f"Building COCO {image_set} dataset with square resize at resolution {resolution}")
@@ -653,6 +692,8 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
                 gpu_postprocess=gpu_postprocess,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
         )
     else:
         logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
@@ -671,8 +712,25 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
                 gpu_postprocess=gpu_postprocess,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
         )
     return dataset
+
+
+def _require_cpu_backend_for_keypoints(include_keypoints: bool, gpu_postprocess: bool) -> None:
+    """Fail fast when keypoint training is combined with the GPU augmentation backend.
+
+    The GPU (kornia) augmentation pipeline in ``RFDETRDataModule.on_after_batch_transfer`` transforms images, boxes,
+    and masks but has no keypoint path, so keypoints would silently keep their pre-augmentation coordinates and train
+    the model on a geometry inference never reproduces.  Keypoint training therefore requires the CPU (Albumentations)
+    backend, which does transform keypoints.
+    """
+    if include_keypoints and gpu_postprocess:
+        raise ValueError(
+            "Keypoint training requires augmentation_backend='cpu'. The GPU/kornia augmentation pipeline does not "
+            "transform keypoints, so boxes and keypoints would fall out of alignment. Set augmentation_backend='cpu'."
+        )
 
 
 def _resolve_runtime_augmentation_backend(backend: str) -> str:
@@ -708,6 +766,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
     img_folder, ann_file = PATHS[image_set.split("_")[0]]
     square_resize_div_64 = getattr(args, "square_resize_div_64", False)
     include_masks = getattr(args, "segmentation_head", False)
+    include_keypoints = getattr(args, "keypoint_head", False)
+    num_keypoints = getattr(args, "num_keypoints", 2)
     multi_scale = getattr(args, "multi_scale", False)
     expanded_scales = getattr(args, "expanded_scales", False)
     do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
@@ -716,6 +776,7 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
     aug_config = getattr(args, "aug_config", None)
     resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
     gpu_postprocess = resolved_augmentation_backend != "cpu"
+    _require_cpu_backend_for_keypoints(include_keypoints, gpu_postprocess)
 
     if square_resize_div_64:
         logger.info(f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}")
@@ -734,6 +795,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
                 gpu_postprocess=gpu_postprocess,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
             remap_category_ids=True,
         )
     else:
@@ -753,6 +816,8 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
                 gpu_postprocess=gpu_postprocess,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints=num_keypoints,
             remap_category_ids=True,
         )
     return dataset

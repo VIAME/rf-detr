@@ -52,6 +52,7 @@ class ModelDefaults:
         set_cost_class: Classification cost weight for the matcher.
         set_cost_bbox: L1 bbox cost weight for the matcher.
         set_cost_giou: GIoU cost weight for the matcher.
+        set_cost_keypoint: L1 keypoint cost weight for the matcher (0 disables the keypoint term in matching).
         bbox_loss_coef: Bbox regression loss coefficient.
         giou_loss_coef: GIoU loss coefficient.
         sum_group_losses: Whether to sum (vs. average) group-DETR losses.
@@ -94,6 +95,7 @@ class ModelDefaults:
     set_cost_class: float = 2.0
     set_cost_bbox: float = 5.0
     set_cost_giou: float = 2.0
+    set_cost_keypoint: float = 4.0
     bbox_loss_coef: float = 5.0
     giou_loss_coef: float = 2.0
     sum_group_losses: bool = False

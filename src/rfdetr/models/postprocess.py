@@ -34,6 +34,7 @@ class PostProcess(nn.Module):
         """
         out_logits, out_bbox = outputs["pred_logits"], outputs["pred_boxes"]
         out_masks = outputs.get("pred_masks", None)
+        out_keypoints = outputs.get("pred_keypoints", None)
 
         assert len(out_logits) == len(target_sizes)
         assert target_sizes.shape[1] == 2
@@ -51,11 +52,13 @@ class PostProcess(nn.Module):
         scale_fct = torch.stack([img_w, img_h, img_w, img_h], dim=1)
         boxes = boxes * scale_fct[:, None, :]
 
+        results = [
+            {"scores": score, "labels": label, "boxes": box} for score, label, box in zip(scores, labels, boxes)
+        ]
+
         # Optionally gather masks corresponding to the same top-K queries and resize to original size
-        results = []
         if out_masks is not None:
             for i in range(out_masks.shape[0]):
-                res_i = {"scores": scores[i], "labels": labels[i], "boxes": boxes[i]}
                 k_idx = topk_boxes[i]
                 masks_i = torch.gather(
                     out_masks[i],
@@ -69,11 +72,18 @@ class PostProcess(nn.Module):
                     mode="bilinear",
                     align_corners=False,
                 )  # [K,1,H,W]
-                res_i["masks"] = masks_i > 0.0
-                results.append(res_i)
-        else:
-            results = [
-                {"scores": score, "labels": label, "boxes": box} for score, label, box in zip(scores, labels, boxes)
-            ]
+                results[i]["masks"] = masks_i > 0.0
+
+        # Optionally gather keypoints for the same top-K queries and scale to absolute coordinates
+        if out_keypoints is not None:
+            num_keypoints = out_keypoints.shape[2]
+            k_idx = topk_boxes.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, num_keypoints, 3)
+            keypoints = torch.gather(out_keypoints, 1, k_idx)  # [B, num_select, K, 3]
+            kp_scale = torch.stack([img_w, img_h], dim=1)[:, None, None, :]  # [B, 1, 1, 2]
+            keypoints_xy = keypoints[..., :2] * kp_scale
+            keypoints_vis = keypoints[..., 2:3].sigmoid()
+            keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
+            for i in range(keypoints.shape[0]):
+                results[i]["keypoints"] = keypoints[i]
 
         return results

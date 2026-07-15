@@ -470,6 +470,49 @@ class SetCriterion(nn.Module):
         del target_masks
         return losses
 
+    def loss_keypoints(self, outputs, targets, indices, num_boxes):
+        """Compute keypoint losses on matched pairs.
+
+        Two terms are produced:
+
+        - ``loss_keypoint`` — L1 regression on the ``(x, y)`` coordinates of keypoints that are visible in the ground
+          truth (visibility flag > 0), normalised by the number of visible keypoints.  Invisible/absent keypoints are
+          excluded so an object with fewer than ``num_keypoints`` labelled points is supervised only on the points it
+          has.
+        - ``loss_keypoint_vis`` — binary cross-entropy on the visibility logit for every keypoint slot, teaching the
+          model which keypoints are present.
+
+        Targets are expected to carry ``"keypoints"`` of shape ``[num_target_boxes, num_keypoints, 3]`` as ``(x, y,
+        visibility)`` with ``x``, ``y`` normalised to ``[0, 1]``.  Returns an empty dict when the outputs carry no
+        keypoints (e.g. the two-stage encoder outputs), so keypoint supervision is silently skipped there.
+        """
+        if "pred_keypoints" not in outputs:
+            return {}
+
+        idx = self._get_src_permutation_idx(indices)
+        src_keypoints = outputs["pred_keypoints"][idx]  # [N, K, 3]
+
+        if src_keypoints.numel() == 0:
+            zero = src_keypoints.sum()
+            return {"loss_keypoint": zero, "loss_keypoint_vis": zero}
+
+        target_keypoints = torch.cat(
+            [t["keypoints"][j] for t, (_, j) in zip(targets, indices)], dim=0
+        )  # [N, K, 3]
+
+        src_xy = src_keypoints[..., :2]
+        src_vis_logits = src_keypoints[..., 2]
+        target_xy = target_keypoints[..., :2]
+        target_vis = (target_keypoints[..., 2] > 0).to(src_xy.dtype)  # [N, K]
+
+        l1 = (src_xy - target_xy).abs().sum(-1)  # [N, K]
+        num_visible = target_vis.sum().clamp(min=1)
+        loss_keypoint = (l1 * target_vis).sum() / num_visible
+
+        loss_keypoint_vis = F.binary_cross_entropy_with_logits(src_vis_logits, target_vis, reduction="mean")
+
+        return {"loss_keypoint": loss_keypoint, "loss_keypoint_vis": loss_keypoint_vis}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -488,6 +531,7 @@ class SetCriterion(nn.Module):
             "cardinality": self.loss_cardinality,
             "boxes": self.loss_boxes,
             "masks": self.loss_masks,
+            "keypoints": self.loss_keypoints,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
