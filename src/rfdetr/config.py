@@ -765,7 +765,7 @@ class TrainConfig(BaseModel):
     lr_min_factor: float = 0.0
     dont_save_weights: bool = False
     # PTL runtime/perf tuning knobs.
-    train_log_sync_dist: bool = False
+    train_log_sync_dist: bool = True
     train_log_on_step: bool = False
     compute_val_loss: bool = True
     compute_test_loss: bool = True
