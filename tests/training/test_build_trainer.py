@@ -679,6 +679,96 @@ class TestBuildTrainerDDPFields:
         assert tc.devices == "auto"
 
 
+class TestBuildTrainerDDPTimeout:
+    """``ddp_timeout_seconds`` must reach the strategy's process-group timeout.
+
+    A registry string ("ddp", "ddp_find_unused_parameters_true", ...) leaves PTL's 30-minute default in place, so the
+    strategy has to be rebuilt as a ``DDPStrategy`` instance carrying the timeout.
+    """
+
+    @staticmethod
+    def _capture(tc, mc):
+        """Build a trainer with a stubbed PTL ``Trainer`` and return the captured kwargs."""
+        import unittest.mock as mock
+
+        captured: dict = {}
+
+        def _fake_trainer(**kwargs):
+            captured.update(kwargs)
+            return mock.MagicMock()
+
+        with mock.patch("rfdetr.training.trainer.Trainer", side_effect=_fake_trainer):
+            build_trainer(tc, mc)
+        return captured
+
+    def test_timeout_rebuilds_registry_string_as_strategy_object(self, tmp_path):
+        """A ddp registry string plus a timeout must become a DDPStrategy carrying that timeout."""
+        from datetime import timedelta
+
+        from pytorch_lightning.strategies import DDPStrategy
+
+        captured = self._capture(
+            _tc(
+                tmp_path,
+                use_ema=False,
+                strategy="ddp_find_unused_parameters_true",
+                ddp_timeout_seconds=7200,
+            ),
+            _mc(),
+        )
+
+        strategy = captured["strategy"]
+        assert isinstance(strategy, DDPStrategy)
+        assert strategy._timeout == timedelta(seconds=7200)
+
+    def test_timeout_preserves_find_unused_parameters(self, tmp_path):
+        """Rebuilding the strategy must not drop the find_unused_parameters the string encoded."""
+        captured = self._capture(
+            _tc(
+                tmp_path,
+                use_ema=False,
+                strategy="ddp_find_unused_parameters_true",
+                ddp_timeout_seconds=7200,
+            ),
+            _mc(),
+        )
+
+        assert captured["strategy"]._ddp_kwargs.get("find_unused_parameters") is True
+
+    def test_no_timeout_leaves_strategy_string_untouched(self, tmp_path):
+        """Without a timeout the registry string is forwarded verbatim, as before."""
+        captured = self._capture(
+            _tc(tmp_path, use_ema=False, strategy="ddp_find_unused_parameters_true"),
+            _mc(),
+        )
+
+        assert captured["strategy"] == "ddp_find_unused_parameters_true"
+
+    def test_timeout_applies_to_spawn_strategy(self, tmp_path):
+        """ddp_spawn is rewritten to the interactive-spawn strategy, which must still carry the timeout."""
+        from datetime import timedelta
+
+        captured = self._capture(
+            _tc(tmp_path, use_ema=False, strategy="ddp_spawn", ddp_timeout_seconds=600),
+            _mc(),
+        )
+
+        assert captured["strategy"]._timeout == timedelta(seconds=600)
+
+    def test_timeout_warns_when_strategy_cannot_carry_it(self, tmp_path):
+        """A timeout on a non-DDP strategy is silently unenforceable, so it must warn."""
+        with pytest.warns(UserWarning, match="ddp_timeout_seconds is ignored"):
+            self._capture(
+                _tc(tmp_path, use_ema=False, strategy="auto", ddp_timeout_seconds=7200),
+                _mc(),
+            )
+
+    def test_timeout_rejects_non_positive_values(self, tmp_path):
+        """ddp_timeout_seconds must be a positive number of seconds, not 0 or negative."""
+        with pytest.raises(ValueError):
+            _tc(tmp_path, use_ema=False, strategy="ddp", ddp_timeout_seconds=0)
+
+
 class TestBuildTrainerSegmentationDDP:
     """build_trainer() must enable find_unused_parameters when segmentation_head=True + strategy='ddp'."""
 

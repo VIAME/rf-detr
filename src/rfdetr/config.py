@@ -760,6 +760,12 @@ class TrainConfig(BaseModel):
     # num_nodes maps to PTL Trainer(num_nodes=...) for multi-machine training.
     # Single-machine DDP users should leave this at 1 (the default).
     num_nodes: int = 1
+    # Process-group timeout for DDP strategies. None keeps PTL's default (30 min),
+    # after which the NCCL watchdog aborts every rank with SIGABRT if one rank has
+    # not reached the collective. Raise it when a rank can legitimately stall
+    # longer than that (slow checkpoint writes to network storage, a long
+    # single-rank eval), so a slow-but-alive run is not killed mid-training.
+    ddp_timeout_seconds: Optional[int] = Field(default=None, ge=1)
     fp16_eval: bool = False
     lr_scheduler: Literal["step", "cosine", "multistep"] = "step"
     lr_min_factor: float = 0.0
