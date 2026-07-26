@@ -17,6 +17,7 @@
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -32,6 +33,16 @@ from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.shapes import as_pair
 
 logger = get_logger()
+
+# Re-reads of a failed image before giving up on it. A short read off network
+# storage raises the same OSError PIL raises for a genuinely truncated file, and
+# retrying costs nothing when the file is fine.
+_IMAGE_READ_ATTEMPTS = 3
+_IMAGE_READ_BACKOFF_SECONDS = 0.5
+# Neighbouring samples tried once the image itself is judged unreadable. Bounded
+# so a wholesale dataset failure still surfaces as an error instead of quietly
+# training on a handful of duplicated images.
+_MAX_SUBSTITUTIONS = 10
 
 
 def is_valid_coco_dataset(dataset_dir: str) -> bool:
@@ -230,16 +241,88 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             return image.convert("RGBA")
         return image.convert("RGB")
 
-    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+    def _image_path(self, idx: int) -> str:
+        """Return the on-disk path backing a dataset index.
+
+        Args:
+            idx: Index into ``self.ids``.
+
+        Returns:
+            The absolute path of the image file for that sample.
+        """
+        return str(Path(self.root) / self.coco.loadImgs(self.ids[idx])[0]["file_name"])
+
+    def _fetch(self, idx: int) -> Tuple[Any, Any]:
+        """Load and transform a single sample.
+
+        Args:
+            idx: Index into ``self.ids``.
+
+        Returns:
+            The ``(image, target)`` pair after annotation conversion and transforms.
+        """
         img, target = super(CocoDetection, self).__getitem__(idx)
-        image_id = self.ids[idx]
-        target = {"image_id": image_id, "annotations": target}
+        target = {"image_id": self.ids[idx], "annotations": target}
         img, target = self.prepare(img, target)
         if self._transforms is not None:
             # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to
             # normalized [cx, cy, w, h] occurs inside Normalize
             img, target = self._transforms(img, target)
         return img, target
+
+    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+        """Load a sample, tolerating an unreadable image rather than raising.
+
+        A DataLoader worker that raises takes its rank down with it, and under DDP
+        every surviving rank then blocks in the next collective until the NCCL
+        watchdog aborts the job one process-group timeout later -- naming no file.
+        One bad read must not cost a multi-GPU run, so the read is retried (a
+        transient short read off network storage is indistinguishable from a
+        truncated file to PIL) and then falls through to a neighbouring sample,
+        which keeps every rank's batch count identical.
+
+        Only ``OSError`` is tolerated -- that covers truncated, unidentifiable,
+        missing and I/O-failed images. Annotation and transform bugs still raise.
+
+        Args:
+            idx: Index into ``self.ids``.
+
+        Returns:
+            The ``(image, target)`` pair, possibly for a neighbouring index.
+
+        Raises:
+            RuntimeError: If every candidate from ``idx`` onward is unreadable,
+                which means the dataset or its filesystem is broken rather than a
+                single file being bad.
+        """
+        for attempt in range(1, _IMAGE_READ_ATTEMPTS + 1):
+            try:
+                return self._fetch(idx)
+            except OSError as exc:
+                logger.error(
+                    f"Read failed for {self._image_path(idx)} "
+                    f"(attempt {attempt}/{_IMAGE_READ_ATTEMPTS}): {exc}"
+                )
+                if attempt < _IMAGE_READ_ATTEMPTS:
+                    time.sleep(_IMAGE_READ_BACKOFF_SECONDS * attempt)
+
+        for step in range(1, _MAX_SUBSTITUTIONS + 1):
+            alt = (idx + step) % len(self.ids)
+            try:
+                sample = self._fetch(alt)
+            except OSError:
+                continue
+            logger.error(
+                f"Substituting sample {alt} for unreadable sample {idx} "
+                f"({self._image_path(idx)}); training continues without it."
+            )
+            return sample
+
+        raise RuntimeError(
+            f"{_MAX_SUBSTITUTIONS + 1} consecutive samples were unreadable "
+            f"starting at index {idx} ({self._image_path(idx)}). The dataset or "
+            f"the filesystem holding it is broken, not one bad file."
+        )
 
 
 class ConvertCoco(object):
