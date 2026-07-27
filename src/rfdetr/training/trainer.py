@@ -6,6 +6,7 @@
 """Trainer factory — assembles a PTL Trainer from RF-DETR configs."""
 
 import warnings
+from datetime import timedelta
 from typing import Any
 
 import torch
@@ -155,10 +156,18 @@ def build_trainer(
     # --- Strategy + EMA sharding guard ---
     strategy = tc.strategy
 
+    # A DDPStrategy object is the only way to set the process-group timeout: the
+    # registry strings ("ddp", "ddp_find_unused_parameters_true", ...) construct
+    # the strategy with PTL's 30-minute default, and nothing else overrides it.
+    ddp_timeout = timedelta(seconds=int(tc.ddp_timeout_seconds)) if tc.ddp_timeout_seconds else None
+    ddp_kwargs: dict[str, Any] = {"timeout": ddp_timeout} if ddp_timeout is not None else {}
+
     # Transparently replace fork-based DDP with spawn-based DDP — see the
     # module-level comment block above _InteractiveSpawnLauncher for rationale.
     if strategy in ("ddp_notebook", "ddp_spawn"):
-        strategy = _NotebookSpawnDDPStrategy(start_method="spawn", find_unused_parameters=True)
+        strategy = _NotebookSpawnDDPStrategy(
+            start_method="spawn", find_unused_parameters=True, **ddp_kwargs
+        )
         _logger.info(
             "%s → spawn-based DDP to avoid OpenMP thread pool corruption after fork.",
             tc.strategy,
@@ -174,9 +183,32 @@ def build_trainer(
         # backward pass to detect which parameters contributed to the loss.  The
         # keypoint head can hit the same issue when some queries contribute no
         # visible keypoints to the loss on a given step.
-        strategy = _DDPStrategy(find_unused_parameters=True)
+        strategy = _DDPStrategy(find_unused_parameters=True, **ddp_kwargs)
         _logger.info(
             "segmentation_head/keypoint_head with strategy='ddp' → DDPStrategy(find_unused_parameters=True).",
+        )
+    elif ddp_timeout is not None and strategy in (
+        "ddp",
+        "ddp_find_unused_parameters_true",
+        "ddp_find_unused_parameters_false",
+    ):
+        # "ddp_fork" is deliberately absent: it also selects a start method, which
+        # this reconstruction from the bare strategy name would silently drop.
+        strategy = _DDPStrategy(
+            find_unused_parameters=strategy.endswith("find_unused_parameters_true"), **ddp_kwargs
+        )
+        _logger.info(
+            "%s → DDPStrategy(timeout=%ss) so a lagging rank is not aborted at PTL's 30-minute default.",
+            tc.strategy,
+            int(tc.ddp_timeout_seconds),
+        )
+    elif ddp_timeout is not None:
+        warnings.warn(
+            f"ddp_timeout_seconds is ignored for strategy={strategy!r}: the process-group timeout can only "
+            f"be set on an explicit DDP strategy ('ddp', 'ddp_find_unused_parameters_true'/'_false', "
+            f"'ddp_spawn', 'ddp_notebook'), not on a registry alias that PTL resolves itself.",
+            UserWarning,
+            stacklevel=2,
         )
     sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
     enable_ema = bool(tc.use_ema) and not sharded

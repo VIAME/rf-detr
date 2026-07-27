@@ -278,6 +278,45 @@ class TestBestModelCallback:
 
         assert (tmp_path / "checkpoint_best_ema.pth").exists()
 
+    def test_sanity_check_does_not_save_ema_checkpoint(self, tmp_path: Path) -> None:
+        """The pre-training sanity pass must not write checkpoint_best_ema.pth."""
+        cb = BestModelCallback(output_dir=str(tmp_path), monitor_ema="val/ema_mAP_50_95")
+        trainer = _make_trainer({"val/mAP_50_95": 0.4, "val/ema_mAP_50_95": 0.6})
+        trainer.sanity_checking = True
+
+        cb.on_validation_end(trainer, _make_pl_module())
+
+        assert not (tmp_path / "checkpoint_best_ema.pth").exists()
+
+    def test_sanity_check_does_not_save_regular_checkpoint(self, tmp_path: Path) -> None:
+        """The pre-training sanity pass must not write checkpoint_best_regular.pth."""
+        cb = BestModelCallback(output_dir=str(tmp_path))
+        trainer = _make_trainer({"val/mAP_50_95": 0.5})
+        trainer.sanity_checking = True
+
+        cb.on_validation_end(trainer, _make_pl_module())
+
+        assert not (tmp_path / "checkpoint_best_regular.pth").exists()
+
+    def test_sanity_check_does_not_poison_best_ema_high_water_mark(self, tmp_path: Path) -> None:
+        """A high sanity-pass EMA score must not block a lower real epoch from saving.
+
+        Fine-tuning from an already-good checkpoint scores well on the two-batch sanity pass, so a sanity score that
+        leaked into ``_best_ema`` would outrank every real epoch for the rest of the run.
+        """
+        cb = BestModelCallback(output_dir=str(tmp_path), monitor_ema="val/ema_mAP_50_95")
+        pl_module = _make_pl_module()
+
+        sanity = _make_trainer({"val/mAP_50_95": 0.63, "val/ema_mAP_50_95": 0.63})
+        sanity.sanity_checking = True
+        cb.on_validation_end(sanity, pl_module)
+
+        real_epoch = _make_trainer({"val/mAP_50_95": 0.58, "val/ema_mAP_50_95": 0.58})
+        cb.on_validation_end(real_epoch, pl_module)
+
+        assert (tmp_path / "checkpoint_best_ema.pth").exists()
+        assert cb._best_ema == pytest.approx(0.58)
+
     def test_ema_checkpoint_saves_ema_callback_weights(self, tmp_path: Path) -> None:
         """EMA checkpoint must store EMA callback weights, not live model weights."""
         cb = BestModelCallback(
