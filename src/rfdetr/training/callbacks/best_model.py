@@ -292,12 +292,9 @@ class BestModelCallback(ModelCheckpoint):
         # Stash before the skip guard — eligible epochs still need this reference
         # inside _save_checkpoint (which receives no pl_module param).
         self._current_pl_module = pl_module
-        # The sanity-check pass validates untrained weights over num_sanity_val_steps
-        # batches before epoch 0. The parent skips it internally, but the EMA branch
-        # below does not, so without this guard a fine-tune from an already-good
-        # checkpoint sets _best_ema from a two-batch score no real epoch can beat --
-        # freezing checkpoint_best_ema.pth at the pre-training weights and making
-        # on_fit_end promote them to checkpoint_best_total.pth.
+        # The parent skips the sanity pass internally; the EMA branch below does not.
+        # A fine-tune from a good checkpoint would otherwise set _best_ema from a
+        # two-batch score no real epoch can beat, freezing checkpoint_best_ema.pth.
         if trainer.sanity_checking:
             return
         if trainer.current_epoch < self._skip_best_epochs:
