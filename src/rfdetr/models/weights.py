@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, List
+from typing import Any, List, Optional
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -71,12 +71,71 @@ def adapt_input_channels(model: torch.nn.Module, num_channels: int) -> None:
 
     patch_embeddings = model.backbone[0].encoder.encoder.embeddings.patch_embeddings
     proj = patch_embeddings.projection
+    # Idempotent: the stem is already this wide when _align_stem_to_checkpoint
+    # pre-adapted it to load an N-channel checkpoint. Re-tiling would rescale the
+    # loaded weights by 3/num_channels and quietly corrupt them.
+    if proj.weight.shape[1] == num_channels:
+        return
     new_proj = copy.deepcopy(proj)
     new_proj.in_channels = num_channels
     new_proj.weight = torch.nn.Parameter(_adapt_input_conv(num_channels, proj.weight))
     new_proj.weight.requires_grad = proj.weight.requires_grad
     patch_embeddings.projection = new_proj
     patch_embeddings.num_channels = num_channels
+
+
+_PATCH_PROJ_SUFFIX = "patch_embeddings.projection.weight"
+
+
+def _checkpoint_stem_channels(checkpoint_state: dict[str, Any]) -> Optional[int]:
+    """Return the input-channel count of a checkpoint's patch-embedding stem.
+
+    Args:
+        checkpoint_state: Model state dict from a checkpoint.
+
+    Returns:
+        The stem's input-channel count, or ``None`` if the checkpoint carries no
+        recognisable patch-embedding projection.
+    """
+    for name, tensor in checkpoint_state.items():
+        if name.endswith(_PATCH_PROJ_SUFFIX) and getattr(tensor, "ndim", 0) == 4:
+            return int(tensor.shape[1])
+    return None
+
+
+def _align_stem_to_checkpoint(
+    nn_model: torch.nn.Module, checkpoint_state: dict[str, Any], num_channels: int
+) -> None:
+    """Widen the model's patch-embedding stem when the checkpoint is already non-RGB.
+
+    ``adapt_input_channels`` runs *after* this load, because it is written to tile a
+    stock 3-channel ImageNet/COCO stem out to ``num_channels``. That ordering breaks
+    the moment the checkpoint is itself a multi-channel model: the stem is still 3
+    wide at load time and ``load_state_dict`` raises a size mismatch. Fine-tuning a
+    4-channel run from its own checkpoint hits exactly that.
+
+    So when the checkpoint's stem already matches the configured channel count, widen
+    the model first and let ``adapt_input_channels`` no-op afterwards.
+
+    Args:
+        nn_model: Model about to receive ``checkpoint_state``.
+        checkpoint_state: Model state dict from the checkpoint.
+        num_channels: Channel count the model is configured for.
+
+    Raises:
+        ValueError: If the checkpoint's stem is neither 3-channel (adaptable) nor a
+            match for ``num_channels``, which no amount of tiling can reconcile.
+    """
+    ckpt_channels = _checkpoint_stem_channels(checkpoint_state)
+    if ckpt_channels is None or ckpt_channels == 3:
+        return
+    if ckpt_channels != num_channels:
+        raise ValueError(
+            f"Checkpoint has a {ckpt_channels}-channel input stem but the model is configured for "
+            f"{num_channels} channels. Only a 3-channel stem can be adapted to another width; set "
+            f"num_channels={ckpt_channels} to fine-tune from this checkpoint."
+        )
+    adapt_input_channels(nn_model, ckpt_channels)
 
 
 def _slice_query_param_per_group(
@@ -533,6 +592,7 @@ def load_pretrain_weights(
                 checkpoint["model"][name] = tensor[: mc.num_queries * mc.group_detr]
 
     interpolate_position_embeddings(checkpoint["model"], mc.pe_grid)
+    _align_stem_to_checkpoint(nn_model, checkpoint["model"], mc.num_channels)
     incompatible = nn_model.load_state_dict(checkpoint["model"], strict=False)
     _warn_on_partial_load(incompatible, pretrain_weights)
 
