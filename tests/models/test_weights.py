@@ -709,8 +709,14 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
             "Per-group structure was not preserved in query_feat.weight."
         )
 
-    def test_legacy_checkpoint_without_args_falls_back_to_flat_slice(self, monkeypatch, tmp_path):
-        """No ``args`` in checkpoint → preserve the legacy flat slice (backward compat)."""
+    def test_argless_checkpoint_with_divisible_rows_infers_group_structure(self, monkeypatch, tmp_path):
+        """No ``args`` but rows divisible by the model's group_detr → infer groups, slice per-group.
+
+        This is the rf-detr-seg-large.pt shape: an args-less checkpoint whose query
+        tensors were packed with the family's group_detr, loaded into a config with
+        fewer queries. The loader must assume the model's group count rather than
+        flat-slice, which would scramble every group but the first.
+        """
         from rfdetr.models.weights import load_pretrain_weights
 
         mc = RFDETRBaseConfig(
@@ -721,7 +727,7 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
             group_detr=3,
         )
         checkpoint = self._make_args_dict_checkpoint(num_queries=4, group_detr=3)
-        del checkpoint["args"]  # legacy
+        del checkpoint["args"]  # args-less, rows = 4*3 = 12, divisible by group_detr=3
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
 
         nn_model = _fake_nn_model()
@@ -730,10 +736,36 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
         passed_state = nn_model.load_state_dict.call_args[0][0]
         refpoint = passed_state["refpoint_embed.weight"]
         query_feat = passed_state["query_feat.weight"]
-        # Legacy flat slice: first 2*3=6 rows of the original 12.  Original rows
-        # are labelled 0,1,2,3,100,101,102,103,200,201,202,203 → first 6 are
-        # 0,1,2,3,100,101.
-        expected = [0, 1, 2, 3, 100, 101]
+        # Inferred ckpt_num_queries = 12 // 3 = 4 → first 2 of each group.
+        expected = [0, 1, 100, 101, 200, 201]
+        assert refpoint[:, 0].int().tolist() == expected
+        assert query_feat[:, 0].int().tolist() == expected
+
+    def test_argless_checkpoint_with_indivisible_rows_falls_back_to_flat_slice(self, monkeypatch, tmp_path):
+        """No ``args`` and rows NOT divisible by the model's group_detr → legacy flat slice."""
+        from rfdetr.models.weights import load_pretrain_weights
+
+        mc = RFDETRBaseConfig(
+            pretrain_weights="/fake/weights.pth",
+            device="cpu",
+            num_queries=2,
+            num_select=2,
+            group_detr=5,
+        )
+        # rows = 4*3 = 12, not divisible by group_detr=5 → no inference possible.
+        checkpoint = self._make_args_dict_checkpoint(num_queries=4, group_detr=3)
+        del checkpoint["args"]
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+
+        nn_model = _fake_nn_model()
+        load_pretrain_weights(nn_model, mc)
+
+        passed_state = nn_model.load_state_dict.call_args[0][0]
+        refpoint = passed_state["refpoint_embed.weight"]
+        query_feat = passed_state["query_feat.weight"]
+        # Flat slice keeps the first 2*5=10 of the original 12 rows, labelled
+        # 0,1,2,3,100,101,102,103,200,201,202,203.
+        expected = [0, 1, 2, 3, 100, 101, 102, 103, 200, 201]
         assert refpoint[:, 0].int().tolist() == expected
         assert query_feat[:, 0].int().tolist() == expected
 
@@ -795,8 +827,17 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
         assert refpoint[:, 0].int().tolist() == expected
         assert query_feat[:, 0].int().tolist() == expected
 
-    def test_legacy_fallback_multigroup_emits_warning(self, monkeypatch) -> None:
-        """group_detr > 1 legacy checkpoint (no num_queries/group_detr in args) emits scramble-risk warning."""
+    @pytest.mark.parametrize(
+        ("model_group_detr", "expected_fragment"),
+        [
+            # rows 12 divisible by 3 → group inference kicks in and says so
+            pytest.param(3, "assuming the model's group_detr", id="divisible-infers"),
+            # rows 12 not divisible by 5 → legacy flat slice + scramble-risk warning
+            pytest.param(5, "flat slice", id="indivisible-warns-flat"),
+        ],
+    )
+    def test_argless_multigroup_checkpoint_warning(self, monkeypatch, model_group_detr, expected_fragment) -> None:
+        """group_detr > 1 args-less checkpoint warns: inference when rows divide, scramble risk otherwise."""
         from rfdetr.models.weights import load_pretrain_weights
 
         mc = RFDETRBaseConfig(
@@ -804,7 +845,7 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
             device="cpu",
             num_queries=2,
             num_select=2,
-            group_detr=3,
+            group_detr=model_group_detr,
         )
         labelled_refpoint = _labelled_query_tensor(num_queries=4, group_detr=3, dim=4)
         labelled_query_feat = _labelled_query_tensor(num_queries=4, group_detr=3, dim=256)
@@ -832,8 +873,8 @@ class TestLoadPretrainWeightsPerGroupQuerySlice:
         nn_model = _fake_nn_model()
         load_pretrain_weights(nn_model, mc)
 
-        assert any("group_detr" in msg and ("scramble" in msg or "flat slice" in msg) for msg in captured), (
-            f"Expected scramble-risk warning for group_detr > 1; got: {captured}"
+        assert any(expected_fragment in msg for msg in captured), (
+            f"Expected a warning containing {expected_fragment!r}; got: {captured}"
         )
 
     def test_legacy_fallback_when_args_missing_num_queries_key(self, monkeypatch, tmp_path):

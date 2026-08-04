@@ -563,6 +563,33 @@ def load_pretrain_weights(
                     _known,
                     _known_val,
                 )
+    # When BOTH are absent, assume the checkpoint shares the model's group count and
+    # infer its num_queries from the tensor rows.  Several published RF-DETR
+    # checkpoints carry no args at all (rf-detr-seg-large.pt: 3900 = 300 x 13 rows,
+    # loaded into a 200-query config), and the flat-slice fallback then scrambles
+    # every group but the first — 2400 of 2600 rows land in the wrong (group, slot),
+    # poisoning 12 of the 13 query groups that one-to-many training relies on.
+    # Genuine group-1 legacy checkpoints are untouched: their row counts (e.g. 300)
+    # are not divisible by the family's group_detr of 13, so they fall through to
+    # the flat slice, which is correct for a single group.
+    if ckpt_num_queries is None and ckpt_group_detr is None and mc.group_detr > 1:
+        _first_query_key = next(
+            (k for k in checkpoint["model"] if any(k.endswith(s) for s in _QUERY_PARAM_SUFFIXES)),
+            None,
+        )
+        if _first_query_key is not None:
+            _n = checkpoint["model"][_first_query_key].shape[0]
+            if _n % mc.group_detr == 0:
+                ckpt_group_detr = mc.group_detr
+                ckpt_num_queries = _n // mc.group_detr
+                logger.warning(
+                    "load_pretrain_weights: checkpoint has no args.num_queries / args.group_detr; "
+                    "assuming the model's group_detr=%d and inferring ckpt_num_queries=%d from "
+                    "tensor rows %d so query groups stay aligned.",
+                    mc.group_detr,
+                    ckpt_num_queries,
+                    _n,
+                )
     # Warn once (not once per suffix key) when falling back to the legacy flat slice.
     if mc.group_detr > 1 and (ckpt_num_queries is None or ckpt_group_detr is None):
         logger.warning(
