@@ -692,6 +692,11 @@ class AlbumentationsWrapper:
                 target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
             else:
                 target_out["masks"] = torch.as_tensor(np.stack(masks_aug), dtype=torch.bool)
+        elif masks_list is not None:
+            # Zero-instance mask tensors bypass Albumentations, so resync their
+            # spatial dims to the transformed image.
+            height, width = augmented["image"].shape[:2]
+            target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
         if keypoints_np is not None:
             # Reassemble keypoints for the kept instances in their new order. A keypoint stays present only if it was
             # visible in the source and still lands inside the transformed image; otherwise it is marked absent.
