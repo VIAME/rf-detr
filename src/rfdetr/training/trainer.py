@@ -248,6 +248,8 @@ def build_trainer(
             segmentation=model_config.segmentation_head,
             eval_interval=tc.eval_interval,
             log_per_class_metrics=tc.log_per_class_metrics,
+            min_class_support=tc.min_class_support,
+            class_agnostic=tc.class_agnostic_eval,
         )
     )
 
@@ -279,11 +281,15 @@ def build_trainer(
         )
     )
 
-    # Best-model checkpointing — monitor EMA metric only when EMA is active.
+    # Best-model checkpointing — monitor EMA metric only when EMA is active.  Under a
+    # support floor the gated variants are what the run is being tuned for, so selection
+    # follows them rather than the all-class mean the rare classes dominate.
+    monitor_suffix = "_gated" if tc.min_class_support > 0 else ""
     callbacks.append(
         BestModelCallback(
             output_dir=tc.output_dir,
-            monitor_ema="val/ema_mAP_50_95" if enable_ema else None,
+            monitor_regular=f"val/mAP_50_95{monitor_suffix}",
+            monitor_ema=f"val/ema_mAP_50_95{monitor_suffix}" if enable_ema else None,
             run_test=tc.run_test,
             skip_best_epochs=tc.skip_best_epochs,
         )
@@ -296,6 +302,8 @@ def build_trainer(
                 patience=tc.early_stopping_patience,
                 min_delta=tc.early_stopping_min_delta,
                 use_ema=tc.early_stopping_use_ema,
+                monitor_regular=f"val/mAP_50_95{monitor_suffix}",
+                monitor_ema=f"val/ema_mAP_50_95{monitor_suffix}",
                 skip_best_epochs=tc.skip_best_epochs,
             )
         )

@@ -692,6 +692,12 @@ class TrainConfig(BaseModel):
     eval_max_dets: int = 500
     eval_interval: int = 1
     log_per_class_metrics: bool = True
+    # Ground-truth instances a class needs before it counts toward the macro-averaged
+    # headline metrics and toward best-checkpoint selection.  0 keeps torchmetrics'
+    # behaviour of averaging every class carrying ground truth, which on a long-tailed
+    # set lets a class with a handful of boxes swing the number that picks the model.
+    min_class_support: int = Field(default=0, ge=0)
+    class_agnostic_eval: bool = True
     # A list of single-key dicts is equivalent to the dict form and is what
     # build_albumentations_transforms already accepts; it is the only way to express
     # a preset that repeats a transform (e.g. two ChannelSubset entries, one per

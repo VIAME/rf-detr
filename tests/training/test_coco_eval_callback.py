@@ -976,3 +976,186 @@ class TestComputeAndLogEmaResetPath:
             cb._compute_and_log(trainer, module, "val")
 
         mock_ema.reset.assert_called_once()
+
+
+def _matching_entry(total_gt: int) -> dict:
+    """Return a per-class matching-accumulator entry carrying `total_gt` instances."""
+    return {
+        "scores": np.array([0.9], dtype=np.float32),
+        "matches": np.array([1], dtype=np.int64),
+        "ignore": np.array([False]),
+        "total_gt": total_gt,
+    }
+
+
+def _metrics_with_per_class(aps: dict[int, float]) -> dict:
+    """Return a metrics dict carrying per-class AP for the given category ids."""
+    metrics = _minimal_metrics()
+    metrics["classes"] = torch.tensor(sorted(aps))
+    metrics["map_per_class"] = torch.tensor([aps[c] for c in sorted(aps)])
+    metrics["mar_500_per_class"] = torch.tensor([0.5 for _ in aps])
+    return metrics
+
+
+def _run_compute_and_log(cb: COCOEvalCallback, merged: dict, metrics: dict) -> tuple[MagicMock, MagicMock]:
+    """Drive _compute_and_log with the heavy collaborators stubbed out."""
+    trainer = _make_trainer()
+    module = _cpu_module()
+    cb.setup(trainer, module, stage="fit")
+    trainer.callback_metrics = {}
+    cb.map_metric = MagicMock(name="map_metric")
+    cb.map_metric.compute.return_value = metrics
+
+    with (
+        patch.object(cb, "_merge_metric_state_across_ranks"),
+        patch.object(cb, "_print_metrics_tables"),
+        patch("rfdetr.training.callbacks.coco_eval.distributed_merge_matching_data", return_value=merged),
+    ):
+        cb._compute_and_log(trainer, module, "val")
+    return trainer, module
+
+
+class TestMinClassSupport:
+    """Support floor keeps thinly-annotated classes out of the macro-averaged headline."""
+
+    def test_gated_map_excludes_low_support_classes(self) -> None:
+        """A class under the floor is dropped from the gated mean even though it has GT."""
+        cb = COCOEvalCallback(min_class_support=10, class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(3)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6, 1: 0.0}))
+
+        gated = next(c for c in module.log.call_args_list if c.args[0] == "val/mAP_50_95_gated")
+        assert gated.args[1] == pytest.approx(0.6)
+
+    def test_all_class_map_is_left_untouched(self) -> None:
+        """The ungated key keeps reporting torchmetrics' own all-class mean."""
+        cb = COCOEvalCallback(min_class_support=10, class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(3)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6, 1: 0.0}))
+
+        ungated = next(c for c in module.log.call_args_list if c.args[0] == "val/mAP_50_95")
+        assert float(ungated.args[1]) == pytest.approx(0.4)
+
+    def test_falls_back_to_all_class_map_when_none_qualify(self) -> None:
+        """A floor no class reaches must not leave the monitored metric NaN."""
+        cb = COCOEvalCallback(min_class_support=10_000, class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(3)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6, 1: 0.0}))
+
+        gated = next(c for c in module.log.call_args_list if c.args[0] == "val/mAP_50_95_gated")
+        assert gated.args[1] == pytest.approx(0.4)
+
+    def test_classes_with_no_ground_truth_are_ignored(self) -> None:
+        """pycocotools' -1 sentinel must not be averaged in as a real score."""
+        cb = COCOEvalCallback(min_class_support=1, class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(50)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6, 1: -1.0}))
+
+        gated = next(c for c in module.log.call_args_list if c.args[0] == "val/mAP_50_95_gated")
+        assert gated.args[1] == pytest.approx(0.6)
+
+    def test_no_gated_key_when_floor_is_zero(self) -> None:
+        """Default configuration logs exactly the keys it logged before the floor existed."""
+        cb = COCOEvalCallback(class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(3)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6, 1: 0.0}))
+
+        assert "val/mAP_50_95_gated" not in {c.args[0] for c in module.log.call_args_list}
+
+    def test_f1_sweep_macro_averages_over_gated_classes(self) -> None:
+        """The swept threshold is chosen for the classes that have enough GT to measure."""
+        cb = COCOEvalCallback(min_class_support=10, class_agnostic=False)
+        merged = {0: _matching_entry(100), 1: _matching_entry(3), 2: _matching_entry(60)}
+        trainer = _make_trainer()
+        module = _cpu_module()
+        cb.setup(trainer, module, stage="fit")
+        trainer.callback_metrics = {}
+        cb.map_metric = MagicMock(name="map_metric")
+        cb.map_metric.compute.return_value = _metrics_with_per_class({0: 0.6, 1: 0.0, 2: 0.5})
+
+        sweep_result = [
+            {
+                "macro_f1": 0.5,
+                "macro_precision": 0.5,
+                "macro_recall": 0.5,
+                "per_class_f1": np.zeros(3),
+                "per_class_prec": np.zeros(3),
+                "per_class_rec": np.zeros(3),
+            }
+        ]
+        with (
+            patch.object(cb, "_merge_metric_state_across_ranks"),
+            patch.object(cb, "_print_metrics_tables"),
+            patch("rfdetr.training.callbacks.coco_eval.distributed_merge_matching_data", return_value=merged),
+            patch(
+                "rfdetr.training.callbacks.coco_eval.sweep_confidence_thresholds",
+                return_value=sweep_result,
+            ) as sweep,
+        ):
+            cb._compute_and_log(trainer, module, "val")
+
+        # sorted_ids == [0, 1, 2]; class 1 holds 3 instances, under the floor of 10.
+        assert sweep.call_args.args[2] == [0, 2]
+
+
+class TestClassAgnosticEval:
+    """Label-collapsed evaluation scores localisation independently of classification."""
+
+    def test_metric_is_created_by_default(self) -> None:
+        """The agnostic metric exists after setup unless explicitly disabled."""
+        cb = COCOEvalCallback()
+        cb.setup(_make_trainer(), _cpu_module(), stage="fit")
+        assert cb.map_metric_agnostic is not None
+
+    def test_metric_is_absent_when_disabled(self) -> None:
+        """class_agnostic=False leaves no second metric to accumulate or compute."""
+        cb = COCOEvalCallback(class_agnostic=False)
+        cb.setup(_make_trainer(), _cpu_module(), stage="fit")
+        assert cb.map_metric_agnostic is None
+
+    def test_batch_end_updates_the_agnostic_metric(self) -> None:
+        """Each validation batch feeds the agnostic metric alongside the class-aware one."""
+        cb = COCOEvalCallback()
+        cb.setup(_make_trainer(), _cpu_module(), stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        cb.map_metric_agnostic = MagicMock(name="map_metric_agnostic")
+        outputs = {"results": _detection_preds(2), "targets": _detection_targets()}
+
+        cb.on_validation_batch_end(_make_trainer(), _cpu_module(), outputs, None, 0)
+
+        cb.map_metric_agnostic.update.assert_called_once()
+
+    def test_no_agnostic_key_logged_without_state(self) -> None:
+        """An epoch that accumulated nothing must not log a -1 sentinel as a score."""
+        cb = COCOEvalCallback()
+        merged = {0: _matching_entry(100)}
+        _, module = _run_compute_and_log(cb, merged, _metrics_with_per_class({0: 0.6}))
+
+        assert "val/mAP_50_95_agnostic" not in {c.args[0] for c in module.log.call_args_list}
+
+    def test_collapse_labels_zeroes_every_label(self) -> None:
+        """Collapsing rewrites all labels to a single class id."""
+        collapsed = COCOEvalCallback._collapse_labels(
+            [{"boxes": torch.zeros(3, 4), "labels": torch.tensor([4, 7, 2])}]
+        )
+        assert torch.equal(collapsed[0]["labels"], torch.zeros(3, dtype=torch.long))
+
+    def test_collapse_labels_leaves_the_source_untouched(self) -> None:
+        """map_metric already holds references to these tensors, so they must not be mutated."""
+        source = [{"boxes": torch.zeros(2, 4), "labels": torch.tensor([5, 6])}]
+        COCOEvalCallback._collapse_labels(source)
+        assert torch.equal(source[0]["labels"], torch.tensor([5, 6]))
+
+    def test_collapse_labels_drops_masks(self) -> None:
+        """The agnostic metric is bbox-only; carrying masks would invite a segm IoU pass."""
+        collapsed = COCOEvalCallback._collapse_labels(
+            [{"boxes": torch.zeros(1, 4), "labels": torch.tensor([1]), "masks": torch.zeros(1, 8, 8)}]
+        )
+        assert "masks" not in collapsed[0]
+
+    def test_collapse_labels_keeps_scores(self) -> None:
+        """Detection scores drive the PR curve and must survive the collapse."""
+        collapsed = COCOEvalCallback._collapse_labels(
+            [{"boxes": torch.zeros(1, 4), "labels": torch.tensor([1]), "scores": torch.tensor([0.75])}]
+        )
+        assert torch.equal(collapsed[0]["scores"], torch.tensor([0.75]))
