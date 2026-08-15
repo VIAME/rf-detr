@@ -515,6 +515,12 @@ def load_pretrain_weights(
                 num_classes = checkpoint_num_classes - 1
                 configured_num_classes_plus_bg = checkpoint_num_classes
                 mc.num_classes = num_classes
+                # The assignment adds num_classes to model_fields_set, which
+                # _align_num_classes_from_dataset would read as a user override
+                # and refuse to adjust to the dataset's class count. Keep the
+                # field auto-align-eligible since the user never set it.
+                if not user_set_num_classes and hasattr(mc, "__pydantic_fields_set__"):
+                    mc.__pydantic_fields_set__.discard("num_classes")
         # In all mismatch cases we need the head to match the checkpoint's
         # class count so load_state_dict succeeds without size mismatches.
         nn_model.reinitialize_detection_head(checkpoint_num_classes)
