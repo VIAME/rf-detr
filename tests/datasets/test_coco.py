@@ -94,6 +94,54 @@ class TestConvertCocoWithMapping:
         assert target["labels"].dtype == torch.int64
 
 
+class TestConvertCocoMaskFallback:
+    """Annotations without a segmentation get an inscribed-ellipse mask so mask/box counts agree."""
+
+    _MIXED_ANNOTATIONS = [
+        # box-only annotation FIRST — previously dropped every mask for the image
+        {"bbox": [10, 10, 40, 20], "category_id": 1, "area": 800, "iscrowd": 0},
+        {
+            "bbox": [50, 50, 20, 20],
+            "category_id": 7,
+            "area": 400,
+            "iscrowd": 0,
+            "segmentation": [[50, 50, 70, 50, 70, 70, 50, 70]],
+        },
+    ]
+
+    def test_mask_count_matches_box_count_with_mixed_annotations(self):
+        converter = ConvertCoco(include_masks=True)
+        _, target = converter(_IMAGE, _make_target(self._MIXED_ANNOTATIONS))
+        assert target["masks"].shape[0] == target["boxes"].shape[0] == 2
+
+    def test_mask_count_matches_box_count_without_any_segmentation(self):
+        annotations = [
+            {"bbox": [10, 10, 30, 30], "category_id": 1, "area": 900, "iscrowd": 0},
+            {"bbox": [50, 50, 20, 20], "category_id": 7, "area": 400, "iscrowd": 0},
+        ]
+        converter = ConvertCoco(include_masks=True)
+        _, target = converter(_IMAGE, _make_target(annotations))
+        assert target["masks"].shape[0] == target["boxes"].shape[0] == 2
+
+    def test_fallback_mask_is_inscribed_ellipse(self):
+        converter = ConvertCoco(include_masks=True)
+        _, target = converter(_IMAGE, _make_target(self._MIXED_ANNOTATIONS))
+        mask = target["masks"][0]
+        # bbox [10, 10, 40, 20]: center on, box corners off, area ≈ π/4 of the box
+        assert mask[20, 30]
+        assert not mask[11, 11]
+        assert not mask[28, 48]
+        area_ratio = mask.sum().item() / (40 * 20)
+        assert 0.65 < area_ratio < 0.85
+
+    def test_real_polygon_still_used_when_present(self):
+        converter = ConvertCoco(include_masks=True)
+        _, target = converter(_IMAGE, _make_target(self._MIXED_ANNOTATIONS))
+        mask = target["masks"][1]
+        assert mask[60, 60]
+        assert not mask[40, 40]
+
+
 def _write_coco_json(path: Path, categories: List[Dict]) -> None:
     """Write a minimal valid COCO annotation file."""
     path.parent.mkdir(parents=True, exist_ok=True)

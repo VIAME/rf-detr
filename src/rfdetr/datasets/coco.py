@@ -17,6 +17,7 @@
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -107,6 +108,26 @@ def _is_rle(segmentation: Any) -> bool:
         ``True`` if the entry looks like an RLE dict, ``False`` otherwise.
     """
     return isinstance(segmentation, dict) and "counts" in segmentation and "size" in segmentation
+
+
+def _box_to_ellipse_polygon(bbox: List[float], num_points: int = 32) -> List[List[float]]:
+    """Approximate the ellipse inscribed in a COCO ``[x, y, w, h]`` box as a polygon.
+
+    Args:
+        bbox: COCO-format bounding box ``[x, y, w, h]``.
+        num_points: Number of vertices used to approximate the ellipse.
+
+    Returns:
+        A single-polygon COCO segmentation (``[[x1, y1, x2, y2, ...]]``).
+    """
+    x, y, w, h = bbox
+    cx, cy = x + w / 2.0, y + h / 2.0
+    rx, ry = w / 2.0, h / 2.0
+    polygon: List[float] = []
+    for i in range(num_points):
+        theta = 2.0 * math.pi * i / num_points
+        polygon.extend([cx + rx * math.cos(theta), cy + ry * math.sin(theta)])
+    return [polygon]
 
 
 def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int) -> torch.Tensor:
@@ -345,6 +366,8 @@ class ConvertCoco(object):
     Args:
         include_masks: If ``True``, decode segmentation annotations (polygon or
             RLE format) into binary masks and include them in the returned target dict.
+            Annotations without a segmentation fall back to the ellipse inscribed in
+            their bounding box so mask and box counts always agree.
         cat2label: Optional mapping from COCO ``category_id`` values to contiguous
             0-based label indices.  When ``None`` (default) the raw ``category_id`` values are used as labels directly,
             which is correct for datasets whose IDs are already 0-indexed.  Pass a non-``None`` mapping for sparse
@@ -411,13 +434,17 @@ class ConvertCoco(object):
 
         # add segmentation masks if requested, otherwise ensure consistent key when include_masks=True
         if self.include_masks:
-            if len(anno) > 0 and "segmentation" in anno[0]:
-                segmentations = [obj.get("segmentation", []) for obj in anno]
-                masks = convert_coco_poly_to_mask(segmentations, h, w)
-                if masks.numel() > 0:
-                    target["masks"] = masks[keep]
-                else:
-                    target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
+            # One mask per annotation so mask/box counts always agree in the matcher;
+            # annotations without a segmentation fall back to the ellipse inscribed in their box.
+            segmentations = []
+            for obj in anno:
+                segmentation = obj.get("segmentation")
+                if segmentation is None or (not isinstance(segmentation, dict) and len(segmentation) == 0):
+                    segmentation = _box_to_ellipse_polygon(obj["bbox"])
+                segmentations.append(segmentation)
+            masks = convert_coco_poly_to_mask(segmentations, h, w)
+            if masks.numel() > 0:
+                target["masks"] = masks[keep]
             else:
                 target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
 
