@@ -44,16 +44,20 @@ def _adapt_input_conv(num_channels: int, conv_weight: torch.Tensor) -> torch.Ten
     """Adapt a 3-channel pretrained conv weight to ``num_channels`` input channels.
 
     ``num_channels == 3`` returns the weight unchanged; ``== 1`` averages the 3
-    channels; otherwise the 3-channel pattern is tiled and scaled by
-    ``3 / num_channels`` to preserve activation magnitude.
+    channels; ``> 3`` keeps the RGB kernels verbatim and seeds each extra
+    channel with a copy of the green-channel kernel; ``== 2`` tiles and
+    rescales as before.
     """
     if num_channels == 3:
         return conv_weight
     if num_channels == 1:
         return conv_weight.mean(dim=1, keepdim=True)
-    repeats = (num_channels + 2) // 3
-    weight_out = torch.cat([conv_weight] * repeats, dim=1)[:, :num_channels]
-    return weight_out * (3.0 / num_channels)
+    if num_channels < 3:
+        repeats = (num_channels + 2) // 3
+        weight_out = torch.cat([conv_weight] * repeats, dim=1)[:, :num_channels]
+        return weight_out * (3.0 / num_channels)
+    extra = conv_weight[:, 1:2].repeat(1, num_channels - 3, 1, 1)
+    return torch.cat([conv_weight, extra], dim=1)
 
 
 def adapt_input_channels(model: torch.nn.Module, num_channels: int) -> None:
