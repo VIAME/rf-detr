@@ -1447,6 +1447,12 @@ class RFDETR:
 
             if include_source_image:
                 detections.metadata["source_image"] = source_images[i]
+            # Carry the keypoint head's output through to the caller.
+            # postprocess emits result["keypoints"] as [num_select, K, 3]
+            # (x, y absolute; visibility sigmoid) for keypoint models.
+            if "keypoints" in result:
+                detections.data["keypoints"] = (
+                    result["keypoints"][keep].cpu().numpy())
             detections.data["source_shape"] = np.tile(np.array(orig_sizes[i], dtype=np.int64), (len(detections), 1))
 
             # Attach class names so callers can map class_id → name without a
