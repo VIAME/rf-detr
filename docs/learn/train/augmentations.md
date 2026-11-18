@@ -1,18 +1,40 @@
 ---
-description: Configure RF-DETR data augmentations with Albumentations. Built-in presets for aerial, industrial, and small datasets plus custom transforms.
+description: Configure RF-DETR data augmentations. Defaults use torchvision; custom presets use optional Albumentations.
 ---
 
 # Augmentations
 
-RF-DETR supports custom data augmentations via [Albumentations](https://albumentations.ai/), with automatic bounding box and mask handling for geometric transforms. Albumentations 1.4.24+ and 2.x are supported.
+RF-DETR uses torchvision-native default augmentations for training, validation, prediction, and export preprocessing. Omitting `aug_config` uses the default training augmentation stack: resize/crop scale jitter plus horizontal flip at 50%. Passing `aug_config={}` disables the horizontal flip while keeping required resizing and normalization.
+
+RF-DETR also supports advanced custom data augmentations via optional [Albumentations](https://albumentations.ai/), with automatic bounding box and mask handling for geometric transforms. Albumentations 1.4.24+ and 2.x are supported.
+
+## Augmentation Backend Values
+
+`augmentation_backend` (on `model.train()`/`TrainConfig`) selects which pipeline runs the augmentation stack:
+
+| Value              | Behavior                                                                                                                  |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| `"cpu"` (default)  | Auto-picks the best *installed* CPU backend: Albumentations > Kornia (CPU) > torchvision.                                 |
+| `"auto"`           | Same priority as `"cpu"`, but prefers GPU-side Kornia first when CUDA is available.                                       |
+| `"torchvision"`    | Forces the torchvision-native default pipeline, never auto-upgraded — use to pin behavior regardless of what's installed. |
+| `"albumentations"` | Forces the CPU Albumentations pipeline; requires `rfdetr[augment]`.                                                       |
+| `"kornia"`         | Forces the GPU Kornia pipeline; requires `rfdetr[augment]`.                                                               |
+
+`"cpu"`/`"auto"` resolution is late (checked at dataset-build time, not when `TrainConfig` is constructed), so a saved config stays portable across environments with different optional packages installed. The legacy strings `"tv"`, `"albu"`, and `"gpu"` are still accepted as aliases for `"torchvision"`, `"albumentations"`, and `"kornia"` respectively.
 
 ## Quick Start
 
-Pass `aug_config` to your training call. Import one of the built-in presets:
+Install the optional augmentation extra before using custom `aug_config` dictionaries or built-in Albumentations presets:
+
+```bash
+pip install "rfdetr[train,augment]"
+```
+
+Then pass `aug_config` to your training call. Import one of the built-in presets:
 
 ```python
 from rfdetr import RFDETRSmall
-from rfdetr.datasets.aug_config import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL
+from rfdetr.datasets.aug_configs import AUG_CONSERVATIVE, AUG_AGGRESSIVE, AUG_AERIAL, AUG_INDUSTRIAL
 
 model = RFDETRSmall()
 model.train(dataset_dir="path/to/dataset", epochs=100, aug_config=AUG_CONSERVATIVE)
@@ -32,7 +54,9 @@ model.train(
 )
 ```
 
-To disable augmentations: `aug_config={}`. Omitting it uses the default (horizontal flip at 50%).
+To disable all optional training augmentation including the torchvision default horizontal flip: `aug_config={}`.
+
+`aug_config` controls only the augmentation stack — the torchvision-native default, or the Albumentations/Kornia stack when a non-empty `aug_config` is passed. To also disable the independent resize → crop → resize branch (Option B) in the training resize pipeline — so no spatial clipping occurs and annotations near image borders stay intact — pass `scale_jitter=False` to `model.train()`.
 
 ## Built-in Presets
 
@@ -43,10 +67,10 @@ To disable augmentations: `aug_config={}`. Omitting it uses the default (horizon
 | `AUG_AERIAL`       | Satellite / overhead imagery      |
 | `AUG_INDUSTRIAL`   | Manufacturing / inspection data   |
 
-All presets are plain dicts — inspect or extend them before passing:
+All presets are Albumentations config dicts and require `rfdetr[augment]`. They are plain dicts, so you can inspect or extend them before passing:
 
 ```python
-from rfdetr.datasets.aug_config import AUG_AGGRESSIVE
+from rfdetr.datasets.aug_configs import AUG_AGGRESSIVE
 
 my_config = {**AUG_AGGRESSIVE, "VerticalFlip": {"p": 0.1}}
 model.train(dataset_dir="...", aug_config=my_config)
@@ -77,7 +101,7 @@ aug_config = {
 }
 ```
 
-Each child's `p` controls its relative selection weight. The container itself always fires.
+Each child's `p` controls its relative selection weight when the container fires. The container-level `p` controls whether the whole container is applied; RF-DETR defaults an omitted value to `1.0` for backward compatibility, while explicit values follow standard Albumentations semantics.
 
 If you need the same transform twice, or want explicit ordering, pass a list instead of a dict:
 
@@ -105,7 +129,12 @@ RF-DETR automatically handles bounding boxes for **geometric transforms** (flips
 
     Be careful with aggressive rotations and crops on datasets where object orientation matters (e.g., text detection, oriented objects).
 
-- **CPU-bound:** Augmentations run on CPU during data loading — more transforms means slower loading
+- **Default path:** Uses torchvision-native transforms and does not require Albumentations.
+- **Custom CPU path:** Non-empty `aug_config` dictionaries use Albumentations and require `rfdetr[augment]`.
+- **GPU path:** `augmentation_backend="kornia"` uses Kornia and requires `rfdetr[augment]`.
+- **Pixel translation on Kornia:** `{"Affine": {"translate_px": {"x": (-4, 4), "y": (-4, 4)}, "p": 1.0}}` shifts images, boxes and masks by whole pixels; an offset may be any integer or an integral float such as `4.0`. This form supports pure translation with constant-zero or replicate borders. Options that cannot change a whole-pixel shift are accepted and have no effect: `interpolation` and `mask_interpolation` codes 0-4, `keep_ratio`, `balanced_scale`, `rotate_method`, a unit `scale` or zero `shear`, and `fill`/`fill_mask` with a replicate border. Building the pipeline raises for nonzero rotation or shear, nonunit scale (a missing axis in a per-axis `scale`/`shear` mapping counts as `1`, as on Albumentations, so `shear={"x": 0}` raises), `fit_output=True`, interpolation codes outside 0-4, border modes other than constant or replicate, a nonzero `fill`/`fill_mask` with a constant border, the deprecated Albumentations 1.x aliases `cval`, `cval_mask` and `mode` (use `fill`, `fill_mask` and `border_mode`), and boolean, fractional, reversed or out-of-64-bit-range offsets. Use the Albumentations backend for those combinations.
+- **Padded batches on Kornia:** Either `square_resize_div_64=False` or `multi_scale="per-sample"` collates images of different sizes into a padded canvas. The GPU path normalizes targets by that canvas, which is wrong for smaller images, so setup raises `ValueError`. Use `square_resize_div_64=True` with `multi_scale="per-batch"` or `"off"`, or `augmentation_backend="torchvision"` or `"albumentations"`.
+- **CPU-bound custom configs:** More transforms means slower data loading
 - **Use `num_workers`:** Parallelize augmentation across data loader workers
 - **Monitor training mAP vs validation mAP:** With strong augmentations it's normal for training mAP to be lower — validation uses original images while training uses augmented (harder) ones
 
@@ -153,4 +182,4 @@ model.train(
 
 - [Monitor training with TensorBoard](loggers.md#tensorboard)
 - [Use early stopping](advanced.md#early-stopping) to prevent overfitting
-- [Export your trained model](../export.md) for deployment
+- [Export your trained model](../../exports/index.md) for deployment

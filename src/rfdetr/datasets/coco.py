@@ -17,51 +17,293 @@
 Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references/detection/coco_utils.py
 """
 
+from __future__ import annotations
+
+import json
 import math
+import os
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, cast
 
 import numpy as np
 import torch
 import torch.utils.data
 import torchvision
-from torchvision import tv_tensors
 from PIL import Image
-from torchvision.transforms.v2 import Compose, ToDtype, ToImage
+from torch import Tensor
+from torchvision import tv_tensors
+from torchvision.transforms.v2 import ToDtype, ToImage
 
-from rfdetr.datasets.aug_config import AUG_CONFIG
+from rfdetr.config import AugmentationBackend, MultiScale
+from rfdetr.datasets._aug_utils import _warn_keypoint_hflip_disabled, resolve_keypoint_flip_pairs
+from rfdetr.datasets._torchvision import (
+    Compose,
+    RandomChoice,
+    RandomHorizontalFlip,
+    RandomResize,
+    RandomSelect,
+    RandomSizedCrop,
+    Resize,
+)
+from rfdetr.datasets.aug_configs import AUG_CONFIG
+from rfdetr.datasets.io_utils import decode_pil_image
+from rfdetr.datasets.kornia_transforms import is_gpu_postprocess, resolve_backend_for_build
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, image_wh
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.shapes import as_pair
 
 logger = get_logger()
 
-# Re-reads of a failed image before giving up on it. A short read off network
-# storage raises the same OSError PIL raises for a genuinely truncated file, and
-# retrying costs nothing when the file is fine.
+_COCO_MAX_SIZE = 1333
+
+# Re-reads of a failed image before giving up on it: a short read off network storage raises the same OSError
+# PIL raises for a genuinely truncated file.
 _IMAGE_READ_ATTEMPTS = 3
 _IMAGE_READ_BACKOFF_SECONDS = 0.5
-# Neighbouring samples tried once the image itself is judged unreadable. Bounded
-# so a wholesale dataset failure still surfaces as an error instead of quietly
-# training on a handful of duplicated images.
+# Neighbouring samples tried once an image is judged unreadable; bounded so a wholesale failure still raises.
 _MAX_SUBSTITUTIONS = 10
+
+# PIL modes that carry a fourth channel (RGB + alpha/motion); such images are kept 4-channel as RGBA.
+_FOUR_CHANNEL_MODES = frozenset({"RGBA", "LA", "CMYK"})
+
+_Resolution = int | tuple[int, int]
 
 
 def is_valid_coco_dataset(dataset_dir: str) -> bool:
     return (Path(dataset_dir) / "train" / "_annotations.coco.json").exists()
 
 
+# Values a COCO export uses to say "this category has no parent".
+_SUPERCATEGORY_PLACEHOLDERS: frozenset[str | None] = frozenset({"", "none", "null", None})
+
+
+def annotated_category_ids(coco_data: dict[str, Any]) -> set[int]:
+    """Collect the category ids referenced by at least one annotation of a parsed COCO file.
+
+    Args:
+        coco_data: Parsed COCO JSON. A missing ``annotations`` key yields an empty set.
+
+    Returns:
+        Category ids carrying at least one annotation.
+
+    Examples:
+        >>> annotated_category_ids({"annotations": [{"category_id": 3}, {"category_id": 3}]})
+        {3}
+        >>> annotated_category_ids({"categories": []})
+        set()
+    """
+    return {int(annotation["category_id"]) for annotation in coco_data.get("annotations", [])}
+
+
+def _category_name(category: dict[str, Any]) -> str:
+    """Return a category's ``name``, failing with an actionable message when the field is absent."""
+    try:
+        return cast(str, category["name"])
+    except KeyError:
+        raise KeyError(
+            f"COCO category {category.get('id', '?')} is missing the required 'name' field; "
+            "every entry of the 'categories' list needs an 'id' and a 'name'."
+        ) from None
+
+
+def _normalized_category_id(category: dict[str, Any]) -> int | None:
+    """Return a category's ``id`` coerced to ``int``, or ``None`` when it is absent or not numeric."""
+    try:
+        return int(category["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def filter_parent_categories(
+    categories: list[dict[str, Any]],
+    annotated_ids: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Drop unannotated grouping nodes from a COCO ``categories`` list.
+
+    Roboflow COCO exports prepend a synthetic root category (``supercategory: "none"``) whose name is reused as the
+    ``supercategory`` of every real class. It carries no annotations, yet it consumes a model output slot once the
+    category list is turned into contiguous label indices. Removing it keeps class names, class count and label
+    remapping in agreement (GitHub #609).
+
+    A category is dropped when it is named as another category's ``supercategory`` **and** no annotation references its
+    id. A category whose own ``supercategory`` equals its own ``name`` — the COCO convention for a top-level class such
+    as ``{"name": "person", "supercategory": "person"}`` — is not a parent of itself and is therefore kept; the same
+    name still counts as a parent when a *different* category groups under it. The annotation guard keeps genuinely
+    labelled parents of hierarchical datasets, and is applied per category by its own ``id`` — categories sharing a
+    ``name`` are judged independently, so an annotated leaf is never dropped alongside a same-named grouping node. Ids
+    are coerced to ``int`` before that lookup, so exports shipping string ids still match ``annotated_ids``. Flat
+    datasets — every ``supercategory`` a placeholder — are returned untouched, as is any input where filtering would
+    remove everything.
+
+    Args:
+        categories: Raw COCO ``categories`` entries; each needs an ``id`` and a ``name``.
+        annotated_ids: Category ids carrying at least one annotation, typically from
+            :func:`annotated_category_ids`. ``None`` treats every category as unannotated, which is the right default
+            when only the category list is available.
+
+    Returns:
+        The kept categories, sorted by ``id``.
+
+    Examples:
+        >>> categories = [
+        ...     {"id": 0, "name": "eggmasses", "supercategory": "none"},
+        ...     {"id": 1, "name": "stake", "supercategory": "eggmasses"},
+        ...     {"id": 2, "name": "tree", "supercategory": "eggmasses"},
+        ... ]
+        >>> [category["name"] for category in filter_parent_categories(categories, {1, 2})]
+        ['stake', 'tree']
+        >>> [category["name"] for category in filter_parent_categories(categories, {0, 1, 2})]
+        ['eggmasses', 'stake', 'tree']
+        >>> self_parented = [
+        ...     {"id": 1, "name": "person", "supercategory": "person"},
+        ...     {"id": 2, "name": "vehicle", "supercategory": "none"},
+        ...     {"id": 3, "name": "car", "supercategory": "vehicle"},
+        ... ]
+        >>> [category["name"] for category in filter_parent_categories(self_parented, {3})]
+        ['person', 'car']
+    """
+    ordered = sorted(
+        categories,
+        key=lambda category: (
+            _normalized_category_id(category) is None,
+            _normalized_category_id(category) or 0,
+        ),
+    )
+    supercategories = [(category.get("supercategory", "none"), category.get("name")) for category in ordered]
+    parents = {
+        supercategory
+        for supercategory, name in supercategories
+        if supercategory not in _SUPERCATEGORY_PLACEHOLDERS and supercategory != name
+    }
+    if not parents:
+        return ordered
+
+    annotated = {int(category_id) for category_id in (annotated_ids or set()) if isinstance(category_id, (int, str))}
+    kept = [
+        category
+        for category in ordered
+        if not (_category_name(category) in parents and _normalized_category_id(category) not in annotated)
+    ]
+    # Safety fallback for pathological inputs where every category is a parent of another.
+    return kept or ordered
+
+
+def _train_split_cat2label(dataset_root: Path) -> dict[int, int] | None:
+    """Derive the train split's ``category_id`` → label-index mapping so the other splits can reuse it.
+
+    Label indices are positions in the filtered category list, so a grouping category annotated in one split but not
+    in another would receive a different index per split — silently shifting every later label of the smaller split.
+    Deriving the mapping once from ``train`` — the split :meth:`RFDETR._detect_num_classes_for_training` and
+    :meth:`RFDETR._load_classes` already read — keeps validation and test targets aligned with the label space the
+    model is trained on.
+
+    Args:
+        dataset_root: Roboflow dataset root holding the ``train``/``valid``/``test`` split directories.
+
+    Returns:
+        Mapping from COCO category id to contiguous label index, or ``None`` when the train annotation file is missing
+        or unreadable, in which case the caller keeps the split-local mapping.
+    """
+    train_ann_file = dataset_root / "train" / "_annotations.coco.json"
+    if not train_ann_file.exists():
+        return None
+    try:
+        with open(train_ann_file, encoding="utf-8") as file:
+            train_annotations = json.load(file)
+        kept = filter_parent_categories(train_annotations["categories"], annotated_category_ids(train_annotations))
+        return {int(category["id"]): label for label, category in enumerate(kept)}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logger.warning(
+            "Could not derive the train-split label mapping from %s (%s); falling back to this split's own mapping. "
+            "Its label indices may diverge from the ones training used.",
+            train_ann_file,
+            exc,
+        )
+        return None
+
+
+def _category_ids_with_keypoints(coco: Any) -> list[int]:
+    """Return sorted COCO category ids that carry keypoint metadata or annotations."""
+    category_ids = {
+        int(cat_id) for cat_id, category in coco.cats.items() if category.get("keypoints") or category.get("skeleton")
+    }
+    if category_ids:
+        return sorted(category_ids)
+
+    for annotation in coco.anns.values():
+        if annotation.get("keypoints") or int(annotation.get("num_keypoints", 0)) > 0:
+            category_ids.add(int(annotation["category_id"]))
+    return sorted(category_ids)
+
+
+def _build_keypoint_cat2label(coco: Any, num_keypoints_per_class: list[int] | None) -> dict[int, int]:
+    """Map COCO category ids onto model label slots that have keypoint capacity.
+
+    RF-DETR keypoint schemas are indexed by model label. The preview person-keypoint schema is ``[17]``: label slot
+    ``0`` owns the 17 COCO person keypoints. Legacy checkpoints may still use a background-first ``[0, 17]`` schema
+    where slot ``0`` is reserved (0 keypoints) and slot ``1`` is person. This helper maps keypoint-bearing categories
+    onto slots with a non-zero keypoint count (``count > 0``), so both layouts keep supervision aligned. For multi-class
+    keypoint training supply e.g. ``[17, 4]`` where each non-zero entry corresponds to a keypoint-bearing category in
+    ascending COCO category ID order.
+    """
+    schema = list(num_keypoints_per_class or [])
+    active_slots = [idx for idx, count in enumerate(schema) if count > 0]
+    if not active_slots:
+        raise ValueError(
+            "Keypoint COCO dataset requested, but num_keypoints_per_class has no active keypoint slots. "
+            "Provide a schema such as [17] for the keypoint preview model."
+        )
+
+    keypoint_cat_ids = _category_ids_with_keypoints(coco)
+    if not keypoint_cat_ids:
+        raise ValueError(
+            "Keypoint COCO dataset has no keypoint category metadata and no keypoint annotations. "
+            "Expected COCO categories with a 'keypoints' field or annotations with 'keypoints'/'num_keypoints'."
+        )
+    if len(keypoint_cat_ids) > len(active_slots):
+        raise ValueError(
+            "Keypoint COCO dataset has more keypoint-bearing categories "
+            f"({len(keypoint_cat_ids)}) than active schema slots ({len(active_slots)}). "
+            "Multi-class keypoint training needs an explicit num_keypoints_per_class schema."
+        )
+
+    sorted_cat_ids = sorted(int(cat_id) for cat_id in coco.cats.keys())
+    required_slots = max(len(sorted_cat_ids), max(active_slots) + 1)
+    assigned_slots: set[int] = set()
+    cat2label: dict[int, int] = {}
+
+    for cat_id, slot in zip(keypoint_cat_ids, active_slots):
+        if slot >= required_slots:
+            raise ValueError(
+                f"Keypoint schema slot {slot} for category_id {cat_id} exceeds the detected class count "
+                f"({len(sorted_cat_ids)}). Pass num_classes large enough to include this keypoint label slot."
+            )
+        cat2label[cat_id] = slot
+        assigned_slots.add(slot)
+
+    free_slots = [slot for slot in range(required_slots) if slot not in assigned_slots]
+    for cat_id in sorted_cat_ids:
+        if cat_id in cat2label:
+            continue
+        if not free_slots:
+            raise ValueError(f"No free model label slots remain for non-keypoint category_id {cat_id}.")
+        cat2label[cat_id] = free_slots.pop(0)
+
+    return cat2label
+
+
 def compute_multi_scale_scales(
-    resolution: int | Tuple[int, int],
+    resolution: _Resolution,
     expanded_scales: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-) -> List[Tuple[int, int]]:
+) -> list[int] | list[tuple[int, int]]:
     """Derive the multi-scale jitter ladder around *resolution*.
 
-    Scales are stepped in whole blocks of ``patch_size * num_windows`` so every candidate remains patchable and
-    windowable.  For a non-square resolution the aspect ratio is held fixed: the shorter side is stepped in whole
+    Scales are stepped in whole blocks of ``patch_size * num_windows`` so every candidate stays patchable and
+    windowable. For a ``(height, width)`` resolution the aspect ratio is held: the shorter side is stepped in whole
     blocks and the longer side is scaled proportionally, then snapped back to a whole number of blocks.
 
     Args:
@@ -71,29 +313,184 @@ def compute_multi_scale_scales(
         num_windows: Windows per spatial dimension.
 
     Returns:
-        Candidate ``(height, width)`` resolutions, each with both dims divisible by
-        ``patch_size * num_windows``.
+        Candidate side lengths for an ``int`` resolution, or candidate ``(height, width)`` pairs for a pair.
+
+    Examples:
+        >>> compute_multi_scale_scales(512)
+        [320, 384, 448, 512, 576, 640, 704, 768]
+        >>> compute_multi_scale_scales((384, 768))[:2]
+        [(192, 384), (256, 512)]
     """
     block = patch_size * num_windows
-    height, width = as_pair(resolution)
-
-    # Step the shorter side in whole blocks and carry the longer side along at a fixed aspect.
-    short, long = (height, width) if height <= width else (width, height)
-    aspect = long / short
-    base_blocks = short // block
-
     offsets = [-3, -2, -1, 0, 1, 2, 3, 4] if not expanded_scales else [-5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5]
+    if isinstance(resolution, int):
+        # round to the nearest multiple of 4*patch_size to enable both patching and windowing
+        scales = [(resolution // block + offset) * block for offset in offsets]
+        return [scale for scale in scales if scale >= block * 2]  # ensure minimum image size
 
-    proposed: List[Tuple[int, int]] = []
+    height, width = as_pair(resolution)
+    short, long = min(height, width), max(height, width)
+    proposed: list[tuple[int, int]] = []
     for offset in offsets:
-        short_blocks = base_blocks + offset
+        short_blocks = short // block + offset
         if short_blocks < 2:  # ensure minimum image size
             continue
-        long_blocks = max(2, round(short_blocks * aspect))
-        short_px, long_px = short_blocks * block, long_blocks * block
+        short_px = short_blocks * block
+        long_px = max(2, round(short_blocks * long / short)) * block
         proposed.append((short_px, long_px) if height <= width else (long_px, short_px))
-
     return proposed
+
+
+def draft_size_for_transforms(
+    image_set: str,
+    resolution: _Resolution,
+    *,
+    multi_scale: bool = False,
+    expanded_scales: bool = False,
+    patch_size: int = 16,
+    num_windows: int = 4,
+    scale_jitter: bool = False,
+    include_masks: bool = False,
+) -> int | None:
+    """Return the source extent below which the transform pipeline starts losing detail.
+
+    :meth:`CocoDetection._decode_image` passes this to the decoder, which applies the reduction ``PIL.Image.draft``
+    would pick, so JPEG sources far larger than the training resolution are decoded at a reduced DCT scale instead of at
+    full size. ``draft`` never returns an image smaller than the requested box, so the box preserves the largest
+    direct-resize target. Scale jitter also preserves its 600-pixel pre-crop resize floor, avoiding an extra upsample
+    after JPEG decoding.
+
+    Two cases return ``None`` (decode at full resolution):
+
+    * Non-train splits.  :class:`~rfdetr.datasets.coco_eval.CocoEvaluator` scores predictions against the unscaled
+      annotation file, so a reduced decode would shift ``orig_size`` and mis-scale every prediction.
+    * Mask datasets.  RLE ``segmentation`` cannot be rescaled by :func:`scale_coco_annotation`.
+
+    Args:
+        image_set: Dataset split name.  Only ``"train"`` is decoded at a reduced scale.
+        resolution: Base resolution the split is built for, a side length or ``(height, width)``. A pair keeps its
+            longer side, the largest extent any resize branch can ask of either source axis.
+        multi_scale: Whether multi-scale training is enabled.
+        expanded_scales: Whether the multi-scale range is widened.
+        patch_size: Patch size used to derive multi-scale candidates.
+        num_windows: Window count used to derive multi-scale candidates.
+        scale_jitter: Whether the training crop branch can resize the short side to 600 pixels.
+        include_masks: Whether the dataset decodes segmentation masks.
+
+    Returns:
+        Minimum extent, in pixels, that a decoded image must retain on both axes, or ``None`` to decode at full size.
+
+    Examples:
+        >>> draft_size_for_transforms("val", 512) is None
+        True
+        >>> draft_size_for_transforms("train", 512, include_masks=True) is None
+        True
+        >>> draft_size_for_transforms("train", 512)
+        512
+        >>> draft_size_for_transforms("train", 512, multi_scale=True)
+        768
+    """
+    if image_set != "train" or include_masks:
+        return None
+    scales = (
+        compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
+        if multi_scale
+        else [resolution]
+    )
+    direct_branch_size = max(max(as_pair(scale)) for scale in scales)
+    return max(direct_branch_size, 600) if scale_jitter else direct_branch_size
+
+
+def scale_coco_annotation(annotation: dict[str, Any], x_scale: float, y_scale: float) -> dict[str, Any]:
+    """Return a COCO annotation scaled into its decoded image coordinate space.
+
+    Needed when an image is decoded at a reduced scale (see :meth:`CocoDetection._decode_image`): ``ConvertCoco`` clamps
+    boxes to the decoded image size, so annotations must move into the decoded image's coordinate space first. JPEG
+    draft dimensions round each axis independently, so boxes, polygon points, keypoints, and area use separate x/y
+    factors.
+    Keypoint visibility, ``iscrowd``, and every other field are copied unchanged. RLE ``segmentation`` cannot be scaled
+    this way, which is why :func:`draft_size_for_transforms` refuses to draft mask datasets.
+
+    Args:
+        annotation: One COCO annotation dict.  Not mutated.
+        x_scale: Horizontal decoded-to-source ratio.
+        y_scale: Vertical decoded-to-source ratio.
+
+    Returns:
+        Scaled copy of the annotation.
+
+    Examples:
+        >>> scale_coco_annotation({"bbox": [10, 20, 30, 40], "area": 1200, "category_id": 1}, 0.5, 0.25)
+        {'bbox': [5.0, 5.0, 15.0, 10.0], 'area': 150.0, 'category_id': 1}
+        >>> scale_coco_annotation({"keypoints": [10, 20, 2]}, 0.5, 0.25)
+        {'keypoints': [5.0, 5.0, 2]}
+    """
+    scaled = dict(annotation)
+    if "bbox" in scaled:
+        x, y, width, height = scaled["bbox"]
+        scaled["bbox"] = [x * x_scale, y * y_scale, width * x_scale, height * y_scale]
+    if "area" in scaled:
+        scaled["area"] = scaled["area"] * x_scale * y_scale
+    segmentation = scaled.get("segmentation")
+    if segmentation and not _is_rle(segmentation):
+        scaled["segmentation"] = [
+            [value * (x_scale if index % 2 == 0 else y_scale) for index, value in enumerate(polygon)]
+            for polygon in segmentation
+        ]
+    keypoints = scaled.get("keypoints")
+    if keypoints:
+        scaled["keypoints"] = [
+            value if index % 3 == 2 else value * (x_scale if index % 3 == 0 else y_scale)
+            for index, value in enumerate(keypoints)
+        ]
+    return scaled
+
+
+def _enclosing_polygons(segmentation: list[Any]) -> list[Any]:
+    """Return the parts of a COCO polygon segmentation that have at least three points.
+
+    ``pycocotools.mask.frPyObjects`` picks the input format from the length of the first part alone: four values are
+    read as an ``[x, y, w, h]`` box, which raises a ``TypeError`` for a list, and an empty part raises ``Exception``. A
+    part with fewer than three points encloses no area, so dropping it leaves the rasterised mask unchanged. Only a flat
+    list of numbers is judged by its length: any other part, such as an uncompressed-RLE dict or a nested list of
+    ``[x, y]`` pairs, is kept so ``pycocotools`` handles or rejects it exactly as it did before.
+
+    Args:
+        segmentation: A polygon segmentation, one flat ``[x1, y1, x2, y2, ...]`` list per part.
+
+    Returns:
+        The parts that are not a flat list of fewer than six coordinates, in their original order.
+
+    Examples:
+        >>> _enclosing_polygons([[1, 1, 8, 8], [0, 0, 5, 0, 5, 5], []])
+        [[0, 0, 5, 0, 5, 5]]
+        >>> _enclosing_polygons([{"counts": [4, 2], "size": [2, 3]}])
+        [{'counts': [4, 2], 'size': [2, 3]}]
+    """
+    return [part for part in segmentation if not _is_degenerate_part(part)]
+
+
+def _is_degenerate_part(part: Any) -> bool:
+    """Check whether a polygon part is a flat list of numbers that holds fewer than three points.
+
+    Args:
+        part: One element of a COCO polygon segmentation.
+
+    Returns:
+        ``True`` for a flat list or tuple of fewer than six values; ``False`` for a longer one and for any part that
+        is not a flat list of numbers.
+
+    Examples:
+        >>> _is_degenerate_part([30, 20, 70, 50])
+        True
+        >>> _is_degenerate_part([[0, 0], [5, 0], [5, 5]])
+        False
+    """
+    return (
+        isinstance(part, (list, tuple))
+        and len(part) < 6
+        and not any(isinstance(value, (list, tuple, dict)) for value in part)
+    )
 
 
 def _is_rle(segmentation: Any) -> bool:
@@ -112,7 +509,7 @@ def _is_rle(segmentation: Any) -> bool:
     return isinstance(segmentation, dict) and "counts" in segmentation and "size" in segmentation
 
 
-def _box_to_ellipse_polygon(bbox: List[float], num_points: int = 32) -> List[List[float]]:
+def _box_to_ellipse_polygon(bbox: Sequence[float], num_points: int = 32) -> list[list[float]]:
     """Approximate the ellipse inscribed in a COCO ``[x, y, w, h]`` box as a polygon.
 
     Args:
@@ -121,24 +518,31 @@ def _box_to_ellipse_polygon(bbox: List[float], num_points: int = 32) -> List[Lis
 
     Returns:
         A single-polygon COCO segmentation (``[[x1, y1, x2, y2, ...]]``).
+
+    Examples:
+        >>> _box_to_ellipse_polygon([0, 0, 4, 2], num_points=4)[0][:4]
+        [4.0, 1.0, 2.0, 2.0]
     """
     x, y, w, h = bbox
     cx, cy = x + w / 2.0, y + h / 2.0
     rx, ry = w / 2.0, h / 2.0
-    polygon: List[float] = []
+    polygon: list[float] = []
     for i in range(num_points):
         theta = 2.0 * math.pi * i / num_points
         polygon.extend([cx + rx * math.cos(theta), cy + ry * math.sin(theta)])
     return [polygon]
 
 
-def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int) -> torch.Tensor:
+def convert_coco_poly_to_mask(segmentations: list[Any], height: int, width: int) -> Tensor:
     """Convert COCO segmentation annotations to a binary mask tensor of shape ``[N, H, W]``.
 
     Supports both polygon and RLE (Run-Length Encoding) annotation formats. Polygon annotations (lists of coordinate
     arrays) are rasterised via ``pycocotools.mask.frPyObjects``.  RLE annotations (dicts with ``"counts"`` and
     ``"size"`` keys; ``counts`` may be str or bytes for compressed RLE, or list of ints for uncompressed RLE) are
     decoded directly, skipping the polygon-to-RLE conversion step.
+
+    A flat polygon part with fewer than three points encloses no area and is skipped before rasterisation. An instance
+    left with no part, like one with an empty or ``None`` segmentation, gets an all-zero mask and keeps its row.
 
     Args:
         segmentations: Per-instance segmentation annotations.  Each element is
@@ -174,6 +578,12 @@ def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int)
                 # Uncompressed RLE (counts is a list of ints) — compress first
                 rles = [coco_mask.frPyObjects(segmentation, height, width)]
         else:
+            if isinstance(segmentation, list):
+                segmentation = _enclosing_polygons(segmentation)
+                if not segmentation:
+                    # every part is shorter than three points, so the instance has no mask area
+                    masks.append(torch.zeros((height, width), dtype=torch.uint8))
+                    continue
             rles = coco_mask.frPyObjects(segmentation, height, width)
         mask = coco_mask.decode(rles)
         if mask.ndim < 3:
@@ -187,21 +597,176 @@ def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int)
     return torch.stack(masks, dim=0)
 
 
-class _ToImage(ToImage):
+class CrowdRegion(NamedTuple):
+    """One ``iscrowd=1`` annotation in the form an evaluation metric's ground truth needs.
+
+    Attributes:
+        label: Class index in the dataset's label space (the ``category_id`` itself when the dataset does not remap).
+        box: ``(x_min, y_min, x_max, y_max)`` in original-image pixels, from the annotation's ``bbox``.
+        segmentation: The annotation's ``segmentation`` compressed to a single RLE dict by
+            :func:`crowd_regions_from_coco`, the raw payload when it could not be compressed, or ``None`` when the
+            annotation carries no mask. Decoded only for mask metrics.
+    """
+
+    label: int
+    box: tuple[float, float, float, float]
+    segmentation: list[Any] | dict[str, Any] | None
+
+
+def _compressed_crowd_segmentation(
+    segmentation: Any, height: int | None, width: int | None
+) -> list[Any] | dict[str, Any] | None:
+    """Compress one crowd annotation's ``segmentation`` to a single RLE dict, once per dataset.
+
+    :func:`convert_coco_poly_to_mask` then takes its decode-only path on every batch that scores the region, instead
+    of rasterising the same polygon again. The raw payload is handed back unchanged when it cannot be compressed —
+    the annotation file carries no dimensions for the image, or ``pycocotools`` is not installed (it ships with the
+    ``rfdetr[train]`` extra, and a box-only evaluation never decodes a crowd mask at all).
+
+    Args:
+        segmentation: The annotation's ``segmentation`` payload, or ``None``/empty when it has none.
+        height: The annotation's image height, or ``None`` when the annotation file omits it.
+        width: The annotation's image width, or ``None`` when the annotation file omits it.
+
+    Returns:
+        A compressed RLE dict; *segmentation* itself when it is already compressed or cannot be compressed; ``None``
+        for a missing or empty payload, or a polygon payload with no part of at least three points.
+
+    Examples:
+        >>> _compressed_crowd_segmentation(None, 4, 4) is None
+        True
+        >>> _compressed_crowd_segmentation([[0, 0, 2, 0, 2, 2]], None, None)
+        [[0, 0, 2, 0, 2, 2]]
+        >>> _compressed_crowd_segmentation({"counts": b"04", "size": [4, 4]}, 4, 4)
+        {'counts': b'04', 'size': [4, 4]}
+    """
+    if segmentation is None or (not isinstance(segmentation, dict) and len(segmentation) == 0):
+        return None
+    if isinstance(segmentation, list):
+        segmentation = _enclosing_polygons(segmentation)
+        if not segmentation:
+            return None
+    raw = cast("list[Any] | dict[str, Any]", segmentation)
+    is_rle = _is_rle(segmentation)
+    if is_rle and isinstance(segmentation.get("counts"), (str, bytes)):
+        return raw
+    if height is None or width is None:
+        return raw
+    try:
+        import pycocotools.mask as coco_mask
+    except ImportError:
+        return raw
+    converted = coco_mask.frPyObjects(segmentation, int(height), int(width))
+    return cast("dict[str, Any]", coco_mask.merge([converted] if is_rle else converted))
+
+
+def crowd_regions_from_coco(coco_api: Any) -> dict[int, list[CrowdRegion]]:
+    """Group a COCO API's crowd annotations by image id, relabelled into the dataset's label space.
+
+    :class:`ConvertCoco` drops ``iscrowd=1`` annotations from the dataset targets, so a metric that needs to score
+    them the way pycocotools does reads them back from the annotation file through this function.
+
+    :class:`CocoDetection` exposes its remapping as ``coco.label2cat``; inverting it recovers exactly the
+    ``cat2label`` mapping that class hands to :class:`ConvertCoco`, since the two are built together from one source.
+    Without a remapping the category ids are the labels, as in :class:`ConvertCoco`. A crowd whose category has no
+    label is skipped: no prediction can carry that label, so the region could never ignore a detection.
+
+    An annotation missing one of the fields read here is skipped with a warning rather than failing the first batch
+    of the next validation epoch — silently dropping it would move mAP with no signal at all.
+
+    Args:
+        coco_api: A pycocotools-style ``COCO`` object (an ``anns`` mapping, plus an optional ``imgs`` mapping and an
+            optional ``label2cat``).
+
+    Returns:
+        Crowd regions per image id; empty when there is no crowd annotation or ``coco_api`` has no ``anns`` mapping.
+
+    Examples:
+        >>> from types import SimpleNamespace
+        >>> anns = {
+        ...     1: {"image_id": 5, "category_id": 3, "bbox": [10, 20, 30, 40], "iscrowd": 1, "segmentation": None},
+        ...     2: {"image_id": 5, "category_id": 3, "bbox": [0, 0, 1, 1], "iscrowd": 0},
+        ...     3: {"image_id": 6, "category_id": 9, "bbox": [0, 0, 1, 1], "iscrowd": 1},
+        ... }
+        >>> crowd_regions_from_coco(SimpleNamespace(anns=anns, label2cat={0: 3}))
+        {5: [CrowdRegion(label=0, box=(10.0, 20.0, 40.0, 60.0), segmentation=None)]}
+    """
+    annotations = getattr(coco_api, "anns", None)
+    if not isinstance(annotations, Mapping):
+        return {}
+    images = getattr(coco_api, "imgs", None)
+    label2cat = getattr(coco_api, "label2cat", None)
+    cat2label = {int(cat): int(label) for label, cat in label2cat.items()} if isinstance(label2cat, Mapping) else None
+    regions: dict[int, list[CrowdRegion]] = {}
+    for annotation_id, annotation in annotations.items():
+        if not annotation.get("iscrowd"):
+            continue
+        image_id = annotation.get("image_id")
+        if image_id is None:
+            logger.warning("Skipping crowd annotation %s: no 'image_id' to attach it to.", annotation_id)
+            continue
+        category_id = annotation.get("category_id")
+        if category_id is None:
+            logger.warning("Skipping crowd annotation of image_id %s: no 'category_id'.", image_id)
+            continue
+        category_id = int(category_id)
+        if cat2label is not None and category_id not in cat2label:
+            continue
+        try:
+            x, y, w, h = (float(value) for value in annotation["bbox"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Skipping crowd annotation of image_id %s: 'bbox' is missing or not four numbers.", image_id)
+            continue
+        image_meta = images.get(int(image_id)) if isinstance(images, Mapping) else None
+        image_meta = image_meta if isinstance(image_meta, Mapping) else {}
+        regions.setdefault(int(image_id), []).append(
+            CrowdRegion(
+                label=category_id if cat2label is None else cat2label[category_id],
+                box=(x, y, x + w, y + h),
+                segmentation=_compressed_crowd_segmentation(
+                    annotation.get("segmentation"), image_meta.get("height"), image_meta.get("width")
+                ),
+            )
+        )
+    return regions
+
+
+def _frame_stack_to_image(array: np.ndarray) -> tv_tensors.Image:
+    """Wrap the HWC frame stack of a video sample as a CHW image tensor.
+
+    Examples:
+        >>> _frame_stack_to_image(np.zeros((4, 6, 9), dtype=np.uint8)).shape
+        torch.Size([9, 4, 6])
+    """
+    return tv_tensors.Image(torch.from_numpy(np.ascontiguousarray(array)).permute(2, 0, 1))
+
+
+class _FrameStackToImage:
+    """Convert the HWC frame stack of a video sample to a CHW image tensor; other images pass through.
+
+    Heads the torchvision-native pipeline, whose transforms take a PIL image or a tensor but not an array.
+    """
+
+    def __call__(self, image: Any, target: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any] | None]:
+        if isinstance(image, np.ndarray):
+            image = _frame_stack_to_image(image)
+        return image, target
+
+
+class _ToImage(ToImage):  # type: ignore[misc]
     """``ToImage`` that also takes the HWC frame stack of a video sample.
 
-    Given a bare array, the stock transform has no image type to anchor on and converts the
-    target's box tensor to an image as well, so the array is wrapped here and the target left alone.
+    Given a bare array, the stock transform has no image type to anchor on and converts the target's box tensor to an
+    image as well, so the array is wrapped here and the target left alone.
     """
 
     def forward(self, *inputs: Any) -> Any:
         if len(inputs) == 2 and isinstance(inputs[0], np.ndarray):
-            array = np.ascontiguousarray(inputs[0])
-            return tv_tensors.Image(torch.from_numpy(array).permute(2, 0, 1)), inputs[1]
+            return _frame_stack_to_image(inputs[0]), inputs[1]
         return super().forward(*inputs)
 
 
-class CocoDetection(torchvision.datasets.CocoDetection):
+class CocoDetection(torchvision.datasets.CocoDetection):  # type: ignore[misc]
     """COCO detection dataset with optional sparse-to-contiguous category ID remapping.
 
     Extends ``torchvision.datasets.CocoDetection`` with two additions:
@@ -216,11 +781,18 @@ class CocoDetection(torchvision.datasets.CocoDetection):
     ``remap_category_ids=True`` builds a ``cat2label`` mapping from the annotation file so that IDs are remapped to the
     range ``[0, N)``.  The reverse ``label2cat`` mapping is attached to the underlying COCO API object so that
     :class:`~rfdetr.datasets.coco_eval.CocoEvaluator` can convert predicted label indices back to the original category
-    IDs required by pycocotools.
+    IDs required by pycocotools.  Unannotated grouping categories — the synthetic root that Roboflow COCO exports
+    prepend, for example — are excluded by :func:`filter_parent_categories` when ``include_keypoints=False``, so they
+    do not consume an output slot; the keypoint path (:func:`_build_keypoint_cat2label`) keeps them.
 
     ``remap_category_ids`` should be ``True`` for Roboflow / custom datasets (via :func:`build_roboflow_from_coco`) and
     ``False`` (the default) when evaluating pretrained models that were trained with the convention that model output
     slot *k* corresponds directly to COCO category ID *k*.
+
+    Images with a fourth channel (RGBA, e.g. RGB plus an appended motion channel) keep all four channels. An image
+    entry carrying ``temporal_files`` (extra frame paths of a video sample) is loaded as one HWC array holding
+    ``[reference, *temporal_files]`` stacked on the channel axis. An unreadable image is retried and then replaced by a
+    neighbouring sample (see :meth:`__getitem__`).
 
     Args:
         img_folder: Path to the directory containing the dataset images.
@@ -229,70 +801,123 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             annotation conversion.  ``None`` means no additional transforms.
         include_masks: If ``True``, decode polygon segmentation masks into binary
             tensors and include them in the target dict under the ``"masks"`` key.
+        include_keypoints: If ``True``, parse COCO keypoints and include them in
+            the target dict under the ``"keypoints"`` key.
+        num_keypoints_per_class: Optional keypoint schema describing the number of
+            keypoints per class. When provided, keypoints are padded/truncated to ``max(num_keypoints_per_class)``.
         remap_category_ids: If ``True``, build a ``cat2label`` mapping from the
             annotation file that remaps sparse category IDs to contiguous 0-based label indices.  The reverse mapping is
             stored as ``label2cat`` on both this object and the underlying COCO API object.  Defaults to ``False``.
+        cat2label: Pre-built ``category_id`` → label-index mapping to adopt verbatim instead of deriving one from this
+            split's own annotations.  Requires ``remap_category_ids=True`` and takes precedence over both the detection
+            and the keypoint derivation.  :func:`build_roboflow_from_coco` passes the train split's mapping here so
+            that validation and test splits share one label space (see :func:`_train_split_cat2label`); ``None`` (the
+            default) keeps the split-local derivation.
+        draft_size: Smallest source extent the transform pipeline can consume without upscaling, used to enable
+            JPEG DCT-domain downscaling during decode (see :meth:`_decode_image`).  ``None`` (the default) decodes at
+            full resolution.  :func:`draft_size_for_transforms` derives the value from the pipeline's scales.
     """
 
     def __init__(
         self,
-        img_folder: Union[str, Path],
-        ann_file: Union[str, Path],
-        transforms: Optional[Any],
+        img_folder: str | Path,
+        ann_file: str | Path,
+        transforms: Any | None,
         include_masks: bool = False,
-        remap_category_ids: bool = False,
         include_keypoints: bool = False,
-        num_keypoints: int = 2,
+        num_keypoints_per_class: list[int] | None = None,
+        remap_category_ids: bool = False,
+        cat2label: dict[int, int] | None = None,
+        draft_size: int | None = None,
     ) -> None:
-        super(CocoDetection, self).__init__(img_folder, ann_file)
+        super().__init__(img_folder, ann_file)
         self._transforms = transforms
+        self._draft_size = draft_size
         self.include_masks = include_masks
         self.include_keypoints = include_keypoints
-        self.num_keypoints = num_keypoints
+        if cat2label is not None and not remap_category_ids:
+            raise ValueError(
+                "cat2label was supplied but remap_category_ids is False, so the mapping would be ignored. "
+                "Pass remap_category_ids=True to apply it, or drop cat2label to keep raw COCO category ids."
+            )
+        self.cat2label: dict[int, int] | None
+        self.label2cat: dict[int, int] | None
         if remap_category_ids:
             # Mapping from original COCO category_id to contiguous label indices
-            self.cat2label = {cat_id: i for i, cat_id in enumerate(sorted(self.coco.cats.keys()))}
+            if cat2label is not None:
+                self.cat2label = dict(cat2label)
+            elif include_keypoints:
+                self.cat2label = _build_keypoint_cat2label(self.coco, num_keypoints_per_class)
+            else:
+                annotated = {int(annotation["category_id"]) for annotation in self.coco.anns.values()}
+                kept = filter_parent_categories(list(self.coco.cats.values()), annotated)
+                self.cat2label = {int(category["id"]): label for label, category in enumerate(kept)}
+                dropped = sorted(set(self.coco.cats) - set(self.cat2label))
+                if dropped:
+                    logger.info(
+                        "Skipping unannotated COCO grouping categories when assigning label indices: %s",
+                        ", ".join(f"{cat_id} ({self.coco.cats[cat_id]['name']})" for cat_id in dropped),
+                    )
             # Reverse mapping from contiguous label indices back to COCO category_id
             self.label2cat = {label: cat_id for cat_id, label in self.cat2label.items()}
             # Expose label-to-category mapping on the underlying COCO API object for evaluators
-            setattr(self.coco, "label2cat", self.label2cat)
+            self.coco.label2cat = self.label2cat
         else:
             self.cat2label = None
             self.label2cat = None
         self.prepare = ConvertCoco(
             include_masks=include_masks,
-            cat2label=self.cat2label,
             include_keypoints=include_keypoints,
-            num_keypoints=num_keypoints,
+            cat2label=self.cat2label,
+            num_keypoints_per_class=num_keypoints_per_class,
         )
 
-    def _load_image(self, id: int) -> Image.Image:
-        # Override torchvision's RGB-forcing loader so imagery with an appended
-        # motion/flow channel (saved as 4-channel RGBA) keeps all its channels.
-        # Standard 3-channel imagery is still returned as RGB.
-        info = self.coco.loadImgs(id)[0]
-        image = self._open_frame(info["file_name"])
+    def _decode_frame(self, file_name: str) -> tuple[Image.Image, tuple[float, float]]:
+        """Decode one image file, keeping a fourth channel when the file has one.
+
+        Four-channel files (RGB plus alpha or an appended motion channel) are returned as full-size RGBA; everything
+        else goes through :func:`decode_pil_image`, drafting when ``draft_size`` is set.
+
+        Args:
+            file_name: Image path, absolute or relative to the dataset root.
+
+        Returns:
+            Decoded RGB or RGBA image and its horizontal/vertical decode scales.
+        """
+        path = Path(self.root) / file_name
+        with Image.open(path) as image:
+            if image.mode in _FOUR_CHANNEL_MODES or (image.mode == "P" and "transparency" in image.info):
+                return image.convert("RGBA"), (1.0, 1.0)
+        return decode_pil_image(path, self._draft_size)
+
+    def _decode_image(self, image_id: int) -> tuple[Any, tuple[float, float]]:
+        """Decode one sample's image, drafting when ``draft_size`` is set.
+
+        Used instead of ``torchvision.datasets.CocoDetection._load_image``, which this class no longer calls, and
+        deliberately not named the same: it returns a decode scale alongside the image.
+
+        Args:
+            image_id: COCO image id.
+
+        Returns:
+            Decoded RGB/RGBA image and its horizontal/vertical decode scales, both ``1.0`` when the decoder did not
+            reduce. For a video sample (image entry with ``temporal_files``) the image is an HWC array of the
+            reference frame followed by the context frames, stacked on the channel axis.
+        """
+        info = self.coco.loadImgs(image_id)[0]
+        image, scales = self._decode_frame(info["file_name"])
         context_files = info.get("temporal_files")
         if not context_files:
-            return image
+            return image, scales
 
-        # Video sample: stack [reference, context...] along the channel axis. PIL cannot hold
-        # more than 4 channels, so the stack travels through the transforms as an HWC array.
+        # PIL cannot hold more than 4 channels, so the stack travels through the transforms as an HWC array.
         reference = np.asarray(image)
         frames = [reference]
         for context_file in context_files:
-            frame = np.asarray(self._open_frame(context_file).convert(image.mode))
+            frame = np.asarray(self._decode_frame(context_file)[0].convert(image.mode))
             # A context frame of another size cannot be fused; fall back to the reference.
             frames.append(frame if frame.shape == reference.shape else reference)
-        return np.concatenate(frames, axis=2)
-
-    def _open_frame(self, path: str) -> Image.Image:
-        image = Image.open(str(Path(self.root) / path))
-        if image.mode in ("RGBA", "LA", "CMYK") or (
-            image.mode == "P" and "transparency" in image.info
-        ):
-            return image.convert("RGBA")
-        return image.convert("RGB")
+        return np.concatenate(frames, axis=2), scales
 
     def _image_path(self, idx: int) -> str:
         """Return the on-disk path backing a dataset index.
@@ -301,11 +926,11 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             idx: Index into ``self.ids``.
 
         Returns:
-            The absolute path of the image file for that sample.
+            The path of the (reference) image file for that sample.
         """
         return str(Path(self.root) / self.coco.loadImgs(self.ids[idx])[0]["file_name"])
 
-    def _fetch(self, idx: int) -> Tuple[Any, Any]:
+    def _fetch(self, idx: int) -> tuple[Any, Any]:
         """Load and transform a single sample.
 
         Args:
@@ -314,8 +939,12 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         Returns:
             The ``(image, target)`` pair after annotation conversion and transforms.
         """
-        img, target = super(CocoDetection, self).__getitem__(idx)
-        target = {"image_id": self.ids[idx], "annotations": target}
+        image_id = self.ids[idx]
+        img, (x_scale, y_scale) = self._decode_image(image_id)
+        annotations = self._load_target(image_id)
+        if (x_scale, y_scale) != (1.0, 1.0):
+            annotations = [scale_coco_annotation(annotation, x_scale, y_scale) for annotation in annotations]
+        target = {"image_id": image_id, "annotations": annotations}
         img, target = self.prepare(img, target)
         if self._transforms is not None:
             # boxes are absolute [x_min, y_min, x_max, y_max]; conversion to
@@ -323,19 +952,14 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             img, target = self._transforms(img, target)
         return img, target
 
-    def __getitem__(self, idx: int) -> Tuple[Any, Any]:
+    def __getitem__(self, idx: int) -> tuple[Any, Any]:
         """Load a sample, tolerating an unreadable image rather than raising.
 
-        A DataLoader worker that raises takes its rank down with it, and under DDP
-        every surviving rank then blocks in the next collective until the NCCL
-        watchdog aborts the job one process-group timeout later -- naming no file.
-        One bad read must not cost a multi-GPU run, so the read is retried (a
-        transient short read off network storage is indistinguishable from a
-        truncated file to PIL) and then falls through to a neighbouring sample,
-        which keeps every rank's batch count identical.
-
-        Only ``OSError`` is tolerated -- that covers truncated, unidentifiable,
-        missing and I/O-failed images. Annotation and transform bugs still raise.
+        A DataLoader worker that raises takes its DDP rank down and every surviving rank then blocks until the NCCL
+        watchdog aborts the job, naming no file. So the read is retried (a transient short read off network storage
+        looks like a truncated file) and then falls through to a neighbouring sample, which keeps every rank's batch
+        count identical. Only ``OSError`` is tolerated: truncated, unidentifiable, missing and I/O-failed images.
+        Annotation and transform bugs still raise.
 
         Args:
             idx: Index into ``self.ids``.
@@ -344,17 +968,15 @@ class CocoDetection(torchvision.datasets.CocoDetection):
             The ``(image, target)`` pair, possibly for a neighbouring index.
 
         Raises:
-            RuntimeError: If every candidate from ``idx`` onward is unreadable,
-                which means the dataset or its filesystem is broken rather than a
-                single file being bad.
+            RuntimeError: If every candidate from ``idx`` onward is unreadable, which means the dataset or its
+                filesystem is broken rather than a single file being bad.
         """
         for attempt in range(1, _IMAGE_READ_ATTEMPTS + 1):
             try:
                 return self._fetch(idx)
             except OSError as exc:
                 logger.error(
-                    f"Read failed for {self._image_path(idx)} "
-                    f"(attempt {attempt}/{_IMAGE_READ_ATTEMPTS}): {exc}"
+                    f"Read failed for {self._image_path(idx)} (attempt {attempt}/{_IMAGE_READ_ATTEMPTS}): {exc}"
                 )
                 if attempt < _IMAGE_READ_ATTEMPTS:
                     time.sleep(_IMAGE_READ_BACKOFF_SECONDS * attempt)
@@ -378,7 +1000,7 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         )
 
 
-class ConvertCoco(object):
+class ConvertCoco:
     """Convert a raw COCO annotation dict into model-ready tensors.
 
     Accepts the ``(image, target)`` pair produced by ``torchvision.datasets.CocoDetection`` and returns the same image
@@ -391,63 +1013,70 @@ class ConvertCoco(object):
     - ``"iscrowd"`` – ``(N,)`` int64 tensor (0 = instance, 1 = crowd).
     - ``"masks"`` – ``(N, H, W)`` bool tensor of binary segmentation masks, only
       present when ``include_masks=True``.
+    - ``"keypoints"`` – ``(N, K, 3)`` float32 tensor in COCO keypoint format,
+      only present when ``include_keypoints=True``.
 
     Crowd annotations (``iscrowd=1``) and degenerate boxes (zero width or height after clamping to image boundaries) are
-    filtered out.
+    filtered out. For ``CocoDetection`` and ``YoloDetection`` splits, ``COCOEvalCallback`` reads crowd regions back from
+    the dataset's COCO API for validation and test mAP; webdataset shards have no COCO API, so their evaluation metrics
+    still omit crowd regions.
 
     Args:
         include_masks: If ``True``, decode segmentation annotations (polygon or
-            RLE format) into binary masks and include them in the returned target dict.
-            Annotations without a segmentation fall back to the ellipse inscribed in
-            their bounding box so mask and box counts always agree.
+            RLE format) into binary masks and include them in the returned target dict. Annotations without a
+            segmentation get an all-zero mask, or the ellipse inscribed in their bounding box when the environment
+            variable ``RFDETR_BOX_ONLY_MASK`` is ``ellipse``.
         cat2label: Optional mapping from COCO ``category_id`` values to contiguous
             0-based label indices.  When ``None`` (default) the raw ``category_id`` values are used as labels directly,
             which is correct for datasets whose IDs are already 0-indexed.  Pass a non-``None`` mapping for sparse
             COCO-style datasets (e.g. IDs 1–90 with gaps) so that labels stay within the model's output range.
+        num_keypoints_per_class: Optional keypoint schema. When provided, keypoints
+            are padded/truncated to ``max(num_keypoints_per_class)`` in each annotation.
     """
 
     def __init__(
         self,
         include_masks: bool = False,
-        cat2label: Optional[Dict[int, int]] = None,
         include_keypoints: bool = False,
-        num_keypoints: int = 2,
+        cat2label: dict[int, int] | None = None,
+        num_keypoints_per_class: list[int] | None = None,
     ) -> None:
         self.include_masks = include_masks
-        self.cat2label = cat2label
         self.include_keypoints = include_keypoints
-        self.num_keypoints = num_keypoints
+        self.cat2label = cat2label
+        self.num_keypoints = max(num_keypoints_per_class, default=0) if num_keypoints_per_class is not None else 0
 
-    def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
+    def __call__(self, image: Image.Image, target: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
         w, h = image_wh(image)
 
         image_id = target["image_id"]
-        image_id = torch.tensor([image_id])
+        image_id = torch.as_tensor([image_id])
 
         anno = target["annotations"]
 
         anno = [obj for obj in anno if "iscrowd" not in obj or obj["iscrowd"] == 0]
 
-        boxes = [obj["bbox"] for obj in anno]
+        box_values = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
-        boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
+        boxes = torch.as_tensor(box_values, dtype=torch.float32).reshape(-1, 4)
         boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
-        classes: List[int] = []
+        class_ids: list[int] = []
+        cat2label = self.cat2label
         for obj in anno:
             category_id = obj["category_id"]
-            if getattr(self, "cat2label", None) is not None:
-                if category_id not in self.cat2label:
+            if cat2label is not None:
+                if category_id not in cat2label:
                     raise KeyError(
                         f"Unknown category_id {category_id} for image_id {target.get('image_id')} "
                         "encountered in annotations. Check that your category mapping matches the dataset."
                     )
-                classes.append(self.cat2label[category_id])
+                class_ids.append(cat2label[category_id])
             else:
-                classes.append(category_id)
-        classes = torch.tensor(classes, dtype=torch.int64)
+                class_ids.append(category_id)
+        classes = torch.as_tensor(class_ids, dtype=torch.int64)
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
@@ -459,47 +1088,66 @@ class ConvertCoco(object):
         target["image_id"] = image_id
 
         # for conversion to coco api
-        area = torch.tensor([obj["area"] for obj in anno])
-        iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno])
+        area = torch.as_tensor([obj["area"] for obj in anno], dtype=torch.float32)
+        iscrowd = torch.as_tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in anno], dtype=torch.int64)
         target["area"] = area[keep]
         target["iscrowd"] = iscrowd[keep]
 
+        keypoint_keep: Tensor | None = None
+        if self.include_keypoints:
+            num_keypoints = self.num_keypoints
+            if num_keypoints == 0:
+                for obj in anno:
+                    keypoints = obj.get("keypoints")
+                    if keypoints is not None:
+                        num_keypoints = len(keypoints) // 3
+                        break
+
+            keypoint_tensors: list[Tensor] = []
+            for obj in anno:
+                raw_keypoints = obj.get("keypoints")
+                if raw_keypoints is None:
+                    keypoint_tensors.append(torch.zeros((num_keypoints, 3), dtype=torch.float32))
+                    continue
+
+                # Taken as-is, with no +0.5 shift: keypoints are treated as continuous image coordinates, the same
+                # convention as boxes, and the horizontal flip mirrors them as ``width - x``.
+                keypoint_tensor = torch.as_tensor(raw_keypoints, dtype=torch.float32).reshape(-1, 3)
+                if keypoint_tensor.shape[0] < num_keypoints:
+                    padded = torch.zeros((num_keypoints, 3), dtype=torch.float32)
+                    padded[: keypoint_tensor.shape[0]] = keypoint_tensor
+                    keypoint_tensors.append(padded)
+                    continue
+                keypoint_tensors.append(keypoint_tensor[:num_keypoints])
+
+            if len(keypoint_tensors) > 0:
+                keypoints_out = torch.stack(keypoint_tensors, dim=0)
+            else:
+                keypoints_out = torch.zeros((0, num_keypoints, 3), dtype=torch.float32)
+            target["keypoints"] = keypoints_out[keep]
+            # Do NOT filter instances with all-invisible keypoints (v=0).
+            # The keypoint loss already handles zero-visibility via valid_visibility
+            # masking; filtering here silently removes box/class supervision for
+            # occluded subjects and prevents training on valid person detections.
+
         # add segmentation masks if requested, otherwise ensure consistent key when include_masks=True
         if self.include_masks:
-            # One mask per annotation so mask/box counts always agree in the matcher;
-            # annotations without a segmentation fall back to the ellipse inscribed in their box.
+            # Build one mask per annotation unconditionally so mask and box counts always agree. An annotation
+            # without a segmentation gets an all-zero mask, or with RFDETR_BOX_ONLY_MASK=ellipse the ellipse
+            # inscribed in its box, for training masks on data that is only partly segmented.
+            ellipse_fallback = os.environ.get("RFDETR_BOX_ONLY_MASK", "").strip().lower() == "ellipse"
             segmentations = []
             for obj in anno:
                 segmentation = obj.get("segmentation")
-                if segmentation is None or (not isinstance(segmentation, dict) and len(segmentation) == 0):
+                if ellipse_fallback and (
+                    segmentation is None or (not isinstance(segmentation, dict) and len(segmentation) == 0)
+                ):
                     segmentation = _box_to_ellipse_polygon(obj["bbox"])
                 segmentations.append(segmentation)
             masks = convert_coco_poly_to_mask(segmentations, h, w)
-            if masks.numel() > 0:
-                target["masks"] = masks[keep]
-            else:
-                target["masks"] = torch.zeros((0, h, w), dtype=torch.uint8)
-
-            target["masks"] = target["masks"].bool()
-
-        # add keypoints if requested; shape [N, num_keypoints, 3] as (x, y, visibility)
-        # with x, y in absolute pixel coordinates (normalised later by ``Normalize``).
-        if self.include_keypoints:
-            k = self.num_keypoints
-            per_instance = []
-            for obj in anno:
-                raw = obj.get("keypoints", []) or []
-                kp = torch.as_tensor(raw, dtype=torch.float32).reshape(-1, 3)
-                fixed = torch.zeros((k, 3), dtype=torch.float32)
-                n = min(kp.shape[0], k)
-                if n > 0:
-                    fixed[:n] = kp[:n]
-                per_instance.append(fixed)
-            if per_instance:
-                keypoints = torch.stack(per_instance, dim=0)[keep]
-            else:
-                keypoints = torch.zeros((0, k, 3), dtype=torch.float32)
-            target["keypoints"] = keypoints
+            target["masks"] = masks[keep].bool()
+            if keypoint_keep is not None:
+                target["masks"] = target["masks"][keypoint_keep]
 
         target["orig_size"] = torch.as_tensor([int(h), int(w)])
         target["size"] = torch.as_tensor([int(h), int(w)])
@@ -508,11 +1156,12 @@ class ConvertCoco(object):
 
 
 def _build_train_resize_config(
-    scales: List[int],
+    scales: Sequence[_Resolution],
     *,
     square: bool,
-    max_size: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    max_size: int | None = None,
+    scale_jitter: bool = True,
+) -> list[dict[str, Any]]:
     """Build the training resize pipeline as an Albumentations config list.
 
     Expresses the ``RandomSelect(resize_a, Compose([resize_b1, crop, resize_b2]))`` pattern as a config-driven
@@ -528,76 +1177,92 @@ def _build_train_resize_config(
     collator via :func:`~rfdetr.utilities.tensors.make_collate_fn`, not here.
 
     Args:
-        scales: Target resize scales in pixels.
-        square: If ``True``, produce square output using ``A.Resize``
-            (one random scale from *scales*).  If ``False``, preserve aspect ratio using ``A.SmallestMaxSize`` with an
-            optional long-side cap.
+        scales: Target resize scales in pixels, each a side length or a ``(height, width)`` pair.
+        square: If ``True``, resize to exactly the target scale using ``A.Resize``
+            (one random scale from *scales*).  If ``False``, preserve aspect ratio using ``A.SmallestMaxSize`` on the
+            scale's shorter side with an optional long-side cap.
         max_size: Maximum long-side size for non-square resizes.  Defaults to
             ``1333`` when *square* is ``False``.
+        scale_jitter: If ``True`` (default), both Option A and Option B are randomly
+            selected.  If ``False``, only Option A (direct resize) is used — no random crop.
 
     Returns:
-        A single-element list containing a ``OneOf`` config entry.
+        A single-element list. By default the entry wraps a ``OneOf`` over both
+        branches; when ``scale_jitter=False``, the entry is Option A directly.
     """
-    # Scales are (height, width) pairs; for a square model both components are equal.
-    pairs = [as_pair(s) for s in scales]
+    pairs = [as_pair(scale) for scale in scales]
+    crop_branch = [{"RandomSizedCrop": {"min_max_height": [384, 600], "height": h, "width": w}} for h, w in pairs]
 
     if square:
-        option_a: Dict[str, Any] = {
+        option_a: dict[str, Any] = {
             "OneOf": {
                 "transforms": [{"Resize": {"height": h, "width": w}} for h, w in pairs],
             }
         }
-        option_b: Dict[str, Any] = {
+        option_b: dict[str, Any] = {
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
-                    {
-                        "OneOf": {
-                            "transforms": [
-                                {"RandomSizedCrop": {"min_max_height": [384, 600], "height": h, "width": w}}
-                                for h, w in pairs
-                            ],
-                        }
-                    },
+                    {"OneOf": {"transforms": crop_branch}},
                 ]
             }
         }
     else:
-        cap = max_size or 1333
-        # This branch resizes by shortest side and caps the longest, so it only needs the short edge.
-        short_sides = [min(h, w) for h, w in pairs]
+        cap = max_size or _COCO_MAX_SIZE
+        # The aspect-preserving resize is driven by the short side alone.
+        short_sides = [min(pair) for pair in pairs]
         # SmallestMaxSize accepts a list and picks randomly — no OneOf needed
         size_param: Any = short_sides[0] if len(short_sides) == 1 else short_sides
         option_a = {
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": size_param}},
-                    {"LongestMaxSize": {"max_size": cap}},
+                    # CappedLongestMaxSize only shrinks (never upscales) -- a plain LongestMaxSize would force
+                    # every image's longest side up to `cap`, silently inflating training resolution far beyond
+                    # `size_param` whenever the aspect ratio keeps the long side below `cap` after SmallestMaxSize.
+                    {"CappedLongestMaxSize": {"max_size": cap}},
                 ]
             }
         }
+        # DETR-style crop branch: resize the short side to 400/500/600, then take a ``RandomSizedCrop`` that resizes
+        # the crop *directly* to the target scale (via a per-scale ``OneOf``, mirroring the square path). This removes
+        # the previous fixed 384x384 intermediate hop -- the crop was resampled to 384 and then resized again to the
+        # target, a wasteful downscale-then-upscale. ``min_max_height`` upper bound matches the maximum SmallestMaxSize
+        # value (600): when the sampled scale is smaller (e.g. 400), albumentations clamps the crop to the image height,
+        # effectively giving a full-image crop — this is the original DETR recipe behaviour and preserves training
+        # diversity (zoom-out variety) across the full SmallestMaxSize range.
         option_b = {
             "Sequential": {
                 "transforms": [
                     {"SmallestMaxSize": {"max_size": [400, 500, 600]}},
-                    {"RandomSizedCrop": {"min_max_height": [384, 600], "height": 384, "width": 384}},
-                    {"SmallestMaxSize": {"max_size": size_param}},
-                    {"LongestMaxSize": {"max_size": cap}},
+                    {"OneOf": {"transforms": crop_branch}},
                 ]
             }
         }
 
+    if not scale_jitter:
+        return [option_a]
+
     return [{"OneOf": {"transforms": [option_a, option_b]}}]
 
 
-def _build_resize(config: List[Dict[str, Any]], image_set: str) -> List[Any]:
-    """Build the resize stage, refusing to return an empty pipeline.
+def _build_resize(config: list[dict[str, Any]], image_set: str) -> list[AlbumentationsWrapper]:
+    """Build the Albumentations resize stage, refusing to return an empty pipeline.
 
-    :meth:`AlbumentationsWrapper.from_config` logs and skips transforms it cannot construct, which is tolerable for
-    augmentations but not for the resize: dropping it leaves images at their native size while boxes are normalised
-    against that size, so the model trains on a geometry inference never reproduces.
+    Dropping the resize leaves images at their native size while boxes are normalised against that size, so the model
+    trains on a geometry inference never reproduces.
+
+    Args:
+        config: Albumentations config of the resize stage.
+        image_set: Dataset split name, for the error message.
+
+    Returns:
+        The resize wrappers, never empty.
+
+    Raises:
+        RuntimeError: If a transform fails to build or the stage builds zero transforms.
     """
-    wrappers = AlbumentationsWrapper.from_config(config)
+    wrappers = AlbumentationsWrapper.from_config(config, strict=True)
     if not wrappers:
         raise RuntimeError(
             f"Resize stage for image_set={image_set!r} built zero transforms from {config!r}. Training without it "
@@ -606,36 +1271,297 @@ def _build_resize(config: List[Dict[str, Any]], image_set: str) -> List[Any]:
     return wrappers
 
 
+def _build_train_resize_transforms(
+    scales: Sequence[_Resolution],
+    *,
+    square: bool,
+    max_size: Optional[int] = None,
+    scale_jitter: bool = True,
+) -> Compose | RandomChoice | RandomResize | RandomSelect:
+    """Build the default torchvision-native training resize pipeline.
+
+    Args:
+        scales: Candidate target scales, each a side length or a ``(height, width)`` pair.
+        square: Whether to resize to exactly the target scale instead of preserving the aspect ratio.
+        max_size: Optional maximum long-side size for non-square resizing.
+        scale_jitter: If ``True`` (default), randomly picks between a direct resize
+            (Option A) and a resize → crop → resize sequence (Option B). If ``False``,
+            only Option A is used — no random crop.
+
+    Returns:
+        Random two-branch resize transform matching the historical DETR-style pipeline,
+        or just Option A when ``scale_jitter=False``.
+    """
+    pairs = [as_pair(scale) for scale in scales]
+    if square:
+        square_resize = RandomChoice([Resize(pair) for pair in pairs])
+        if not scale_jitter:
+            return square_resize
+        resize_b = Compose(
+            [
+                RandomResize([400, 500, 600]),
+                RandomChoice(
+                    [RandomSizedCrop((384, 600), pair) for pair in pairs],
+                ),
+            ]
+        )
+        return RandomSelect(square_resize, resize_b)
+
+    cap = max_size or _COCO_MAX_SIZE
+    # The aspect-preserving resize is driven by the short side alone.
+    resize = RandomResize([min(pair) for pair in pairs], max_size=cap)
+    if not scale_jitter:
+        return resize
+    # Resize each crop directly to the selected target scale, capped as the removed final RandomResize did. Previously
+    # the crop was resized to a fixed 384x384 output and then resized again to `scales`, needlessly resampling it twice.
+    # The Albumentations backend already dropped that extra hop (see _build_train_resize_config), so both backends now
+    # express the same recipe while retaining the historical non-square maximum size.
+    capped_pairs = [(min(height, cap), min(width, cap)) for height, width in pairs]
+    resize_b = Compose(
+        [
+            RandomResize([400, 500, 600]),
+            RandomChoice([RandomSizedCrop((384, 600), pair) for pair in capped_pairs]),
+        ]
+    )
+    return RandomSelect(resize, resize_b)
+
+
+def _build_albumentations_pipeline(
+    image_set: str,
+    resolution: _Resolution,
+    scales: Sequence[_Resolution],
+    *,
+    square: bool,
+    aug_config: Optional[Dict[str, Dict[str, Any]]],
+    scale_jitter: bool = True,
+    gpu_postprocess: bool,
+    keypoint_flip_pairs: Optional[List[int]],
+) -> Compose:
+    """Build the legacy Albumentations-backed transform pipeline for custom configs.
+
+    Args:
+        image_set: Dataset split name.
+        resolution: Target resolution, a side length or ``(height, width)``.
+        scales: Candidate train resize scales.
+        square: Whether to resize to exactly the target resolution instead of preserving the aspect ratio.
+        aug_config: Custom Albumentations config.
+        scale_jitter: If ``True`` (default), the training resize pipeline randomly picks between
+            a direct resize (Option A) and a resize → crop → resize sequence (Option B). Set to
+            ``False`` to use Option A only — no random crop.
+        gpu_postprocess: Whether GPU augmentation/normalization will run later.
+        keypoint_flip_pairs: Keypoint left/right swap pairs.
+
+    Returns:
+        Transform pipeline.
+    """
+    to_image = _ToImage()
+    to_float = ToDtype(torch.float32, scale=True)
+    normalize = Normalize()
+
+    if image_set == "train":
+        resize_wrappers = _build_resize(
+            _build_train_resize_config(
+                scales,
+                square=square,
+                max_size=None if square else _COCO_MAX_SIZE,
+                scale_jitter=scale_jitter,
+            ),
+            image_set,
+        )
+        pipeline: list[Any] = [*resize_wrappers]
+        if not gpu_postprocess:
+            aug_wrappers = AlbumentationsWrapper.from_config(
+                aug_config if aug_config is not None else AUG_CONFIG,
+                keypoint_flip_pairs=keypoint_flip_pairs,
+            )
+            pipeline += [*aug_wrappers]
+        pipeline += [to_image, to_float]
+        if not gpu_postprocess:
+            pipeline += [normalize]
+        return Compose(pipeline)
+
+    height, width = as_pair(resolution)
+    if square or image_set == "val_speed":
+        resize_wrappers = _build_resize([{"Resize": {"height": height, "width": width}}], image_set)
+        return Compose([*resize_wrappers, to_image, to_float, normalize])
+
+    resize_wrappers = _build_resize(
+        [
+            {"SmallestMaxSize": {"max_size": min(height, width)}},
+            # CappedLongestMaxSize only shrinks (never upscales) -- see the matching comment in
+            # _build_train_resize_config's option_a.
+            {"CappedLongestMaxSize": {"max_size": _COCO_MAX_SIZE}},
+        ],
+        image_set,
+    )
+    return Compose([*resize_wrappers, to_image, to_float, normalize])
+
+
+def _build_torchvision_pipeline(
+    image_set: str,
+    resolution: _Resolution,
+    scales: Sequence[_Resolution],
+    *,
+    square: bool,
+    aug_config: Optional[Dict[str, Dict[str, Any]]],
+    scale_jitter: bool = True,
+    gpu_postprocess: bool,
+    keypoint_flip_pairs: Optional[List[int]],
+) -> Compose:
+    """Build the default torchvision-native transform pipeline.
+
+    Args:
+        image_set: Dataset split name.
+        resolution: Target resolution, a side length or ``(height, width)``.
+        scales: Candidate train resize scales.
+        square: Whether to resize to exactly the target resolution instead of preserving the aspect ratio.
+        aug_config: ``None`` for default augmentation, ``{}`` to disable it.
+        scale_jitter: If ``True`` (default), the training resize pipeline randomly picks between
+            a direct resize (Option A) and a resize → crop → resize sequence (Option B). Set to
+            ``False`` to use Option A only — no random crop.
+        gpu_postprocess: Whether GPU augmentation/normalization will run later.
+        keypoint_flip_pairs: Keypoint left/right swap pairs.
+
+    Returns:
+        Transform pipeline.
+    """
+    to_image = _ToImage()
+    to_float = ToDtype(torch.float32, scale=True)
+    normalize = Normalize()
+    # A video sample arrives as an HWC frame stack; the transforms below take a PIL image or a tensor.
+    stack_to_image = _FrameStackToImage()
+
+    if image_set == "train":
+        import warnings
+
+        if aug_config is None:
+            warnings.warn(
+                "RF-DETR has changed the default training augmentation backend from "
+                "Albumentations (cv2 INTER_LINEAR, no antialias) to torchvision "
+                "(BILINEAR + antialias=True). Pixel values will differ slightly from "
+                "previous versions; mAP may drift on existing benchmarks. "
+                "To restore the previous behaviour, install rfdetr[augment] and "
+                "pass aug_config=AUG_CONFIG from rfdetr.datasets.aug_configs.",
+                UserWarning,
+                stacklevel=4,
+            )
+        pipeline: list[Any] = [
+            stack_to_image,
+            _build_train_resize_transforms(
+                scales,
+                square=square,
+                max_size=None if square else _COCO_MAX_SIZE,
+                scale_jitter=scale_jitter,
+            ),
+        ]
+        if aug_config is None and not gpu_postprocess:
+            if keypoint_flip_pairs is not None and not keypoint_flip_pairs:
+                # Keypoint pipeline with no flip pairs defined: mirror the Albumentations path's
+                # filter_keypoint_hflip_augmentations and drop the flip entirely instead of
+                # applying it, since RandomHorizontalFlip.__call__ has no way to relabel
+                # left/right joints without the pairs (see #1122 for the Albumentations-side fix
+                # this mirrors).
+                _warn_keypoint_hflip_disabled("RandomHorizontalFlip", logger.warning, editable_config=False)
+            else:
+                pipeline.append(RandomHorizontalFlip(p=0.5, keypoint_flip_pairs=keypoint_flip_pairs))
+        pipeline += [to_image, to_float]
+        if not gpu_postprocess:
+            pipeline += [normalize]
+        return Compose(pipeline)
+
+    height, width = as_pair(resolution)
+    if square or image_set == "val_speed":
+        return Compose([stack_to_image, Resize((height, width)), to_image, to_float, normalize])
+    return Compose(
+        [stack_to_image, RandomResize([min(height, width)], max_size=_COCO_MAX_SIZE), to_image, to_float, normalize]
+    )
+
+
+def _route_transforms(
+    image_set: str,
+    resolution: _Resolution,
+    scales: Sequence[_Resolution],
+    *,
+    square: bool,
+    aug_config: Optional[Dict[str, Dict[str, Any]]],
+    scale_jitter: bool = True,
+    gpu_postprocess: bool,
+    keypoint_flip_pairs: Optional[List[int]],
+) -> Compose:
+    """Route transform construction to Albumentations or torchvision backend.
+
+    Args:
+        image_set: Dataset split name.
+        resolution: Target resolution in pixels, a side length or ``(height, width)``.
+        scales: Candidate resize scales.
+        square: Whether to use square resize.
+        aug_config: Augmentation config; ``None`` or ``{}`` routes to torchvision.
+        scale_jitter: If ``True`` (default), the training resize pipeline randomly picks between
+            a direct resize (Option A) and a resize → crop → resize sequence (Option B). Set to
+            ``False`` to use Option A only — no random crop.
+        gpu_postprocess: Whether GPU augmentation will run later.
+        keypoint_flip_pairs: Keypoint left/right swap pairs.
+
+    Returns:
+        Composed transform pipeline.
+    """
+    if image_set == "train" and aug_config not in (None, {}) and not gpu_postprocess:
+        return _build_albumentations_pipeline(
+            image_set,
+            resolution,
+            scales,
+            square=square,
+            aug_config=aug_config,
+            scale_jitter=scale_jitter,
+            gpu_postprocess=gpu_postprocess,
+            keypoint_flip_pairs=keypoint_flip_pairs,
+        )
+    return _build_torchvision_pipeline(
+        image_set,
+        resolution,
+        scales,
+        square=square,
+        aug_config=aug_config,
+        scale_jitter=scale_jitter,
+        gpu_postprocess=gpu_postprocess,
+        keypoint_flip_pairs=keypoint_flip_pairs,
+    )
+
+
 def make_coco_transforms(
     image_set: str,
-    resolution: int | Tuple[int, int],
+    resolution: _Resolution,
     multi_scale: bool = False,
     expanded_scales: bool = False,
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: Optional[Dict[str, Dict[str, Any]]] = None,
+    aug_config: dict[str, dict[str, Any]] | None = None,
+    scale_jitter: bool = True,
     gpu_postprocess: bool = False,
+    keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
     """Build the standard COCO transform pipeline for a given dataset split.
 
     Returns a composed transform that resizes images to the target ``resolution`` (with optional multi-scale jitter),
-    applies Albumentations-based augmentations during training, and normalises pixel values with ImageNet statistics.
+    applies torchvision-native default augmentations during training, and normalises pixel values with ImageNet
+    statistics. Non-empty custom ``aug_config`` values continue to use the optional Albumentations path.
 
     For the ``"train"`` split the pipeline uses a two-branch ``OneOf`` between a direct resize and a resize →
-    random-crop → resize sequence (built via :func:`_build_train_resize_config`), followed by the augmentation stack and
-    normalisation.  For ``"val"``, ``"test"``, and ``"val_speed"`` only resize and normalisation are applied — no
-    augmentation.
+    random-crop → resize sequence (built via :func:`_build_train_resize_config`), followed by the
+    augmentation stack and normalisation.  For ``"val"``, ``"test"``, and ``"val_speed"`` only resize
+    and normalisation are applied — no augmentation.
 
     When *gpu_postprocess* is ``True``, both the Albumentations augmentation wrappers and the ``Normalize`` step are
-    omitted from the ``"train"`` pipeline. The ``RFDETRDataModule`` then applies augmentation and normalization on the
-    device in ``on_after_batch_transfer`` instead.
+    omitted from the ``"train"`` pipeline. The ``RFDETRDataModule`` then applies
+    augmentation and normalization on the device in ``on_after_batch_transfer`` instead.
 
     Args:
         image_set: Dataset split identifier — ``"train"``, ``"val"``, ``"test"``,
             or ``"val_speed"``.
         resolution: Target short-side resolution in pixels.  During validation the
-            longest side is capped at 1333 px to preserve aspect ratio.
+            longest side is capped at 1333 px to preserve aspect ratio.  A ``(height, width)`` pair contributes its
+            shorter side, except for ``"val_speed"`` which resizes to exactly ``(height, width)``.
         multi_scale: If ``True``, sample the resize target from a range of scales
             computed by :func:`compute_multi_scale_scales` instead of using a single fixed size.
         expanded_scales: Passed to :func:`compute_multi_scale_scales`; broadens the
@@ -646,31 +1572,50 @@ def make_coco_transforms(
             ensure all candidate resolutions are compatible with the backbone.
         num_windows: Number of attention windows; used by
             :func:`compute_multi_scale_scales` to derive candidate resolutions.
-        aug_config: Albumentations augmentation config dict passed to
-            :class:`~rfdetr.datasets.transforms.AlbumentationsWrapper`.  Falls back to the default
-            :data:`~rfdetr.datasets.aug_config.AUG_CONFIG` when ``None``.
-        gpu_postprocess: When ``True``, skip Albumentations augmentation wrappers and
+        aug_config: Controls the training augmentation backend.  Three states are
+            recognised:
+
+            * ``None`` (default) — use the torchvision-native default augmentation
+              (``RandomHorizontalFlip(p=0.5)``, gated by ``keypoint_flip_pairs`` —
+              see below).  See the ``UserWarning`` emitted at runtime for details
+              of this behaviour change.
+            * ``{}`` (empty dict) — disable all optional training augmentation
+              including the default horizontal flip.
+            * non-empty dict — pass to the optional Albumentations backend;
+              requires ``rfdetr[augment]`` to be installed.
+
+            Note:
+                ``aug_config`` has no effect on ``"val"``, ``"test"``, or ``"val_speed"``
+                splits — augmentation is never applied outside of training.
+        scale_jitter: If ``True`` (default), the training resize pipeline randomly picks between
+            a direct resize (Option A) and a resize → crop → resize sequence (Option B) for scale
+            variation.  Set to ``False`` to use Option A only — no random crop, annotations near
+            image borders stay intact.
+        gpu_postprocess: When ``True``, skip CPU augmentation and
             ``Normalize`` from the CPU pipeline.  The ``RFDETRDataModule`` then applies both augmentation and
             normalization on the GPU in ``on_after_batch_transfer``.  Has no effect on val/test splits.
+        keypoint_flip_pairs: Keypoint left/right swap pairs, or ``None`` for a
+            detection-only pipeline.  On the torchvision-native default backend
+            (``aug_config=None``), an empty list disables ``RandomHorizontalFlip``
+            entirely instead of applying it without relabelling — mirroring
+            ``AlbumentationsWrapper.from_config``'s existing gating for the same
+            sentinel.
 
     Returns:
-        A :class:`torchvision.transforms.v2.Compose` pipeline ready to be passed to :class:`CocoDetection`.
+        A transform pipeline ready to be passed to :class:`CocoDetection`.
 
         .. note::
             This pipeline does **not** guarantee that output ``H`` and ``W`` are divisible by ``patch_size *
             num_windows``.  Divisibility is enforced at the batch level by the DataLoader collate function.  If you
-            apply these transforms outside of :class:`~rfdetr.training.module_data.RFDETRDataModule`, pass the result
+            apply these transforms outside of :class:`~rfdetr.training.module_data.RFDETRDataModule`,
+            pass the result
             through :func:`~rfdetr.utilities.tensors.nested_tensor_from_tensor_list` with ``block_size=patch_size *
             num_windows``, or use :func:`~rfdetr.utilities.tensors.make_collate_fn` with that value.
 
     Raises:
         ValueError: If ``image_set`` is not one of the recognised split names.
     """
-    to_image = _ToImage()
-    to_float = ToDtype(torch.float32, scale=True)
-    normalize = Normalize()
-
-    scales = [as_pair(resolution)]
+    scales: Sequence[_Resolution] = [resolution]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
         scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
@@ -678,55 +1623,42 @@ def make_coco_transforms(
             scales = [scales[-1]]
         logger.info(f"Using multi-scale training with scales: {scales}")
 
-    if image_set == "train":
-        resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = _build_resize(
-            _build_train_resize_config(scales, square=False, max_size=1333), image_set
-        )
-        pipeline = [*resize_wrappers]
-        if not gpu_postprocess:
-            aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
-            pipeline += [*aug_wrappers]
-        pipeline += [to_image, to_float]
-        if not gpu_postprocess:
-            pipeline += [normalize]
-        return Compose(pipeline)
+    if image_set not in ("train", "val", "test", "val_speed"):
+        raise ValueError(f"unknown {image_set}")
 
-    if image_set in ("val", "test"):
-        resize_wrappers = _build_resize(
-            [
-                {"SmallestMaxSize": {"max_size": min(as_pair(resolution))}},
-                {"LongestMaxSize": {"max_size": 1333}},
-            ],
-            image_set,
-        )
-        return Compose([*resize_wrappers, to_image, to_float, normalize])
-    if image_set == "val_speed":
-        _res_h, _res_w = as_pair(resolution)
-        resize_wrappers = _build_resize([{"Resize": {"height": _res_h, "width": _res_w}}], image_set)
-        return Compose([*resize_wrappers, to_image, to_float, normalize])
-
-    raise ValueError(f"unknown {image_set}")
+    return _route_transforms(
+        image_set,
+        resolution,
+        scales,
+        square=False,
+        aug_config=aug_config,
+        scale_jitter=scale_jitter,
+        gpu_postprocess=gpu_postprocess,
+        keypoint_flip_pairs=keypoint_flip_pairs,
+    )
 
 
 def make_coco_transforms_square_div_64(
     image_set: str,
-    resolution: int | Tuple[int, int],
+    resolution: _Resolution,
     multi_scale: bool = False,
     expanded_scales: bool = False,
     skip_random_resize: bool = False,
     patch_size: int = 16,
     num_windows: int = 4,
-    aug_config: Optional[Dict[str, Dict[str, Any]]] = None,
+    aug_config: dict[str, dict[str, Any]] | None = None,
+    scale_jitter: bool = True,
     gpu_postprocess: bool = False,
+    keypoint_flip_pairs: list[int] | None = None,
 ) -> Compose:
     """Create COCO transforms with square resizing where the output size is divisible by 64.
 
-    This function builds a torchvision-style transform pipeline for COCO images that resizes them to square shapes
+    This function builds a torchvision-native transform pipeline for COCO images that resizes them to square shapes
     suitable for models that require spatial dimensions divisible by 64. It supports multi-scale training and optional
-    random resizing and cropping for the training split.
+    random resizing and cropping for the training split. Non-empty custom ``aug_config`` values continue to use the
+    optional Albumentations path.
 
-    When *gpu_postprocess* is ``True``, both the Albumentations augmentation wrappers and the ``Normalize`` step are
+    When *gpu_postprocess* is ``True``, both CPU augmentation and the ``Normalize`` step are
     omitted from the ``"train"`` pipeline. The ``RFDETRDataModule`` then applies augmentation and normalization on the
     device in ``on_after_batch_transfer`` instead.
 
@@ -734,32 +1666,44 @@ def make_coco_transforms_square_div_64(
         image_set: Dataset split identifier. Expected values are "train", "val",
             "test", or "val_speed". Each split uses a slightly different transform pipeline suited for training or
             evaluation.
-        resolution: Base square resolution (in pixels) to which images are resized.
+        resolution: Base resolution (in pixels) to which images are resized: a side length for a square output or
+            a ``(height, width)`` pair for a non-square one.
         multi_scale: If True, enable multi-scale training by sampling from a set of
             square resolutions instead of a single fixed size.
         expanded_scales: If True, expand the range of scales used during
             multi-scale training. Passed through to ``compute_multi_scale_scales``.
         skip_random_resize: If True and ``multi_scale`` is enabled, use only the
-            largest scale returned by ``compute_multi_scale_scales`` and skip random selection among multiple scales.
+            largest scale returned by ``compute_multi_scale_scales`` and skip
+            random selection among multiple scales.
         patch_size: Patch size used by ``compute_multi_scale_scales`` when
             determining valid square resolutions (typically related to the model's patch embedding or stride).
         num_windows: Number of windows used by ``compute_multi_scale_scales`` to
             derive the list of candidate square resolutions.
-        aug_config: Augmentation configuration dictionary compatible with
-            :class:`~rfdetr.datasets.transforms.AlbumentationsWrapper`. If ``None``, the default
-            :data:`~rfdetr.datasets.aug_config.AUG_CONFIG` is used.
+        aug_config: ``None`` for default torchvision augmentation, ``{}`` to disable augmentation, or a non-empty
+            Albumentations augmentation config dictionary.  On the ``None`` default, ``RandomHorizontalFlip`` is
+            further gated by ``keypoint_flip_pairs`` (see below).
+
+            Note:
+                ``aug_config`` has no effect on ``"val"``, ``"test"``, or ``"val_speed"``
+                splits — augmentation is never applied outside of training.
+        scale_jitter: If ``True`` (default), the training resize pipeline randomly picks between
+            a direct resize (Option A) and a resize → crop → resize sequence (Option B) for scale
+            variation.  Set to ``False`` to use Option A only — no random crop, annotations near
+            image borders stay intact.
         gpu_postprocess: When ``True``, skip Albumentations augmentation wrappers and
             ``Normalize`` from the CPU pipeline.  The ``RFDETRDataModule`` then applies both augmentation and
             normalization on the GPU in ``on_after_batch_transfer``.  Has no effect on val/test splits.
+        keypoint_flip_pairs: Keypoint left/right swap pairs, or ``None`` for a
+            detection-only pipeline.  On the torchvision-native default backend
+            (``aug_config=None``), an empty list disables ``RandomHorizontalFlip``
+            entirely instead of applying it without relabelling — mirroring
+            ``AlbumentationsWrapper.from_config``'s existing gating for the same
+            sentinel.
 
     Returns:
         A ``Compose`` object containing the composed image transforms appropriate for the specified ``image_set``.
     """
-    to_image = _ToImage()
-    to_float = ToDtype(torch.float32, scale=True)
-    normalize = Normalize()
-
-    scales = [as_pair(resolution)]
+    scales: Sequence[_Resolution] = [resolution]
     if multi_scale:
         # scales = [448, 512, 576, 640, 704, 768, 832, 896]
         scales = compute_multi_scale_scales(resolution, expanded_scales, patch_size, num_windows)
@@ -767,55 +1711,90 @@ def make_coco_transforms_square_div_64(
             scales = [scales[-1]]
         logger.info(f"Using multi-scale training with square resize and scales: {scales}")
 
-    if image_set == "train":
-        resolved_aug_config = aug_config if aug_config is not None else AUG_CONFIG
-        resize_wrappers = _build_resize(_build_train_resize_config(scales, square=True), image_set)
-        pipeline = [*resize_wrappers]
-        if not gpu_postprocess:
-            aug_wrappers = AlbumentationsWrapper.from_config(resolved_aug_config)
-            pipeline += [*aug_wrappers]
-        pipeline += [to_image, to_float]
-        if not gpu_postprocess:
-            pipeline += [normalize]
-        return Compose(pipeline)
+    if image_set not in ("train", "val", "test", "val_speed"):
+        raise ValueError(f"unknown {image_set}")
 
-    if image_set in ("val", "test", "val_speed"):
-        _res_h, _res_w = as_pair(resolution)
-        resize_wrappers = _build_resize([{"Resize": {"height": _res_h, "width": _res_w}}], image_set)
-        return Compose([*resize_wrappers, to_image, to_float, normalize])
-
-    raise ValueError(f"unknown {image_set}")
+    return _route_transforms(
+        image_set,
+        resolution,
+        scales,
+        square=True,
+        aug_config=aug_config,
+        scale_jitter=scale_jitter,
+        gpu_postprocess=gpu_postprocess,
+        keypoint_flip_pairs=keypoint_flip_pairs,
+    )
 
 
-def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> CocoDetection:
+def build_coco(image_set: str, args: Any, resolution: _Resolution) -> CocoDetection:
+    """Build a COCO dataset from an explicit configuration namespace.
+
+    Direct callers must provide either ``dataset_dir`` or ``coco_path``, plus
+    ``square_resize_div_64``, ``segmentation_head``, ``multi_scale``,
+    ``expanded_scales``, ``patch_size``, and ``num_windows`` on ``args``. Keypoint, custom augmentation, scale-jitter,
+    and augmentation-backend fields are optional.
+
+    Args:
+        image_set: COCO split identifier.
+        args: Dataset, model, and transform configuration namespace.
+        resolution: Target image resolution in pixels, a side length or ``(height, width)``.
+
+    Returns:
+        The configured COCO dataset.
+
+    Raises:
+        AttributeError: If a required dataset or transform option is absent.
+        FileNotFoundError: If the configured COCO root does not exist.
+        KeyError: If ``image_set`` does not map to a supported COCO split.
+    """
     root = Path(getattr(args, "dataset_dir", None) or args.coco_path)
     if not root.exists():
         logger.error(f"COCO path {root} does not exist")
         raise FileNotFoundError(f"COCO path {root} does not exist")
+    multi_scale = MultiScale.from_value(args.multi_scale)
 
-    mode = "instances"
+    # Detection dataset args may omit keypoint fields; default to the detection annotation path.
+    has_keypoints = getattr(args, "use_grouppose_keypoints", False)
+    mode = "person_keypoints" if has_keypoints else "instances"
     PATHS = {  # noqa: N806
         "train": (root / "train2017", root / "annotations" / f"{mode}_train2017.json"),
         "val": (root / "val2017", root / "annotations" / f"{mode}_val2017.json"),
         "test": (root / "test2017", root / "annotations" / "image_info_test-dev2017.json"),
     }
 
-    img_folder, ann_file = PATHS[image_set.split("_")[0]]
+    img_folder, ann_file = PATHS[image_set.split("_", maxsplit=1)[0]]
 
-    square_resize_div_64 = getattr(args, "square_resize_div_64", False)
-    include_masks = getattr(args, "segmentation_head", False)
-    include_keypoints = getattr(args, "keypoint_head", False)
-    num_keypoints = getattr(args, "num_keypoints", 2)
+    # Model-dependent pipeline options are mandatory for direct builder calls.
+    square_resize_div_64 = args.square_resize_div_64
+    include_masks = args.segmentation_head
+    include_keypoints = has_keypoints
+    num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
     aug_config = getattr(args, "aug_config", None)
+    scale_jitter = getattr(args, "scale_jitter", True)
+    keypoint_flip_pairs = resolve_keypoint_flip_pairs(args, include_keypoints=include_keypoints)
     augmentation_backend = getattr(args, "augmentation_backend", "cpu")
-    resolved_augmentation_backend = _resolve_runtime_augmentation_backend(augmentation_backend)
-    if resolved_augmentation_backend != augmentation_backend and resolved_augmentation_backend == "cpu":
+    resolved_augmentation_backend = resolve_backend_for_build(augmentation_backend)
+    # NOTE: `augmentation_backend == "auto"` never reaches here on the RFDETRDataModule path --
+    # module_data.py's setup("fit") resolves "auto" to a concrete "cpu"/"kornia" sentinel before
+    # calling build_dataset()/build_coco(). This branch only fires when build_coco() is called
+    # directly with `args.augmentation_backend == "auto"` (a supported direct usage, since
+    # build_coco is re-exported from rfdetr.datasets), bypassing the DataModule.
+    if augmentation_backend == "auto" and resolved_augmentation_backend == AugmentationBackend.TV:
         logger.warning(
-            "augmentation_backend='auto' resolved to 'cpu' because CUDA or kornia is unavailable; "
-            "disabling GPU postprocess transforms and retaining CPU normalization."
+            "augmentation_backend='auto' resolved to torchvision because CUDA/Albumentations/kornia are "
+            "unavailable; disabling GPU postprocess transforms and retaining CPU normalization."
         )
-    gpu_postprocess = resolved_augmentation_backend != "cpu"
-    _require_cpu_backend_for_keypoints(include_keypoints, gpu_postprocess)
+    gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
+    draft_size = draft_size_for_transforms(
+        image_set,
+        resolution,
+        multi_scale=multi_scale is not MultiScale.OFF,
+        expanded_scales=args.expanded_scales,
+        patch_size=args.patch_size,
+        num_windows=args.num_windows,
+        scale_jitter=scale_jitter,
+        include_masks=include_masks,
+    )
 
     if square_resize_div_64:
         logger.info(f"Building COCO {image_set} dataset with square resize at resolution {resolution}")
@@ -825,17 +1804,24 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
             transforms=make_coco_transforms_square_div_64(
                 image_set,
                 resolution,
-                multi_scale=args.multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=args.expanded_scales,
-                skip_random_resize=not args.do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
-            num_keypoints=num_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
+            # NOTE: remap_category_ids and num_keypoints_per_class schema are coupled.
+            # Active-first [17] maps keypoint categories to slot 0; changing either without
+            # the other silently misaligns training supervision.
+            remap_category_ids=include_keypoints,
+            draft_size=draft_size,
         )
     else:
         logger.info(f"Building COCO {image_set} dataset at resolution {resolution}")
@@ -845,54 +1831,55 @@ def build_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> 
             transforms=make_coco_transforms(
                 image_set,
                 resolution,
-                multi_scale=args.multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=args.expanded_scales,
-                skip_random_resize=not args.do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=args.patch_size,
                 num_windows=args.num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
-            num_keypoints=num_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
+            # NOTE: remap_category_ids and num_keypoints_per_class schema are coupled.
+            # Active-first [17] maps keypoint categories to slot 0; changing either without
+            # the other silently misaligns training supervision.
+            remap_category_ids=include_keypoints,
+            draft_size=draft_size,
         )
     return dataset
 
 
-def _require_cpu_backend_for_keypoints(include_keypoints: bool, gpu_postprocess: bool) -> None:
-    """Fail fast when keypoint training is combined with the GPU augmentation backend.
-
-    The GPU (kornia) augmentation pipeline in ``RFDETRDataModule.on_after_batch_transfer`` transforms images, boxes,
-    and masks but has no keypoint path, so keypoints would silently keep their pre-augmentation coordinates and train
-    the model on a geometry inference never reproduces.  Keypoint training therefore requires the CPU (Albumentations)
-    backend, which does transform keypoints.
-    """
-    if include_keypoints and gpu_postprocess:
-        raise ValueError(
-            "Keypoint training requires augmentation_backend='cpu'. The GPU/kornia augmentation pipeline does not "
-            "transform keypoints, so boxes and keypoints would fall out of alignment. Set augmentation_backend='cpu'."
-        )
-
-
-def _resolve_runtime_augmentation_backend(backend: str) -> str:
-    """Resolve ``augmentation_backend`` at runtime for dataset builders.
-
-    Thin wrapper around :func:`rfdetr.datasets.kornia_transforms.resolve_augmentation_backend` kept for
-    backward-compatibility with callers in ``yolo.py``.
-
-    ``"auto"`` becomes ``"gpu"`` only when CUDA and Kornia are both available, otherwise ``"cpu"``. Explicit
-    ``"cpu"``/``"gpu"`` values pass through.
-    """
-    from rfdetr.datasets.kornia_transforms import resolve_augmentation_backend
-
-    return resolve_augmentation_backend(backend)
-
-
-def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[int, int]) -> CocoDetection:
+def build_roboflow_from_coco(image_set: str, args: Any, resolution: _Resolution) -> CocoDetection:
     """Build a Roboflow COCO-format dataset.
 
     This uses Roboflow's standard directory structure (train/valid/test folders with _annotations.coco.json).
+
+    Each split is built by its own call, so label indices are taken from the train split for every non-train split (see
+    :func:`_train_split_cat2label`). Letting a split derive its own mapping would shift its label indices whenever its
+    annotation coverage of a grouping category differs from the train split's.
+
+    Direct callers must provide ``dataset_dir``, ``square_resize_div_64``,
+    ``segmentation_head``, ``multi_scale``, ``expanded_scales``,
+    ``patch_size``, and ``num_windows`` on
+    ``args``. Keypoint, custom augmentation, scale-jitter, and
+    augmentation-backend fields are optional.
+
+    Args:
+        image_set: Roboflow split identifier.
+        args: Dataset, model, and transform configuration namespace.
+        resolution: Target image resolution in pixels, a side length or ``(height, width)``.
+
+    Returns:
+        The configured Roboflow COCO-format dataset.
+
+    Raises:
+        AttributeError: If a required dataset or transform option is absent.
+        FileNotFoundError: If the configured dataset root does not exist.
+        KeyError: If ``image_set`` does not map to a supported Roboflow split.
     """
     root = Path(args.dataset_dir)
     if not root.exists():
@@ -905,20 +1892,38 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
         "test": (root / "test", root / "test" / "_annotations.coco.json"),
     }
 
-    img_folder, ann_file = PATHS[image_set.split("_")[0]]
-    square_resize_div_64 = getattr(args, "square_resize_div_64", False)
-    include_masks = getattr(args, "segmentation_head", False)
-    include_keypoints = getattr(args, "keypoint_head", False)
-    num_keypoints = getattr(args, "num_keypoints", 2)
-    multi_scale = getattr(args, "multi_scale", False)
-    expanded_scales = getattr(args, "expanded_scales", False)
-    do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
-    patch_size = getattr(args, "patch_size", 16)
-    num_windows = getattr(args, "num_windows", 4)
+    split = image_set.split("_", maxsplit=1)[0]
+    img_folder, ann_file = PATHS[split]
+    # Model-dependent pipeline options are mandatory for direct builder calls;
+    # optional task/augmentation fields below retain documented safe defaults.
+    square_resize_div_64 = args.square_resize_div_64
+    include_masks = args.segmentation_head
+    multi_scale = MultiScale.from_value(args.multi_scale)
+    expanded_scales = args.expanded_scales
+    patch_size = args.patch_size
+    num_windows = args.num_windows
+    # Roboflow detection exports omit keypoint schema/flip-pair fields; missing values mean detection-only.
+    include_keypoints = getattr(args, "use_grouppose_keypoints", False)
+    num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
+    keypoint_flip_pairs = resolve_keypoint_flip_pairs(args, include_keypoints=include_keypoints)
     aug_config = getattr(args, "aug_config", None)
-    resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
-    gpu_postprocess = resolved_augmentation_backend != "cpu"
-    _require_cpu_backend_for_keypoints(include_keypoints, gpu_postprocess)
+    scale_jitter = getattr(args, "scale_jitter", True)
+    resolved_augmentation_backend = resolve_backend_for_build(getattr(args, "augmentation_backend", "cpu"))
+    gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
+    # Label indices come from the train split alone: deriving them per split makes a category that is annotated in
+    # train but not in valid shift every later label index of that split. The keypoint path maps categories onto
+    # schema slots instead of annotation coverage, so it keeps its own derivation.
+    cat2label = None if split == "train" or include_keypoints else _train_split_cat2label(root)
+    draft_size = draft_size_for_transforms(
+        image_set,
+        resolution,
+        multi_scale=multi_scale is not MultiScale.OFF,
+        expanded_scales=expanded_scales,
+        patch_size=patch_size,
+        num_windows=num_windows,
+        scale_jitter=scale_jitter,
+        include_masks=include_masks,
+    )
 
     if square_resize_div_64:
         logger.info(f"Building Roboflow {image_set} dataset with square resize at resolution {resolution}")
@@ -928,18 +1933,22 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
             transforms=make_coco_transforms_square_div_64(
                 image_set,
                 resolution,
-                multi_scale=multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=expanded_scales,
-                skip_random_resize=not do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
-            num_keypoints=num_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
             remap_category_ids=True,
+            cat2label=cat2label,
+            draft_size=draft_size,
         )
     else:
         logger.info(f"Building Roboflow {image_set} dataset at resolution {resolution}")
@@ -949,17 +1958,21 @@ def build_roboflow_from_coco(image_set: str, args: Any, resolution: int | Tuple[
             transforms=make_coco_transforms(
                 image_set,
                 resolution,
-                multi_scale=multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=expanded_scales,
-                skip_random_resize=not do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
             include_keypoints=include_keypoints,
-            num_keypoints=num_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
             remap_category_ids=True,
+            cat2label=cat2label,
+            draft_size=draft_size,
         )
     return dataset

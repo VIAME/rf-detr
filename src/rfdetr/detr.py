@@ -6,42 +6,64 @@
 from __future__ import annotations
 
 import contextlib
-import glob
 import importlib
 import json
+import ntpath
 import operator
 import os
+import pickle
 import tempfile
+import threading
 import warnings
 from collections import defaultdict
+from collections.abc import Callable, Iterable
 from copy import copy, deepcopy
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Concatenate, Literal, ParamSpec, TypeVar, cast
+from weakref import WeakKeyDictionary
 
 import numpy as np
-import requests
 import torch
+from deprecate.deprecation import deprecation_warning
+from pydantic import ValidationError
 
-if TYPE_CHECKING:
-    import supervision as sv
-
-import torchvision.transforms.functional as F  # noqa: N812
-import yaml
-from PIL import Image
-
-from rfdetr.assets.coco_classes import COCO_CLASS_NAMES, COCO_CLASSES
-from rfdetr.assets.model_weights import download_pretrain_weights, get_model_cache_dir
-from rfdetr.config import (
-    ModelConfig,
-    TrainConfig,
+from rfdetr._namespace import _namespace_from_configs
+from rfdetr._prediction.core import (
+    PredictionContext,
+    _predict_batch,
+    _resolve_patch_size,
+    _validate_shape_dims,
 )
-from rfdetr.datasets.coco import is_valid_coco_dataset
-from rfdetr.datasets.yolo import is_valid_yolo_dataset
-from rfdetr.inference import ModelContext, _build_model_context
-from rfdetr.utilities.decorators import deprecated
-from rfdetr.utilities.distributed import is_main_process
+from rfdetr._prediction.types import _ImageInput, _ThresholdInput
+from rfdetr.assets.coco_classes import COCO_CLASS_NAMES
+from rfdetr.assets.model_weights import download_pretrain_weights, get_model_cache_dir
+from rfdetr.config import ModelConfig, TrainConfig, _resolve_train_config_class
+from rfdetr.datasets._keypoint_schema import (
+    active_keypoint_counts,
+    infer_coco_keypoint_schema,
+    infer_yolo_keypoint_schema,
+)
+from rfdetr.datasets.coco import annotated_category_ids, filter_parent_categories, is_valid_coco_dataset
+from rfdetr.datasets.webdataset.index import WebDatasetSplitUnavailableError, index_name, read_shard_index
+from rfdetr.datasets.yolo import _extract_yolo_class_names, find_yolo_data_file, is_valid_yolo_dataset
+from rfdetr.inference import ModelContext, RFDETRInference, _build_model_context
+from rfdetr.models.backbone.dinov2_with_windowed_attn import _fold_layer_scales
+from rfdetr.models.ops.modules.ms_deform_attn import MSDeformAttn
+
+# The lightweight package holds the symbol set; rfdetr.platform.models would import rfdetr_plus, which imports rfdetr.
+from rfdetr.platform import _PLUS_EXPORTS
+from rfdetr.utilities.class_names import _task_of, prediction_labels
+from rfdetr.utilities.distributed import _is_launcher_main_process, is_main_process
+from rfdetr.utilities.files import _mkstemp_default_mode, _replace_keeping_mode
+from rfdetr.utilities.keypoints import _is_bg_first_schema
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.shapes import as_pair
+from rfdetr.utilities.package import is_installed
+from rfdetr.utilities.tensors import _native_grid_sample
+
+if TYPE_CHECKING:
+    from rfdetr._prediction.types import _PredictionOutput
 
 try:
     torch.set_float32_matmul_precision("high")
@@ -49,10 +71,124 @@ except Exception:
     pass
 
 logger = get_logger()
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_ModuleT = TypeVar("_ModuleT", bound="torch.nn.Module")
+
+
+class _CUDAGraphInferenceModel:
+    """Replay a fixed-shape TorchScript module through one direct CUDA Graph.
+
+    The graph owns its input and output buffers. Each call copies the caller's tensor into the static input, replays the
+    captured kernels, then clones the outputs before returning them so a later replay cannot mutate a previous call's
+    result. A CUDA event serializes calls made from different streams without forcing the host to synchronize.
+    """
+
+    def __init__(self, model: Any, sample_input: torch.Tensor, device: torch.device) -> None:
+        """Warm up ``model``, capture one forward pass, and record the completion event.
+
+        Args:
+            model: TorchScript module to capture.
+            sample_input: Fixed-shape input on ``device``; it becomes the graph's static input buffer.
+            device: CUDA device the graph is captured on.
+
+        Raises:
+            torch.cuda.OutOfMemoryError: If CUDA Graph capture runs out of device memory. The message advises a smaller
+                ``batch_size`` and notes that a process restart may be required.
+            RuntimeError: If CUDA Graph capture fails for any other reason. A failed capture can leave CUDA
+                random-number state unusable for the rest of the process, so the message asks for a restart.
+        """
+        self._model = model
+        self._static_input = sample_input
+        self._lock = threading.Lock()
+
+        current_stream = torch.cuda.current_stream(device)
+        warmup_stream = torch.cuda.Stream(device=device)  # type: ignore[no-untyped-call]
+        warmup_stream.wait_stream(current_stream)
+        with torch.cuda.stream(warmup_stream), torch.inference_mode():
+            for _ in range(3):
+                model(self._static_input)
+        current_stream.wait_stream(warmup_stream)
+        torch.cuda.synchronize(device)
+
+        self._graph = torch.cuda.CUDAGraph()
+        try:
+            # Capture on the warm-up stream, which lives on ``device``. Without ``stream=``, torch reuses one
+            # process-wide capture stream created on whichever device was current at the first capture.
+            # "thread_local" checks only this thread's CUDA calls for capture safety; the default "global" mode also
+            # errors on unsafe calls from other threads, e.g. a cudaMalloc by another model's concurrent predict().
+            with (
+                torch.inference_mode(),
+                torch.cuda.graph(self._graph, stream=warmup_stream, capture_error_mode="thread_local"),
+            ):
+                self._static_output = model(self._static_input)
+            # An error that CUDA only reports at the completion fence gets the same restart instruction.
+            torch.cuda.synchronize(device)
+        except torch.cuda.OutOfMemoryError as exc:
+            # Keep the OOM type so callers' OOM handlers still match; the fix is less memory, not another backend.
+            raise torch.cuda.OutOfMemoryError(
+                "CUDA ran out of memory while capturing compile_backend='cudagraph'. Call inference() with a smaller "
+                "batch_size or free device memory first. A failed capture can leave CUDA random-number state "
+                "unusable, so a process restart may be required."
+            ) from exc
+        except Exception as exc:
+            # On torch 2.9.1 a rejected capture leaves CUDA random ops raising "Offset increment outside graph capture"
+            # for the rest of the process, so no other backend can be set up again after it either.
+            raise RuntimeError(
+                "CUDA Graph capture failed for compile_backend='cudagraph', the default on CUDA. A failed capture can "
+                "leave CUDA random-number state unusable for the rest of the process. Restart the process and call "
+                "inference(compile_backend='torchscript') to avoid CUDA graph capture."
+            ) from exc
+
+        self._completed = torch.cuda.Event()  # type: ignore[no-untyped-call]
+        self._completed.record(torch.cuda.current_stream(device))
+
+    @staticmethod
+    def _clone_output(value: Any) -> Any:
+        """Clone tensors recursively so graph-owned storage never escapes the wrapper."""
+        if isinstance(value, torch.Tensor):
+            return value.clone(memory_format=torch.preserve_format)
+        if isinstance(value, tuple):
+            return tuple(_CUDAGraphInferenceModel._clone_output(item) for item in value)
+        if isinstance(value, list):
+            return [_CUDAGraphInferenceModel._clone_output(item) for item in value]
+        if isinstance(value, dict):
+            return {key: _CUDAGraphInferenceModel._clone_output(item) for key, item in value.items()}
+        return value
+
+    def __call__(self, value: torch.Tensor) -> Any:
+        """Copy one fixed-shape batch into the graph, replay it, and return owned outputs.
+
+        Raises:
+            ValueError: If ``value``'s shape, dtype or device differs from the captured input, which ``copy_`` would
+                otherwise silently broadcast or cast.
+        """
+        static_input = self._static_input
+        if (value.shape, value.dtype, value.device) != (static_input.shape, static_input.dtype, static_input.device):
+            raise ValueError(
+                f"compile_backend='cudagraph' was captured for input shape {tuple(static_input.shape)}, dtype "
+                f"{static_input.dtype}, device {static_input.device}; got shape {tuple(value.shape)}, dtype "
+                f"{value.dtype}, device {value.device}. Pass a matching input or call inference() again with the "
+                "batch_size and dtype you need."
+            )
+        with self._lock, torch.inference_mode():
+            stream = torch.cuda.current_stream(value.device)
+            stream.wait_event(self._completed)
+            self._static_input.copy_(value)
+            try:
+                self._graph.replay()
+                output = self._clone_output(self._static_output)
+            finally:
+                # Record after the clone attempt, even a failed one, so the next caller waits for this replay.
+                # Recording before the clone would let another stream's replay overwrite outputs still being read.
+                self._completed.record(stream)
+        return output
+
 
 # ModelContext and _build_model_context are eagerly imported above (runtime use in get_model).
 _VARIANT_EXPORTS = (
     "RFDETRBase",
+    "RFDETRKeypointPreview",
     "RFDETRLarge",
     "RFDETRLargeDeprecated",
     "RFDETRMedium",
@@ -73,8 +209,8 @@ _CHECKPOINT_MODEL_NAME_EXCLUDED_SYMBOLS = frozenset({"RFDETRLargeDeprecated", "R
 _CHECKPOINT_MODEL_NAME_CLASS_SYMBOLS: tuple[str, ...] = tuple(
     class_symbol for class_symbol in _VARIANT_EXPORTS if class_symbol not in _CHECKPOINT_MODEL_NAME_EXCLUDED_SYMBOLS
 )
-_CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS: tuple[str, ...] = ("RFDETRXLarge", "RFDETR2XLarge")
 _CHECKPOINT_MODEL_MAP_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("keypoint-preview", "RFDETRKeypointPreview"),
     ("seg-2xlarge", "RFDETRSeg2XLarge"),
     ("seg-xxlarge", "RFDETRSeg2XLarge"),
     ("seg-xlarge", "RFDETRSegXLarge"),
@@ -94,110 +230,495 @@ _CHECKPOINT_PLUS_MODEL_MAP_ENTRIES: tuple[tuple[str, str], ...] = (
     ("xxlarge", "RFDETR2XLarge"),
     ("xlarge", "RFDETRXLarge"),
 )
+# PE-Core-T release-file stems, matched in the file name only: bare "atto" or "pico" occur in other words.
+_CHECKPOINT_PLUS_STEM_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("rf-detr-atto", "RFDETRAtto"),
+    ("rfdetr-atto", "RFDETRAtto"),
+    ("rf-detr-femto", "RFDETRFemto"),
+    ("rfdetr-femto", "RFDETRFemto"),
+    ("rf-detr-pico", "RFDETRPico"),
+    ("rfdetr-pico", "RFDETRPico"),
+)
 
 
-def _validate_shape_dims(
-    shape: object,
-    block_size: int,
-    patch_size: int,
-    num_windows: int,
-) -> tuple[int, int]:
-    """Validate a user-supplied ``(height, width)`` shape tuple and return normalised plain-int dims.
+#: Guards :data:`_MODULE_MOVE_LOCKS` itself, never a move. Held only long enough to hand out one module's lock, so
+#: that two threads reaching a never-moved module together cannot create two different locks over its storage.
+_LOCK_REGISTRY_LOCK = threading.Lock()
 
-    Args:
-        shape: The raw value supplied by the caller (e.g. from ``export(shape=...)`` or
-            ``predict(shape=...)``).  Must be a two-element sequence of positive integers (or integer-compatible types
-            accepted by :func:`operator.index`).
-        block_size: Required divisor for both dimensions.  Equals ``patch_size * num_windows``.
-        patch_size: Backbone patch size — used only in error messages.
-        num_windows: Number of attention windows — used only in error messages.
+#: One move lock per module, keyed by the module object. Overlapping in-place ``nn.Module.to()`` calls on one module
+#: race on its parameter storage and can leave corrupted weights behind without raising — and that storage is what
+#: the lock protects, so the lock belongs to the module rather than to the :class:`~rfdetr.inference.ModelContext`
+#: around it: ``ModelContext.model`` is a plain reassignable attribute, so two contexts can wrap one module, and a
+#: per-context lock would let each take a different lock over the same tensors. Keying on the module also keeps
+#: unrelated models independent, where a single process-wide lock made a cold move of one stall another model's
+#: already-warm guard for the whole transfer. Weak keys: a module's lock goes when the module does.
+#: Notebook DDP avoids inheriting a held lock because ``build_trainer()`` in ``training/trainer.py`` replaces
+#: ``ddp_notebook`` with ``start_method="spawn"``. Forking while a module's lock is held leaves it locked in the
+#: child; before supporting fork-based model use, reset it with ``os.register_at_fork(after_in_child=...)``.
+_MODULE_MOVE_LOCKS: WeakKeyDictionary[Any, threading.Lock] = WeakKeyDictionary()
 
-    Returns:
-        A ``(height, width)`` tuple of plain Python :class:`int` values.
-
-    Raises:
-        ValueError: If ``shape`` cannot be unpacked as a two-element sequence, if either
-            dimension is a bool, float, or other non-integer type, if either dimension is not positive, or if either
-            dimension is not divisible by ``block_size``.
-    """
-    try:
-        height, width = shape  # type: ignore[misc]
-    except (TypeError, ValueError):
-        raise ValueError(f"shape must be a sequence of two positive integers (height, width), got {shape!r}.") from None
-    for dim_name, dim in (("height", height), ("width", width)):
-        if isinstance(dim, bool):
-            raise ValueError(f"shape {dim_name} must be an integer, got {type(dim).__name__} (shape={shape!r}).")
-        try:
-            operator.index(dim)
-        except TypeError:
-            raise ValueError(
-                f"shape {dim_name} must be an integer, got {type(dim).__name__} (shape={shape!r}).",
-            ) from None
-        if dim <= 0:
-            raise ValueError(f"shape must contain positive integers for height and width, got {shape!r}.")
-    # Normalise to plain Python ints; also accepts numpy.int64, torch scalars, etc.
-    height, width = operator.index(height), operator.index(width)
-    if height % block_size != 0 or width % block_size != 0:
-        raise ValueError(
-            f"shape must have both dimensions divisible by {block_size} "
-            f"(patch_size={patch_size} * num_windows={num_windows}), got {shape!r}.",
-        )
-    return height, width
+#: Source and streaming options that only :meth:`RFDETRInference.predict` takes; ``RFDETR.predict`` refuses them
+#: instead of silently ignoring them as other unknown keyword arguments.
+_SOURCE_PREDICT_OPTIONS = frozenset({"stream", "batch", "vid_stride", "stream_buffer"})
 
 
-def _resolve_patch_size(patch_size: int | None, model_config: object, caller: str) -> int:
-    """Resolve and validate the ``patch_size`` argument for :meth:`RFDETR.export` and :meth:`RFDETR.predict`.
+def _rewrite_for_mps_prediction(model: torch.nn.Module, *, fold_layer_scales: bool) -> None:
+    """Prepare a prediction-only model for MPS: fused deformable sampling and, optionally, folded LayerScale.
+
+    Only for a model this code owns and never trains again. The training sampler gathers bilinear samples by hand
+    because MPS has no ``F.grid_sample`` backward; a model that only predicts can take the fused kernel instead.
+    Folding LayerScale into the Linear before it drops two multiplies per backbone block. Inductor fuses those
+    already and measured no gain from folding, so its callers pass ``fold_layer_scales=False``.
 
     Args:
-        patch_size: Value supplied by the caller, or ``None`` to read from ``model_config``.
-        model_config: The model's configuration object.  Must expose ``patch_size`` as a
-            positive integer attribute when ``patch_size`` is ``None`` or when a mismatch check is needed.
-        caller: Name of the calling method (``"export"`` or ``"predict"``) — used in
-            error messages to help the caller locate the problem.
+        model: The prediction model to rewrite in place.
+        fold_layer_scales: Fold each DINOv2 LayerScale into the Linear layer before it.
+
+    Examples:
+        Skipped when run as a doctest: requires model weights.
+
+        >>> from rfdetr import RFDETRNano  # doctest: +SKIP
+        >>> _rewrite_for_mps_prediction(RFDETRNano().model.model, fold_layer_scales=True)  # doctest: +SKIP
+    """
+    for module in model.modules():
+        if isinstance(module, MSDeformAttn):
+            module.grid_sample = _native_grid_sample
+    if fold_layer_scales:
+        _fold_layer_scales(model)
+
+
+def _default_compile_backend(device: torch.device) -> Literal["torchscript", "cudagraph", "inductor"]:
+    """Pick the compile backend :meth:`RFDETR.inference` uses when the caller names none.
+
+    A captured CUDA graph on CUDA: the snapshot already has a fixed batch size and resolution, and replaying the graph
+    removes the per-kernel launch cost that bounds a batch-1 TorchScript forward, without inductor's compile time.
+    Inductor on MPS, when the installed PyTorch has an MPS code generator for it. TorchScript everywhere else: on the
+    CPU, inductor compiled for about 18 s and ran slower than TorchScript.
+
+    Args:
+        device: The device the snapshot runs on.
 
     Returns:
-        A validated, positive :class:`int` patch size.
+        The backend name.
 
-    Raises:
-        ValueError: If the resolved or provided ``patch_size`` is not a positive integer,
-            or if a caller-provided value disagrees with ``model_config.patch_size``.
+    Examples:
+        >>> _default_compile_backend(torch.device("cpu"))
+        'torchscript'
     """
-    if patch_size is None:
-        patch_size = getattr(model_config, "patch_size", 14)
-    else:
-        if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
-            raise ValueError(f"patch_size must be a positive integer, got {patch_size!r}")
-        model_patch_size = getattr(model_config, "patch_size", None)
-        if model_patch_size is not None and patch_size != model_patch_size:
-            raise ValueError(
-                f"{caller}(patch_size={patch_size}) does not match the instantiated model's "
-                f"patch_size={model_patch_size}. Patch size is an architectural parameter; "
-                f"omit patch_size to use the model's configured value.",
-            )
-    if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
-        raise ValueError(f"patch_size must be a positive integer, got {patch_size!r}")
-    return patch_size
+    if device.type == "cuda":
+        return "cudagraph"
+    if device.type == "mps" and is_installed("torch._inductor.codegen.mps"):
+        return "inductor"
+    return "torchscript"
 
 
-def _ensure_model_on_device(model_ctx: Any) -> None:
+class _StackedFramesConfig:
+    """Present a video model's config with the channel count of its stacked-frame input tensor.
+
+    Args:
+        config: The model configuration; every other attribute is read through to it.
+        num_channels: Channels of one input tensor (per-frame channels times ``temporal_frames``).
+    """
+
+    def __init__(self, config: Any, num_channels: int) -> None:
+        self._config = config
+        self.num_channels = num_channels
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._config, name)
+
+
+def _trace_for_prediction(module: torch.nn.Module, example_input: torch.Tensor) -> torch.jit.ScriptModule:
+    """Trace a prediction model without changing the caller's deterministic settings.
+
+    Args:
+        module: The model to trace.
+        example_input: An input of the shape the predictor runs.
+
+    Returns:
+        The traced module.
+
+    Examples:
+        >>> traced = _trace_for_prediction(torch.nn.Identity(), torch.zeros(1, 3, 2, 2))
+        >>> traced(torch.ones(1, 3, 2, 2)).shape
+        torch.Size([1, 3, 2, 2])
+    """
+    return cast("torch.jit.ScriptModule", torch.jit.trace(module, example_input))  # type: ignore[no-untyped-call]
+
+
+def _device_move_lock(module: Any) -> threading.Lock:
+    """Return the device-move lock for *module*, creating it on first use.
+
+    Args:
+        module: The module whose parameter storage the lock protects. Keyed by identity, so every holder of that
+            module — however many wrappers it has — gets the one lock.
+
+    Returns:
+        The lock for *module*.
+
+    Examples:
+        >>> module = torch.nn.Linear(2, 2)
+        >>> _device_move_lock(module) is _device_move_lock(module)
+        True
+        >>> _device_move_lock(module) is _device_move_lock(torch.nn.Linear(2, 2))
+        False
+    """
+    with _LOCK_REGISTRY_LOCK:
+        lock = _MODULE_MOVE_LOCKS.get(module)
+        if lock is None:
+            lock = threading.Lock()
+            _MODULE_MOVE_LOCKS[module] = lock
+        return lock
+
+
+def _locked_move(module: _ModuleT, device: torch.device | str) -> _ModuleT:
+    """Move a live, shared module to *device* while holding that module's device-move lock.
+
+    :meth:`RFDETR.export` and :meth:`RFDETR.evaluate` move the *live* module — the very one ``predict()`` runs on —
+    to CPU and back around their own work.  ``nn.Module.to()`` rewrites parameter storage in place, so such a move
+    overlapping the deferred first-use move in :func:`_move_model_context_to_device` races on the same tensors.
+    Both take that module's own lock (see :func:`_device_move_lock`), so the two wait for each other while a move of
+    any other model runs undisturbed.
+
+    Only the move itself is serialised.  A caller that moves the module away and restores it later (export's CPU
+    staging and its ``finally`` restore, for instance) holds no lock in between, so a concurrent ``predict()`` can
+    re-place the module inside that window — that costs the staging its freed accelerator memory, it does not
+    corrupt weights.
+
+    Args:
+        module: The live module to move.
+        device: Target device, as a :class:`torch.device` or any string ``torch.device()`` accepts.
+
+    Returns:
+        Whatever ``module.to(device)`` returns — for ``nn.Module`` that is *module* itself, moved in place.
+
+    Examples:
+        >>> module = torch.nn.Linear(2, 2)
+        >>> _locked_move(module, "cpu") is module
+        True
+    """
+    # ``torch.inference_mode(False)`` for the same reason as in ``_move_model_context_to_device`` below: parameters
+    # materialised by ``.to()`` under an active inference mode are inference tensors and can never require gradients.
+    with _device_move_lock(module), torch.inference_mode(False):
+        return module.to(device)
+
+
+def _move_model_context_to_device(model_ctx: Any) -> None:
     """Move model weights to the target device recorded in *model_ctx*.
 
     ``_build_model_context`` intentionally keeps the ``nn.Module`` on CPU so that ``RFDETR.__init__`` does not
     initialise CUDA (which would prevent DDP strategies from forking in notebook environments).  This helper performs
     the deferred ``.to(device)`` on first use.
 
+    An index-less CUDA target is resolved to a concrete device (``cuda`` -> ``cuda:0``) on the first call that needs it,
+    and that device is recorded back on *model_ctx* so every later caller agrees on one GPU.
+
     It is safe to call on duck-typed stand-ins (e.g. ``SimpleNamespace``); the function silently returns when the
     expected attributes are missing.
     """
-    target = getattr(model_ctx, "device", None)
-    inner = getattr(model_ctx, "model", None)
-    if target is None or inner is None or not hasattr(inner, "parameters"):
+    if getattr(model_ctx, "device", None) is None:
         return
-    if isinstance(target, str):
-        target = torch.device(target)
-    first_param = next(inner.parameters(), None)
-    if first_param is not None and first_param.device != target:
-        model_ctx.model = inner.to(target)
+    inner = getattr(model_ctx, "model", None)
+    if inner is None or not hasattr(inner, "parameters"):
+        return
+    # Several threads sharing one model (e.g. one channel per thread) can reach their first ``predict()`` together.
+    # The device check runs under this module's lock: ``nn.Module.to()`` rewrites parameters one by one, so a lock-free
+    # check can see the first parameter already on ``target`` while later ones are still moving and let inference start
+    # on a half-moved model. Callers that arrive mid-move wait here until it has finished, then find nothing left to do.
+    # The lock is keyed on ``inner`` rather than on ``model_ctx``, because ``inner`` owns the raced storage.
+    with _device_move_lock(inner):
+        # Read the target under the lock: the first caller to resolve a CUDA index records it below, and a thread
+        # that waited here must adopt that agreed device rather than the one it read on the way in.
+        target = model_ctx.device
+        if isinstance(target, str):
+            target = torch.device(target)
+        if target.type == "cuda" and target.index is None:
+            # An index-less ``torch.device("cuda")`` never compares equal to the indexed device (e.g. ``cuda:0``) a
+            # real parameter reports once placed, even when they name the same physical GPU — resolve it to the index
+            # ``.to("cuda")`` would actually place on, so the check below can detect "already on the right device" and
+            # skip re-moving every parameter on every call. The resolved device is recorded on the context because
+            # ``torch.cuda.current_device()`` is per-thread: two threads with different ``torch.cuda.set_device()``
+            # selections would otherwise each compute their own target, each find the weights on the other's GPU, and
+            # move the whole model back and forth on every call. Resolving here rather than in
+            # ``_build_model_context`` keeps CUDA uninitialised during ``RFDETR.__init__`` (see above).
+            target = torch.device(target.type, torch.cuda.current_device())
+            model_ctx.device = target
+        # Every parameter is checked, not just the first: ``nn.Module.to()`` has no rollback, so a move that raises
+        # part-way (a CUDA OOM on a large variant, say) leaves the parameters it already rewrote on ``target`` and the
+        # rest behind. Reading only the first one would report that module as moved and run inference across two
+        # devices. Re-running the move instead is safe — a per-parameter ``.to()`` onto the device it already sits on
+        # is a no-op — and the reads are cheap next to the millisecond-scale call they guard. Also how a module moved
+        # back to CPU by ``export()`` / ``evaluate()`` is detected: the real devices are re-read on every call.
+        if all(param.device == target for param in inner.parameters()):
+            return
+        # Prediction batches run under ``@torch.inference_mode()`` and call ``_prediction_context()``, which carries
+        # ``@_ensure_model_on_device``, so the deferred move can run while inference mode is active.  Tensors
+        # materialised by ``.to()`` under inference mode become *inference tensors*: they can never require
+        # gradients, so a later ``train()`` or auto-batch probe would silently produce no gradients.  Disable
+        # inference mode for the move so deferred device placement is safe regardless of decorator order.
+        with torch.inference_mode(False):
+            model_ctx.model = inner.to(target)
+
+
+def _ensure_model_on_device(method: Callable[Concatenate[Any, _P], _R]) -> Callable[Concatenate[Any, _P], _R]:
+    """Decorate RF-DETR instance methods that require lazy model device placement.
+
+    The wrapped method receives the same arguments and return value as the original method. Before calling it, the
+    decorator moves ``self.model.model`` to ``self.model.device`` if the model context is available and the weights are
+    still on a different device. This keeps public inference methods clean while preserving deferred CUDA initialization
+    during ``RFDETR.__init__``.
+    """
+
+    @wraps(method)
+    def wrapper(self: Any, *args: _P.args, **kwargs: _P.kwargs) -> _R:
+        _move_model_context_to_device(getattr(self, "model", None))
+        return method(self, *args, **kwargs)
+
+    typed_wrapper = cast("Callable[Concatenate[Any, _P], _R]", wrapper)
+    return typed_wrapper
+
+
+def _prepare_run_config(
+    detector: RFDETR, *, for_eval: bool = False, **kwargs: Any
+) -> tuple[TrainConfig, str | None, list[int] | None]:
+    """Absorb the special run kwargs and build a :class:`~rfdetr.config.TrainConfig`.
+
+    Shared by :meth:`RFDETR.train` and :meth:`RFDETR.evaluate` so both accept exactly the same keyword arguments.
+    Handles the kwargs that are not plain ``TrainConfig`` fields: ``device`` (mapped to PyTorch Lightning
+    accelerator/devices), and
+    ``resolution`` (a ``ModelConfig`` field applied to ``detector.model_config`` in place, with the positional-encoding
+    size and cached inference context kept in sync). Remaining kwargs are forwarded to
+    :meth:`RFDETR.get_train_config`; ``batch_size="auto"`` is resolved by auto-batch probing (skipped when
+    ``for_eval=True`` — see below).
+    ``model_config.model_name`` is set to the concrete subclass name.
+
+    Defined at module scope (rather than as a method) so that :meth:`RFDETR.train` / :meth:`RFDETR.evaluate`, which are
+    unit-tested by calling the unbound method with a ``MagicMock`` ``self``, still run the real preprocessing: a
+    module-level function is not intercepted by the mock, so no per-test monkeypatching of this helper is needed.
+
+    Args:
+        detector: The :class:`RFDETR` instance whose ``model_config`` and model context the run targets.
+        for_eval: When ``True`` (set by :meth:`RFDETR.evaluate`), ``batch_size="auto"`` is not resolved by probing —
+            the probe forces train mode and runs a forward+backward pass to size for the *training* memory envelope
+            (retained activations and gradients), which both wastes compute on a call that never backprops and
+            under-sizes the eval batch relative to what a no-grad forward pass can actually fit. Falls back to
+            :attr:`TrainConfig.batch_size`'s default instead.
+        **kwargs: Keyword arguments accepted by :meth:`RFDETR.train` / :meth:`RFDETR.evaluate`.
+
+    Returns:
+        ``(train_config, accelerator, devices)`` where ``accelerator`` / ``devices`` are PTL trainer kwargs derived
+        from the ``device`` kwarg (``None`` when ``device`` was not provided).
+
+    Raises:
+        ValueError: If ``resolution`` is not a positive integer or ``(height, width)`` pair, or is not divisible by
+            ``patch_size * num_windows`` for the model variant.
+    """
+    # Imported eagerly (not only under batch_size="auto") so a broken/absent training
+    # submodule surfaces its original ModuleNotFoundError here rather than being masked.
+    from rfdetr.training.auto_batch import resolve_auto_batch_config
+
+    # Parse `device` kwarg and map it to PTL accelerator/devices.
+    # Supports torch-style strings and torch.device (e.g. "cuda:1").
+    _device = kwargs.pop("device", None)
+    _accelerator, _devices = RFDETR._resolve_trainer_device_kwargs(_device)
+
+    # Apply resolution override to model_config before building the train config.
+    # resolution is a ModelConfig field, not a TrainConfig field, so we pop it
+    # here to avoid it being silently ignored by TrainConfig.
+    _resolution = kwargs.pop("resolution", None)
+    if _resolution is not None:
+        _resolution_error = "resolution must be a positive integer or a (height, width) pair"
+        if isinstance(_resolution, bool):
+            raise ValueError(_resolution_error)
+        try:
+            # A single int stays an int so square configs serialize as before; anything else must be (height, width).
+            _resolution = operator.index(_resolution)
+            _res_pair = (_resolution, _resolution)
+        except TypeError:
+            try:
+                _res_pair = as_pair(_resolution)
+            except (TypeError, ValueError) as error:
+                raise ValueError(_resolution_error) from error
+            _resolution = _res_pair
+        if min(_res_pair) <= 0:
+            raise ValueError(_resolution_error)
+        block_size = detector.model_config.patch_size * detector.model_config.num_windows
+        if _res_pair[0] % block_size != 0 or _res_pair[1] % block_size != 0:
+            raise ValueError(
+                f"resolution={_resolution} is not divisible by "
+                f"patch_size ({detector.model_config.patch_size}) * num_windows "
+                f"({detector.model_config.num_windows}) = {block_size}. "
+                f"Choose a resolution whose height and width are both multiples of {block_size}."
+            )
+        # Smart PE update: only recompute positional_encoding_size when the
+        # current config derives it formulaically (PE == resolution // patch_size).
+        # Configs with a pretrained-specific PE (e.g. RFDETRBase uses DINOv2's
+        # PE=37 at 518 px, training at 560 px) must not have PE silently changed
+        # — doing so causes shape mismatches when loading pretrained checkpoints.
+        _patch_size = detector.model_config.patch_size
+        _current_pe = detector.model_config.positional_encoding_size
+        _cur_h, _cur_w = as_pair(detector.model_config.resolution)
+        new_pe: int | tuple[int, int]
+        if as_pair(_current_pe) == (_cur_h // _patch_size, _cur_w // _patch_size):
+            # Formula-derived: update PE proportionally to the new resolution (an int while the grid is square).
+            _pe_h, _pe_w = _res_pair[0] // _patch_size, _res_pair[1] // _patch_size
+            new_pe = _pe_h if _pe_h == _pe_w else (_pe_h, _pe_w)
+            detector.model_config.positional_encoding_size = new_pe
+        else:
+            # Pretrained-specific PE; leave it unchanged.
+            new_pe = _current_pe
+        detector.model_config.resolution = _resolution
+
+        # Keep the cached inference/export context in sync with model_config so
+        # predict()/export()/deployment all see the same resolution metadata.
+        if hasattr(detector, "model") and detector.model is not None:
+            if hasattr(detector.model, "resolution"):
+                detector.model.resolution = _resolution
+            model_args = getattr(detector.model, "args", None)
+            if model_args is not None:
+                if hasattr(model_args, "resolution"):
+                    model_args.resolution = _resolution
+                if hasattr(model_args, "positional_encoding_size"):
+                    model_args.positional_encoding_size = new_pe
+    if for_eval and kwargs.get("amp_dtype") == "fp8" and kwargs.get("batch_size") == "auto":
+        # TrainConfig.validate_fp8_batch_size rejects amp_dtype="fp8" with batch_size="auto"
+        # unconditionally, because auto-sizing probes the unconverted model — a real risk only
+        # on the training path. evaluate() never runs that probe (see the for_eval branch below),
+        # so substitute the eval default before construction; otherwise the validator raises
+        # before for_eval is ever consulted.
+        kwargs["batch_size"] = TrainConfig.model_fields["batch_size"].default
+    config = detector.get_train_config(**kwargs)
+    if config.batch_size == "auto" and for_eval:
+        # The probe sizes for the *training* memory envelope (forward + retained activations +
+        # backward), which evaluate() never needs and cannot benefit from — falls back to the
+        # TrainConfig default micro-batch instead of running a wasted train-mode probe.
+        default_batch_size = TrainConfig.model_fields["batch_size"].default
+        logger.info(
+            "[auto-batch] batch_size='auto' is a train-only feature; evaluate() uses the default "
+            "micro-batch (%s) instead of probing.",
+            default_batch_size,
+        )
+        config.batch_size = default_batch_size
+    elif config.batch_size == "auto":
+        # Auto-batch probing runs forward/backward on the actual model, which
+        # must be on the target device (typically CUDA).  Lazy placement keeps
+        # the model on CPU until first use — move it now.
+        _move_model_context_to_device(detector.model)
+        auto_batch = resolve_auto_batch_config(
+            model_context=detector.model,
+            model_config=detector.model_config,
+            train_config=config,
+            devices=_devices,
+        )
+        config.batch_size = auto_batch.safe_micro_batch
+        config.grad_accum_steps = auto_batch.recommended_grad_accum_steps
+        logger.info(
+            "[auto-batch] resolved train config: batch_size=%s grad_accum_steps=%s effective_batch_size=%s",
+            config.batch_size,
+            config.grad_accum_steps,
+            auto_batch.effective_batch_size,
+        )
+    detector.model_config.model_name = type(detector).__name__
+    return config, _accelerator, _devices
+
+
+def _save_training_config(config: TrainConfig, model_config: ModelConfig, class_names: list[str] | None) -> None:
+    """Write the run's complete configuration to ``training_config.json`` in the output directory.
+
+    Called twice per run: once before training starts, so a run stopped with Ctrl-C or killed by a crash still
+    leaves a record of how it was configured, and once after it finishes, which overwrites the first copy with the
+    dataset-resolved class names. Both copies carry the same keys; the start-of-run one may hold ``class_names:
+    null`` where the label space could not be read ahead of training.
+
+    The serialized payload goes to a temporary file in the same directory and is moved over the final path with
+    :func:`os.replace`, so a kill or a full disk mid-write leaves the previous complete copy in place instead of a
+    truncated one — the start-of-run write overwrites the finished copy of an earlier run in the same output
+    directory. A rewritten file keeps its permission bits; a new one gets the mode :func:`open` would give it. Nothing
+    here can end a training run: every failure, serialization included, is logged and swallowed, since this file is
+    provenance rather than part of training.
+
+    Args:
+        config: The resolved training configuration.
+        model_config: The detector's model configuration, after dataset-derived alignment.
+        class_names: Label space to record, or ``None`` when it could not be resolved.
+
+    Examples:
+        Writes to ``config.output_dir``, so this is documentation rather than a doctest:
+
+        ```python
+        _save_training_config(train_config, model_config, ["cat", "dog"])
+        # -> writes output/training_config.json
+        ```
+    """
+    try:
+        complete_config = {
+            "train_config": config.model_dump(),
+            "model_config": model_config.model_dump(),
+            "model_config_type": model_config.__class__.__name__,
+            "class_names": class_names,
+            "num_classes": len(class_names) if class_names else 0,
+        }
+        payload = json.dumps(complete_config, indent=2, default=str)
+        os.makedirs(config.output_dir, exist_ok=True)
+        # The temp file lives in the destination directory so os.replace stays on one filesystem (atomic); the
+        # same shape as utilities.state_dict's checkpoint rewrite.
+        tmp_path: str | None = None
+        try:
+            tmp_fd, tmp_path = _mkstemp_default_mode(config.output_dir, suffix=".tmp")
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(payload)
+                tmp_file.flush()
+            _replace_keeping_mode(tmp_path, os.path.join(config.output_dir, "training_config.json"))
+        finally:
+            # Best-effort: after a successful replace the temp path is gone; after a failure it is stray.
+            if tmp_path is not None and os.path.exists(tmp_path):
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
+    except Exception:
+        logger.warning("Could not save training_config.json to %s.", config.output_dir, exc_info=True)
+
+
+def _resolve_resumed_optimizer_settings(config: TrainConfig) -> TrainConfig:
+    """Order a resumed run's parameter-group settings before anything records its config (#1613).
+
+    Defaults, then the checkpoint, then the caller: a learning-rate or weight-decay setting passed to ``train()`` wins,
+    and one left out takes the value recorded in the checkpoint, so ``training_config.json``, written before
+    ``trainer.fit``, already holds what the run trains with. ``RFDETRModelModule.on_load_checkpoint`` resolves the same
+    order again from the checkpoint Lightning loads, logs it, and covers what this cannot read: a ``resume`` that names
+    no file (a Lightning sentinel such as ``"last"``) or a file a weights-only ``torch.load`` refuses. A checkpoint
+    without optimizer state (the lightweight ``.pth`` files) restarts the optimizer from the config, so it changes
+    nothing here.
+
+    Args:
+        config: Config of the resumed run, with ``resume`` set. ``model_fields_set`` holds what the caller passed.
+
+    Returns:
+        The config to train with.
+    """
+    # rfdetr.training needs the train extra, which RFDETR.train() has already imported by now.
+    from rfdetr.training.param_groups import _resolve_resumed_param_group_settings
+
+    resume = str(config.resume)
+    if not os.path.isfile(resume):
+        return config
+    try:
+        # mmap: only the pickled metadata is read here; Lightning loads the tensors again inside trainer.fit().
+        checkpoint = torch.load(resume, map_location="cpu", weights_only=True, mmap=True)
+    except (RuntimeError, pickle.UnpicklingError) as exc:
+        logger.debug("Could not read the training settings recorded in %s ahead of training: %s", resume, exc)
+        return config
+    if not isinstance(checkpoint, dict) or not checkpoint.get("optimizer_states"):
+        return config
+    return _resolve_resumed_param_group_settings(config, checkpoint)[0]
+
+
+def _default_export_shape(shape: tuple[int, int] | None, resolution: Any) -> tuple[int, int] | None:
+    """Return ``shape``, or the model's ``(height, width)`` when it is unset and the resolution is non-square."""
+    if shape is None and isinstance(resolution, (tuple, list)):
+        return as_pair(resolution)
+    return shape
 
 
 class RFDETR:
@@ -206,26 +727,59 @@ class RFDETR:
 
     means = [0.485, 0.456, 0.406]
     stds = [0.229, 0.224, 0.225]
-    size = None
+    size: str | None = None
     _model_config_class: type[ModelConfig] = ModelConfig
     _train_config_class: type[TrainConfig] = TrainConfig
+    #: Per-instance memo for :meth:`_memoized_coco_categories`, created on first use like ``_keypoint_schema_cache``.
+    _coco_categories_cache: dict[str, list[dict[str, Any]]]
 
     def _input_channels(self) -> int:
         """Channels of one input tensor: per-frame channels times frames per sample."""
         return int(self.model_config.num_channels) * int(getattr(self.model_config, "temporal_frames", 1) or 1)
 
-    def __init__(self, **kwargs):
+    def _prediction_config(self) -> Any:
+        """Return the config the prediction core validates inputs against."""
+        input_channels = self._input_channels()
+        if input_channels == self.model_config.num_channels:
+            return self.model_config
+        # A video model's input tensor carries every stacked frame's channels.
+        return _StackedFramesConfig(self.model_config, input_channels)
+
+    def __init__(self, *, trust_checkpoint: bool = False, **kwargs: Any) -> None:
+        """Initialize with ModelConfig fields as keyword arguments.
+
+        Passes all remaining kwargs to the variant's ModelConfig. Unknown kwargs raise
+        ``pydantic.ValidationError``. See the variant's config class for available
+        parameters (e.g. ``RFDETRSmallConfig``).
+
+        Args:
+            trust_checkpoint: When ``True``, allow ``pretrain_weights`` to fall back to full
+                pickle deserialization (``weights_only=False``) if safe loading fails. Set this
+                only when ``pretrain_weights`` points to a checkpoint you explicitly trust (e.g.
+                when called internally by :meth:`from_checkpoint`); left ``False`` by default for
+                the ordinary construction path, which only ever downloads official Roboflow-hosted
+                weights.
+            **kwargs: ModelConfig field values (e.g. ``resolution``, ``num_classes``,
+                ``pretrain_weights``, ``gradient_checkpointing``).
+
+        Raises:
+            ImportError: If ``backbone_lora=True`` is set, or ``pretrain_weights`` was saved by a
+                ``backbone_lora=True`` run, and ``peft`` is not installed (``pip install "rfdetr[lora]"``).
+        """
         self.model_config = self.get_model_config(**kwargs)
         self.maybe_download_pretrain_weights()
-        self.model = self.get_model(self.model_config)
-        self.callbacks = defaultdict(list)
+        self.model = self.get_model(self.model_config, trust_checkpoint=trust_checkpoint)
+        self.callbacks: dict[str, list[Callable[..., Any]]] = defaultdict(list)
+
+        self.means = list(self.means)
+        self.stds = list(self.stds)
 
         # repeat means and stds for non-rgb images
         input_channels = self._input_channels()
         if input_channels != 3:
             from itertools import cycle
 
-            # Cycles per frame too: stacked video frames repeat the per-frame statistics.
+            # Cycle per frame first: stacked video frames repeat the per-frame statistics.
             per_frame = self.model_config.num_channels
             self.means = [val for _, val in zip(range(per_frame), cycle(self.means))]
             self.stds = [val for _, val in zip(range(per_frame), cycle(self.stds))]
@@ -236,11 +790,13 @@ class RFDETR:
         self._is_optimized_for_inference = False
         self._has_warned_about_not_being_optimized_for_inference = False
         self._optimized_has_been_compiled = False
-        self._optimized_batch_size = None
-        self._optimized_resolution = None
-        self._optimized_dtype = None
+        self._optimized_batch_size: int | None = None
+        self._optimized_resolution: tuple[int, int] | None = None
+        self._optimized_dtype: torch.dtype | None = None
+        self._optimized_inplace = False
+        self._has_been_trained = False
 
-    def maybe_download_pretrain_weights(self):
+    def maybe_download_pretrain_weights(self) -> None:
         """Download pre-trained weights if they are not already downloaded.
 
         Bare filenames (no directory component, e.g. ``rf-detr-base.pth``) are resolved to the model cache directory —
@@ -251,9 +807,9 @@ class RFDETR:
         Paths that already contain a directory component are used as-is; the parent directory is created if it does not
         yet exist.
         """
-        pretrain_weights = self.model_config.pretrain_weights
-        if pretrain_weights is None:
+        if self.model_config.pretrain_weights is None:
             return
+        pretrain_weights = str(self.model_config.pretrain_weights)
         if not os.path.dirname(pretrain_weights):
             # Field default was not processed by expand_path — resolve to cache dir.
             cache_dir = get_model_cache_dir()
@@ -262,14 +818,14 @@ class RFDETR:
         else:
             os.makedirs(os.path.dirname(pretrain_weights), exist_ok=True)
         self.model_config.pretrain_weights = pretrain_weights
-        download_pretrain_weights(self.model_config.pretrain_weights)
+        download_pretrain_weights(pretrain_weights)
 
-    def get_model_config(self, **kwargs) -> ModelConfig:
+    def get_model_config(self, **kwargs: Any) -> ModelConfig:
         """Retrieve the configuration parameters used by the model."""
         return self._model_config_class(**kwargs)
 
     @classmethod
-    def from_checkpoint(cls, path: str | os.PathLike[str], **kwargs: Any) -> RFDETR:
+    def from_checkpoint(cls, path: str | os.PathLike[str], *, trust_checkpoint: bool = False, **kwargs: Any) -> RFDETR:
         """Load an RF-DETR model from a training checkpoint, automatically inferring the model class.
 
         The correct subclass is resolved in order of preference:
@@ -290,55 +846,137 @@ class RFDETR:
         by the PTL training stack) are supported.
 
         Args:
-            path: Path to a checkpoint file (e.g. ``checkpoint_best_total.pth``).
+            path: Path to a checkpoint file (e.g. ``checkpoint_best_total.pth``, or ``last.ckpt`` for the latest
+                non-EMA weights of a run).
+            trust_checkpoint: When ``True``, fall back to ``weights_only=False``
+                (full pickle) if safe deserialization fails.  Only set this for
+                checkpoints from fully trusted sources; the default ``False``
+                keeps the safe loading path and raises if it cannot succeed.
+                Applies to both the initial checkpoint read here and the
+                constructor's own reload of the same file via
+                :func:`~rfdetr.models.weights.load_pretrain_weights`.
             **kwargs: Additional keyword arguments forwarded to the model
                 constructor (e.g. ``accept_platform_model_license=True`` for XLarge / 2XLarge models).
+
+                ``num_classes`` is resolved in this priority order:
+
+                1. Explicit caller kwarg — always wins.
+                2. Weight inference from ``class_embed.weight`` shape in the checkpoint
+                   (``shape[0] - 1``, since the head includes a background class). This
+                   overrides a stale ``model_config`` value written before fine-tuning
+                   changed the class count.
+                3. ``saved_model_config["num_classes"]`` from the checkpoint's
+                   ``model_config`` entry — may be stale for older checkpoints.
+                4. Legacy ``args["num_classes"]`` dict entry.
+                5. Constructor default.
+
+                In cases 2–5 the field is not recorded as a user-set override, so
+                :meth:`train` can still adapt the detection head to the training
+                dataset's class count.  Pass an explicit ``num_classes=N`` to pin
+                the head and prevent adaptation.
+
+                The checkpoint's other ``model_config`` fields (``resolution``,
+                ``num_select``, ``dec_layers`` and the rest of the trained
+                architecture) are restored the same way: an explicit caller kwarg
+                always wins over the saved value.  ``device`` and
+                ``pretrain_weights`` are the two exceptions — *path* itself supplies
+                the weights, and ``device`` is never restored, so the loading host's
+                own default applies unless ``device=`` is passed, letting a
+                GPU-trained checkpoint load on a CPU-only machine.  When the checkpoint carries no
+                ``model_config`` at all (best-total files written before it was
+                strip-preserved), the lost fields fall back to class defaults and a
+                warning names them, together with the unstripped sibling checkpoint
+                or ``training_config.json`` to recover them from.
 
         Returns:
             An instance of the appropriate :class:`RFDETR` subclass loaded from the checkpoint.
 
         Warning:
-            This method calls ``torch.load`` with ``weights_only=False``, which
-            unpickles arbitrary Python objects. Only load checkpoints from trusted sources.
+            By default this method attempts safe deserialization
+            (``weights_only=True``).  Pass ``trust_checkpoint=True`` only for
+            checkpoints from fully trusted sources, as it enables full pickle
+            deserialization which can execute arbitrary code.
 
         Raises:
             FileNotFoundError: If *path* does not exist.
             OSError: If *path* exists but cannot be read.
-            KeyError: If the checkpoint does not contain an ``"args"`` key.
             ValueError: If the model class cannot be inferred from ``model_name``,
-                ``pretrain_weights``, or the checkpoint filename.
+                ``pretrain_weights``, or the checkpoint filename, or if *path* records no ``"args"`` at all — as
+                ``last.ckpt`` and ``checkpoint_<epoch>.ckpt`` from rfdetr 1.11.0 and earlier are, and as
+                :func:`~rfdetr.training.checkpoint.convert_legacy_checkpoint` output is.
+            ImportError: If the checkpoint was saved by a ``backbone_lora=True`` run and ``peft``
+                is not installed (``pip install "rfdetr[lora]"``).
 
         Examples:
-            >>> model = RFDETR.from_checkpoint("checkpoint_best_total.pth")  # doctest: +SKIP
-            >>> model = RFDETRSmall.from_checkpoint("checkpoint_best_total.pth")  # doctest: +SKIP
+            model = RFDETR.from_checkpoint("checkpoint_best_total.pth")
+            model = RFDETRSmall.from_checkpoint("checkpoint_best_total.pth")
         """
         # Local import breaks the variants → detr import cycle.
         import rfdetr.variants as rfdetr_variants
 
         _plus_available = False
+        # Raised only if the checkpoint needs a plus class: a broken rfdetr_plus must not block core checkpoints.
+        _plus_import_error: ImportError | None = None
         _plus_symbols: dict[str, type[RFDETR]] = {}
+        # Why each plus symbol is missing; chained onto the upgrade hint below so the cause stays visible.
+        _plus_symbol_errors: dict[str, ImportError] = {}
         _plus_entries: list[tuple[str, type[RFDETR]]] = []
+        _plus_stem_entries: list[tuple[str, type[RFDETR]]] = []
         from rfdetr.platform import _IS_RFDETR_PLUS_AVAILABLE
 
         if _IS_RFDETR_PLUS_AVAILABLE:
             try:
                 import rfdetr.platform.models as platform_models
 
-                for class_symbol in _CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS:
-                    plus_obj = getattr(platform_models, class_symbol)
+                for class_symbol in sorted(_PLUS_EXPORTS):
+                    try:
+                        plus_obj = getattr(platform_models, class_symbol)
+                    except ImportError as ex:
+                        # The installed rfdetr_plus predates this model; a checkpoint naming it is rejected below.
+                        _plus_symbol_errors[class_symbol] = ex
+                        continue
                     _plus_symbols[class_symbol] = plus_obj
                 _plus_entries = [
-                    (name, _plus_symbols[class_symbol]) for name, class_symbol in _CHECKPOINT_PLUS_MODEL_MAP_ENTRIES
+                    (name, _plus_symbols[class_symbol])
+                    for name, class_symbol in _CHECKPOINT_PLUS_MODEL_MAP_ENTRIES
+                    if class_symbol in _plus_symbols
+                ]
+                _plus_stem_entries = [
+                    (name, _plus_symbols[class_symbol])
+                    for name, class_symbol in _CHECKPOINT_PLUS_STEM_ENTRIES
+                    if class_symbol in _plus_symbols
                 ]
                 _plus_available = True
             except ModuleNotFoundError as ex:
                 if ex.name not in {"rfdetr_plus", "rfdetr_plus.models"}:
-                    raise
+                    _plus_import_error = ex
+            except ImportError as ex:
+                _plus_import_error = ex
+            if _plus_import_error is not None:
+                # Every from_checkpoint call retries the import; report the broken install once per process.
+                logger.warning_once(
+                    "rfdetr_plus is installed but failed to import (%s); plus model checkpoints cannot be loaded.",
+                    _plus_import_error,
+                )
 
-        # weights_only=False is required because legacy checkpoints embed
-        # argparse.Namespace objects that cannot be deserialised with
-        # weights_only=True.
-        ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+        # Use the safe-load helper which tries weights_only=True first (with
+        # legacy argparse.Namespace safe globals), falling back to full pickle
+        # only when the caller explicitly passes trust_checkpoint=True.
+        from rfdetr.utilities.io import _safe_torch_load
+
+        ckpt: dict[str, Any] = _safe_torch_load(str(path), trust=trust_checkpoint)
+        if "args" not in ckpt:
+            raise ValueError(
+                f"Checkpoint {os.fspath(path)!r} records no 'args' or 'model_config' — as last.ckpt and "
+                "checkpoint_<epoch>.ckpt from rfdetr 1.11.0 and earlier are, and as convert_legacy_checkpoint "
+                "output is (it stores the training args under 'hyper_parameters' instead) — so neither the model "
+                "class nor its settings can be read from it. Load checkpoint_best_ema.pth from the same run instead "
+                "(checkpoint_best_regular.pth if it trained without EMA), which records them since rfdetr 1.8.0. Or "
+                "pass this file to the class it was trained with, with the architecture settings it was trained with, "
+                f"e.g. RFDETRSmall(pretrain_weights={os.fspath(path)!r}, resolution=...); training_config.json lists "
+                "them when the run wrote one. That route restores the weights but not the class names, which this "
+                "file does not store."
+            )
         args = ckpt["args"]
 
         _variant_name_to_class: dict[str, type[RFDETR]] = {
@@ -357,18 +995,36 @@ class RFDETR:
             for name, class_symbol in _CHECKPOINT_MODEL_MAP_ENTRIES
             if name.startswith("seg-")
         ]
+        _keypoint_map: list[tuple[str, type[RFDETR]]] = [
+            (name, _variant_symbols[class_symbol])
+            for name, class_symbol in _CHECKPOINT_MODEL_MAP_ENTRIES
+            if "keypoint" in name
+        ]
         _base_map: list[tuple[str, type[RFDETR]]] = [
             (name, _variant_symbols[class_symbol])
             for name, class_symbol in _CHECKPOINT_MODEL_MAP_ENTRIES
-            if not name.startswith("seg-")
+            if not name.startswith("seg-") and "keypoint" not in name
         ]
-        _model_map: list[tuple[str, type[RFDETR]]] = _seg_map + _plus_entries + _base_map
+        _model_map: list[tuple[str, type[RFDETR]]] = _seg_map + _keypoint_map + _plus_entries + _base_map
 
         # New checkpoints store model_name directly — use it when available.
         _name_map: dict[str, type[RFDETR]] = dict(_variant_symbols)
         # Plus-model classes are resolved only when rfdetr_plus is installed.
         if _plus_available:
             _name_map.update(_plus_symbols)
+        # RFDETRLargeDeprecated is excluded from _CHECKPOINT_MODEL_NAME_CLASS_SYMBOLS
+        # (so forward name-map lookups always reach RFDETRLarge), but it must be
+        # in _name_map so that checkpoints carrying model_name="RFDETRLargeDeprecated"
+        # are reloaded with the correct class instead of falling through to the
+        # substring matcher (which would wrongly pick RFDETRLarge and fail with a
+        # pydantic literal_error on encoder / projector_scale fields).
+        # Note: RFDETRLargeDeprecated is a _DeprecatedProxy (pyDeprecate) and has no
+        # __name__; look it up by the string key it was registered under, then inject
+        # into _name_map so checkpoint matching resolves directly without the substring
+        # fallback.  Tests assert this mapping exists (see tests/inference/test_from_checkpoint.py).
+        _large_deprecated_cls = _variant_name_to_class.get("RFDETRLargeDeprecated")
+        if _large_deprecated_cls is not None:
+            _name_map["RFDETRLargeDeprecated"] = _large_deprecated_cls
         saved_model_name = ckpt.get("model_name")
         model_cls: type[RFDETR] | None = None
         if isinstance(saved_model_name, str):
@@ -396,25 +1052,50 @@ class RFDETR:
         if weights_name in {"", "none", "null"}:
             weights_name = os.path.basename(os.fspath(path)).lower()
             _filename_fallback = True
+        # A directory such as "rf-detr-pico/" names no model. ntpath splits on both "/" and "\", so a Windows-style
+        # path recorded in the checkpoint (e.g. "c:\models\rf-detr-pico\rf-detr-nano.pth") also drops its directories.
+        weights_file = ntpath.basename(weights_name)
 
         if model_cls is None:
             # Guard: plus-only checkpoints should raise an actionable install error
             # when rfdetr_plus is missing, regardless of whether class inference
             # relies on model_name (new format) or pretrain_weights (legacy format).
-            plus_by_model_name = normalized_name in _CHECKPOINT_PLUS_MODEL_NAME_CLASS_SYMBOLS
-            plus_by_weights_name = "xlarge" in weights_name and "seg-" not in weights_name
+            plus_by_model_name = normalized_name in _PLUS_EXPORTS
+            plus_by_weights_name = (
+                "xlarge" in weights_name and "seg-" not in weights_name and "keypoint-preview" not in weights_name
+            ) or any(name in weights_file for name, _ in _CHECKPOINT_PLUS_STEM_ENTRIES)
             if not _plus_available and (plus_by_model_name or plus_by_weights_name):
                 from rfdetr.platform import _INSTALL_MSG
 
+                reason = (
+                    f", which is installed but failed to import: {_plus_import_error}"
+                    if _plus_import_error
+                    else ". " + _INSTALL_MSG.format(name="platform model downloads")
+                )
                 raise ImportError(
                     f"Checkpoint model_name={saved_model_name!r}, pretrain_weights={weights_name!r} requires the "
-                    f"rfdetr_plus package. " + _INSTALL_MSG.format(name="platform model downloads")
-                )
+                    f"rfdetr_plus package{reason}"
+                ) from _plus_import_error
+            # An installed rfdetr_plus that predates the checkpoint's model (by name or release stem): never fall back
+            # to other names, which could resolve a core class (e.g. "small" in "rf-detr-pico-small-ft.pth").
+            missing_symbol = normalized_name if plus_by_model_name else None
+            for stem, symbol in _CHECKPOINT_PLUS_STEM_ENTRIES:
+                if missing_symbol is None and stem in weights_file and symbol not in _plus_symbols:
+                    missing_symbol = symbol
+            if missing_symbol is not None:
+                from rfdetr.platform.models import _UPGRADE_MSG
 
-            for name, klass in _model_map:
-                if name in weights_name:
-                    model_cls = klass
-                    break
+                raise ImportError(
+                    f"Checkpoint model_name={saved_model_name!r}, pretrain_weights={weights_name!r}: "
+                    + _UPGRADE_MSG.format(name=missing_symbol)
+                ) from _plus_symbol_errors.get(missing_symbol)
+
+            model_cls = next((klass for name, klass in _plus_stem_entries if name in weights_file), None)
+            if model_cls is None:
+                for name, klass in _model_map:
+                    if name in weights_name:
+                        model_cls = klass
+                        break
 
             if _filename_fallback and model_cls is not None:
                 logger.info(
@@ -436,13 +1117,177 @@ class RFDETR:
         else:
             num_classes = getattr(args, "num_classes", None)
 
-        # pretrain_weights is placed after **kwargs so it always wins even if
-        # a caller accidentally passes pretrain_weights inside kwargs.
-        constructor_kwargs: dict[str, Any] = {**kwargs, "pretrain_weights": str(path)}
+        constructor_kwargs: dict[str, Any] = {}
+        checkpoint_config_keys: set[str] = set()  # keys injected from checkpoint, not from caller
+
+        # Resolve model config field set once — used for both saved_model_config parsing and
+        # weight-based schema inference guards (BaseConfig has extra="forbid"; unknown fields raise).
+        _model_config_class = getattr(model_cls, "_model_config_class", None)
+        _mc_fields: dict[str, Any] = {}
+        _mc_model_fields = getattr(_model_config_class, "model_fields", None)
+        if isinstance(_mc_model_fields, dict):
+            _mc_fields = _mc_model_fields
+        else:
+            _mc_legacy = getattr(_model_config_class, "__fields__", None)
+            if isinstance(_mc_legacy, dict):
+                _mc_fields = _mc_legacy
+
+        saved_model_config = ckpt.get("model_config")
+        if isinstance(saved_model_config, dict):
+            for key, value in saved_model_config.items():
+                # device records the training host (e.g. "cuda"); the loading host keeps its own default.
+                if key in ("pretrain_weights", "device"):
+                    continue
+                if not _mc_fields or key in _mc_fields:
+                    constructor_kwargs[key] = value
+                    checkpoint_config_keys.add(key)
+        elif "rfdetr_version" in ckpt or "best_total_source" in ckpt:
+            # checkpoint_best_total.pth files written before strip_checkpoint kept model_config have lost it; the
+            # unstripped file they were copied from, named by best_total_source, still has it. These settings then
+            # fall back to class defaults without an error (a changed num_queries or group_detr fails loudly on the
+            # weight shapes instead), so keep warning until the caller has passed all of them.
+            # Both keys discriminate, because neither is present on its own in every affected file: rfdetr_version
+            # reaches back to 1.7.0 but is omitted when get_version() cannot resolve a version (editable install
+            # without package metadata), while best_total_source covers those but only exists since 1.9.0.
+            silent_fields = ["resolution", "num_select", "dec_layers"]
+            segmentation_field = _mc_fields.get("segmentation_head")
+            if kwargs.get("segmentation_head", getattr(segmentation_field, "default", False)) is True:
+                silent_fields.append("mask_downsample_ratio")
+            missing = [name for name in silent_fields if name not in kwargs]
+            if missing:
+                # A best-total file often travels alone (the Roboflow SDK upload path sends only this one), so the
+                # sibling it was copied from is not always there to point at. Only the two source names the training
+                # stack writes become a filename; anything else is reported as-is so an anomaly stays visible.
+                best_total_source = ckpt.get("best_total_source")
+                sibling = (
+                    Path(path).with_name(f"checkpoint_best_{best_total_source}.pth")
+                    if best_total_source in ("ema", "regular")
+                    else None
+                )
+                if sibling is not None and sibling.exists():
+                    remedy = (
+                        f"Load {sibling.name} from the same output directory instead, or pass the training values "
+                        "to from_checkpoint(); training_config.json in that directory lists them."
+                    )
+                elif sibling is not None:
+                    remedy = (
+                        f"{sibling.name} is not beside it, so pass the values above to from_checkpoint() "
+                        "explicitly; training_config.json from the original training run lists them."
+                    )
+                else:
+                    remedy = (
+                        f"Its best_total_source is {best_total_source!r}, so check for an unstripped "
+                        "checkpoint_best_*.pth beside it, or pass the values above to from_checkpoint() "
+                        "explicitly; training_config.json from the original training run lists them."
+                    )
+                written_by = f" (written by rfdetr {ckpt['rfdetr_version']})" if "rfdetr_version" in ckpt else ""
+                logger.warning(
+                    "Checkpoint %r%s has no model_config, which checkpoint_best_total.pth files lost when "
+                    "stripped, so these settings fall back to %s defaults: %s. %s",
+                    str(path),
+                    written_by,
+                    getattr(model_cls, "__name__", repr(model_cls)),
+                    ", ".join(missing),
+                    remedy,
+                )
+
         if num_classes is not None and "num_classes" not in kwargs:
             constructor_kwargs["num_classes"] = num_classes
+            checkpoint_config_keys.add("num_classes")
 
-        return model_cls(**constructor_kwargs)
+        # Infer schema-critical fields from checkpoint weights — these are authoritative when
+        # ``model_config`` is absent or stale (saved before ``model_config`` persistence was added,
+        # or saved with default values before fine-tuning changed the trained schema).
+        # User-supplied ``kwargs`` take precedence and are applied in the ``update`` call below.
+        _ckpt_weights: dict[str, Any] = ckpt.get("model") or {}
+        if not _ckpt_weights and "state_dict" in ckpt:
+            _pfx = "model."
+            _ckpt_weights = {}
+            for k, v in ckpt["state_dict"].items():
+                if k.startswith(_pfx):
+                    key = k[len(_pfx) :]
+                    # Strip optional torch.compile() wrapper prefix
+                    if key.startswith("_orig_mod."):
+                        key = key[len("_orig_mod.") :]
+                    _ckpt_weights[key] = v
+        if _ckpt_weights:
+            # num_keypoints_per_class — inferred from _kp_active_mask (shape [num_classes, max_kp]).
+            # Reflects what the model actually learned; saved model_config may carry the COCO default
+            # [0, 17] even after fine-tuning on a different keypoint schema.
+            if "num_keypoints_per_class" not in kwargs and (not _mc_fields or "num_keypoints_per_class" in _mc_fields):
+                _kp_mask = _ckpt_weights.get("_kp_active_mask")
+                if isinstance(_kp_mask, torch.Tensor) and _kp_mask.ndim == 2:
+                    _inferred_kp = [int(n) for n in _kp_mask.sum(dim=1).tolist()]
+                    _current_kp = constructor_kwargs.get("num_keypoints_per_class")
+                    if _inferred_kp != _current_kp:
+                        logger.debug(
+                            "from_checkpoint: overriding num_keypoints_per_class %s → %s "
+                            "(inferred from _kp_active_mask; saved model_config may be stale).",
+                            _current_kp,
+                            _inferred_kp,
+                        )
+                    constructor_kwargs["num_keypoints_per_class"] = _inferred_kp
+                    checkpoint_config_keys.add("num_keypoints_per_class")
+            # num_classes — inferred from class_embed.weight shape.
+            # The head shape is ground truth for what num_classes the checkpoint uses.
+            if "num_classes" not in kwargs:
+                _ce_weight = _ckpt_weights.get("class_embed.weight")
+                if isinstance(_ce_weight, torch.Tensor) and _ce_weight.ndim == 2:
+                    _inferred_nc = _ce_weight.shape[0] - 1  # shape[0] = num_classes + 1 (background)
+                    _current_nc = constructor_kwargs.get("num_classes")
+                    if _inferred_nc != _current_nc:
+                        logger.debug(
+                            "from_checkpoint: overriding num_classes %s → %s "
+                            "(inferred from class_embed.weight; saved model_config may be stale).",
+                            _current_nc,
+                            _inferred_nc,
+                        )
+                    constructor_kwargs["num_classes"] = _inferred_nc
+                    checkpoint_config_keys.add("num_classes")
+
+        constructor_kwargs.update(kwargs)
+        # pretrain_weights is placed after **kwargs so it always wins even if
+        # a caller accidentally passes pretrain_weights inside kwargs.
+        # Fully resolved, because the config sends a bare filename to the model cache, which is not the file read above.
+        constructor_kwargs["pretrain_weights"] = os.path.realpath(path)
+        # Model construction reloads this same file via load_pretrain_weights(); without this,
+        # trust_checkpoint=True would bypass the safe-load only for the metadata read above and
+        # then fail identically when the constructor re-reads pretrain_weights.
+        constructor_kwargs["trust_checkpoint"] = trust_checkpoint
+
+        # Fields injected from the checkpoint but not supplied by the caller must not be
+        # treated as explicit user overrides in Pydantic's model_fields_set.  Downstream
+        # alignment guards (e.g. _align_num_classes_from_dataset,
+        # _align_keypoint_schema_from_dataset, load_pretrain_weights) all read
+        # model_fields_set to decide whether to adapt model internals to the training
+        # dataset — leaving checkpoint-derived fields marked as user-set breaks them.
+        checkpoint_derived_keys = checkpoint_config_keys - set(kwargs)
+
+        model = model_cls(**constructor_kwargs)
+        # The instance now carries checkpoint (trained) weights; flag it so a later
+        # train() call warns that it will restart from pretrain_weights, not continue.
+        model._has_been_trained = True
+
+        if checkpoint_derived_keys:
+            loaded_config = getattr(model, "model_config", None)
+            # model_fields_set is the public API and returns the live backing set
+            # in Pydantic v2; fall back to the private attribute only if that changes.
+            fields_set = getattr(loaded_config, "model_fields_set", None)
+            if fields_set is None:
+                fields_set = getattr(loaded_config, "__pydantic_fields_set__", None)
+            if fields_set is not None:
+                fields_set.difference_update(checkpoint_derived_keys)
+            # Verify num_classes specifically — if Pydantic ever returns a snapshot instead
+            # of the live backing set, this assertion will catch the silent regression before
+            # it causes a training-time head-adaptation failure.
+            if "num_classes" in checkpoint_derived_keys:
+                assert "num_classes" not in getattr(loaded_config, "model_fields_set", set()), (
+                    "num_classes still in model_fields_set after checkpoint load; "
+                    "Pydantic may return a snapshot rather than the live backing set — "
+                    "switch to model_construct(_fields_set=...) for Pydantic v3 compatibility."
+                )
+
+        return model
 
     @staticmethod
     def _resolve_trainer_device_kwargs(device: Any) -> tuple[str | None, list[int] | None]:
@@ -453,7 +1298,8 @@ class RFDETR:
 
         Returns:
             ``(accelerator, devices)`` where ``devices`` is ``None`` unless an explicit device index is provided (for
-            example ``cuda:1``).
+            example ``cuda:1``). ``device.type == "xla"`` maps to ``accelerator="tpu"`` -- PTL's accelerator
+            registry has no ``"xla"`` string; ``"tpu"`` is its canonical name for the XLA backend.
 
         Raises:
             ValueError: If ``device`` is not a valid torch device specifier.
@@ -474,6 +1320,12 @@ class RFDETR:
             return "gpu", [resolved_device.index] if resolved_device.index is not None else None
         if resolved_device.type == "mps":
             return "mps", [resolved_device.index] if resolved_device.index is not None else None
+        if resolved_device.type == "xla":
+            # PTL's accelerator registry has no "xla" string -- "tpu" is its canonical name for
+            # the XLA backend (torch.device("xla") is valid and .type is always "xla", even on
+            # TPU; torch.device("tpu") itself raises RuntimeError). Bridge explicitly instead of
+            # falling through to the auto-detection warning below.
+            return "tpu", [resolved_device.index] if resolved_device.index is not None else None
 
         warnings.warn(
             f"Device type {resolved_device.type!r} is not explicitly mapped to a PyTorch Lightning "
@@ -483,7 +1335,7 @@ class RFDETR:
         )
         return None, None
 
-    def train(self, **kwargs):
+    def train(self, **kwargs: Any) -> None:
         """Train an RF-DETR model via the PyTorch Lightning stack.
 
         All keyword arguments are forwarded to :meth:`get_train_config` to build a :class:`~rfdetr.config.TrainConfig`.
@@ -498,17 +1350,19 @@ class RFDETR:
           PE=37 at 560 px) are left unchanged to preserve checkpoint compatibility.
         * ``device`` — normalized via :class:`torch.device` and mapped to PyTorch
           Lightning trainer arguments. ``"cpu"`` becomes ``accelerator="cpu"``; ``"cuda"`` and ``"cuda:N"`` become
-          ``accelerator="gpu"`` and optionally ``devices=[N]``; ``"mps"`` becomes ``accelerator="mps"``. Other valid
-          torch device types fall back to PTL auto-detection and emit a :class:`UserWarning`.
-        * ``callbacks`` — if the dict contains any non-empty lists a
-          :class:`DeprecationWarning` is emitted; the dict is then discarded. Use PTL
-          :class:`~pytorch_lightning.Callback` objects passed via :func:`~rfdetr.training.build_trainer` instead.
-        * ``start_epoch`` — emits :class:`DeprecationWarning` and is dropped.
-        * ``do_benchmark`` — emits :class:`DeprecationWarning` and is dropped.
+          ``accelerator="gpu"`` and optionally ``devices=[N]``; ``"mps"`` becomes ``accelerator="mps"``; ``"xla"``
+          becomes ``accelerator="tpu"`` (PTL's canonical name for the XLA backend). Other valid torch device types
+          fall back to PTL auto-detection and emit a :class:`UserWarning`.
         * ``notes`` — optional user-defined metadata (string, dict, list, or
           any JSON-serialisable value) stored under the ``"notes"`` key in every ``.pth`` checkpoint produced during
           training.  The value is also available inside ``args["notes"]`` for full provenance.  Pass the same value to
-          :meth:`export` to embed it in the ONNX file as well.
+          :meth:`export` to embed it in the exported artifact's metadata as well.
+
+        With ``resume`` pointing at a checkpoint that carries optimizer state, the optimizer's moments and the
+        schedule's progress carry over, and the learning-rate and weight-decay settings (``lr``, ``lr_encoder``,
+        ``lr_vit_layer_decay``, ``lr_component_decay``, ``weight_decay``) follow the order defaults, then the
+        checkpoint, then the keyword arguments: one passed here wins, and one left out takes the value recorded in the
+        checkpoint (#1613).
 
         After training completes the underlying ``nn.Module`` is synced back onto ``self.model.model`` so that
         :meth:`predict` and :meth:`export` continue to work without reloading the checkpoint.
@@ -519,13 +1373,11 @@ class RFDETR:
             ValueError: If ``resolution`` is not a positive integer or is not
                 divisible by ``patch_size * num_windows`` for the model variant.
         """
-        # Both imports are grouped in a single try block because they both live in
-        # the `rfdetr[train]` extras group — a missing `pytorch_lightning` (or any
-        # other training-extras package) causes either import to fail, and the
-        # remediation is identical: `pip install "rfdetr[train,loggers]"`.
+        # The training stack lives in the `rfdetr[train]` extras group — a missing
+        # `pytorch_lightning` (or any other training-extras package) causes the import to fail,
+        # and the remediation is `pip install "rfdetr[train,loggers]"`.
         try:
             from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
-            from rfdetr.training.auto_batch import resolve_auto_batch_config
         except ModuleNotFoundError as exc:
             # Preserve internal import errors so packaging/regression issues in
             # rfdetr.* are not misreported as missing optional extras.
@@ -536,142 +1388,128 @@ class RFDETR:
                 'Install them with `pip install "rfdetr[train,loggers]"` and try again.',
             ) from exc
 
-        # Absorb legacy `callbacks` dict — warn if non-empty, then discard.
-        callbacks_dict = kwargs.pop("callbacks", None)
-        if callbacks_dict and any(callbacks_dict.values()):
+        if getattr(self, "_has_been_trained", False):
             warnings.warn(
-                "Custom callbacks dict is not forwarded to PTL. "
-                "Deprecated since v1.7.0, will be removed in v1.9.0. "
-                "Use PTL Callback objects instead.",
-                DeprecationWarning,
+                "Calling train() on a model that has already been trained or loaded from a checkpoint. "
+                "The new training run will start from the original pretrained weights (pretrain_weights), "
+                "NOT from the in-memory trained state. To continue training, pass resume=<checkpoint_path>.",
+                UserWarning,
                 stacklevel=2,
             )
 
-        # Parse `device` kwarg and map it to PTL accelerator/devices.
-        # Supports torch-style strings and torch.device (e.g. "cuda:1").
-        _device = kwargs.pop("device", None)
-        _accelerator, _devices = RFDETR._resolve_trainer_device_kwargs(_device)
-
-        # Absorb legacy `start_epoch` — PTL resumes automatically via ckpt_path.
-        if "start_epoch" in kwargs:
-            warnings.warn(
-                "`start_epoch` is deprecated since v1.7.0 and will be removed in v1.9.0; "
-                "PTL resumes automatically via `resume`.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            kwargs.pop("start_epoch")
-
-        # Pop `do_benchmark`; benchmarking via `.train()` is deprecated.
-        run_benchmark = bool(kwargs.pop("do_benchmark", False))
-        if run_benchmark:
-            warnings.warn(
-                "`do_benchmark` in `.train()` is deprecated since v1.7.0 and will be removed in v1.9.0; "
-                "use `rfdetr benchmark`.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-        # Apply resolution override to model_config before building the train config.
-        # resolution is a ModelConfig field, not a TrainConfig field, so we pop it
-        # here to avoid it being silently ignored by TrainConfig.
-        _resolution = kwargs.pop("resolution", None)
-        if _resolution is not None:
-            if isinstance(_resolution, bool):
-                raise ValueError("resolution must be a positive integer or an (height, width) pair")
-            try:
-                # A single int stays an int so square configs serialize exactly as before;
-                # anything else must be a two-element (height, width) sequence.
-                _resolution = operator.index(_resolution)
-                _res_pair = (_resolution, _resolution)
-            except TypeError:
-                try:
-                    _res_pair = as_pair(_resolution)
-                    _resolution = _res_pair
-                except (TypeError, ValueError) as error:
-                    raise ValueError(
-                        "resolution must be a positive integer or an (height, width) pair"
-                    ) from error
-            if min(_res_pair) <= 0:
-                raise ValueError("resolution must be a positive integer or an (height, width) pair")
-            block_size = self.model_config.patch_size * self.model_config.num_windows
-            if _res_pair[0] % block_size or _res_pair[1] % block_size:
-                raise ValueError(
-                    f"resolution={_resolution} is not divisible by "
-                    f"patch_size ({self.model_config.patch_size}) * num_windows "
-                    f"({self.model_config.num_windows}) = {block_size}. "
-                    f"Choose a resolution whose height and width are both multiples of {block_size}."
-                )
-            # Smart PE update: only recompute positional_encoding_size when the
-            # current config derives it formulaically (PE == resolution // patch_size).
-            # Configs with a pretrained-specific PE (e.g. RFDETRBase uses DINOv2's
-            # PE=37 at 518 px, training at 560 px) must not have PE silently changed
-            # — doing so causes shape mismatches when loading pretrained checkpoints.
-            _current_pe = self.model_config.pe_grid
-            _cur_h, _cur_w = self.model_config.input_shape
-            _derived_pe = (_cur_h // self.model_config.patch_size, _cur_w // self.model_config.patch_size)
-            if _current_pe == _derived_pe:
-                # Formula-derived: update PE proportionally to the new resolution.
-                _pe_h = _res_pair[0] // self.model_config.patch_size
-                _pe_w = _res_pair[1] // self.model_config.patch_size
-                new_pe = _pe_h if _pe_h == _pe_w else (_pe_h, _pe_w)
-                self.model_config.positional_encoding_size = new_pe
-            else:
-                # Pretrained-specific PE; leave it unchanged.
-                new_pe = self.model_config.positional_encoding_size
-            self.model_config.resolution = _resolution
-
-            # Keep the cached inference/export context in sync with model_config so
-            # predict()/export()/deployment all see the same resolution metadata.
-            if hasattr(self, "model") and self.model is not None:
-                if hasattr(self.model, "resolution"):
-                    self.model.resolution = _resolution
-                model_args = getattr(self.model, "args", None)
-                if model_args is not None:
-                    if hasattr(model_args, "resolution"):
-                        model_args.resolution = _resolution
-                    if hasattr(model_args, "positional_encoding_size"):
-                        model_args.positional_encoding_size = new_pe
-        config = self.get_train_config(**kwargs)
-        if config.batch_size == "auto":
-            # Auto-batch probing runs forward/backward on the actual model, which
-            # must be on the target device (typically CUDA).  Lazy placement keeps
-            # the model on CPU until first use — move it now.
-            _ensure_model_on_device(self.model)
-            auto_batch = resolve_auto_batch_config(
-                model_context=self.model,
-                model_config=self.model_config,
-                train_config=config,
-            )
-            config.batch_size = auto_batch.safe_micro_batch
-            config.grad_accum_steps = auto_batch.recommended_grad_accum_steps
-            logger.info(
-                "[auto-batch] resolved train config: batch_size=%s grad_accum_steps=%s effective_batch_size=%s",
-                config.batch_size,
-                config.grad_accum_steps,
-                auto_batch.effective_batch_size,
-            )
-        self.model_config.model_name = type(self).__name__
+        # Absorb the special train/evaluate kwargs (device, resolution, deprecated knobs),
+        # build the TrainConfig, and resolve any auto batch size.  Shared with evaluate()
+        # so both accept exactly the same keyword arguments.
+        config, _accelerator, _devices = _prepare_run_config(self, **kwargs)
+        # Before anything records the config: training_config.json and every checkpoint describe the resolved one.
+        if config.resume:
+            config = _resolve_resumed_optimizer_settings(config)
 
         # Auto-detect num_classes from the training dataset and align model_config.
         # This must run before RFDETRModelModule is constructed so that weight loading
         # inside the module uses the correct (dataset-derived) class count.
         dataset_dir = getattr(config, "dataset_dir", None)
         if dataset_dir:
+            self._align_keypoint_schema_from_dataset(config)
             self._align_num_classes_from_dataset(dataset_dir)
+
+        # Record the run's configuration before anything expensive starts, so a run interrupted while the model is
+        # built, while dataset grids render, or during training itself still leaves one behind (#1493). Rewritten
+        # after trainer.fit() with the dataset's class names. Both configs are final here: the alignment above is
+        # the last thing that mutates them, and neither module construction nor build_trainer touches them.
+        #
+        # The dataset's class names are not known until the datamodule builds a dataset inside fit(), so read the
+        # label space straight off disk instead: the COCO/YOLO readers first, then the train shard index of a
+        # packed dataset_file="webdataset" directory. Best-effort on the same exception tuple as the num_classes
+        # alignment above: a layout none of these understand records class_names: null until the post-fit write
+        # fills it in, rather than blocking training.
+        #
+        # Guarded on the launcher's environment rather than is_main_process(), which reports rank 0 in every
+        # process until trainer.fit() initializes torch.distributed; several ranks would otherwise write this one
+        # path at once, where a torn write can truncate a previous run's good copy. Same guard as the dataset-grid
+        # block below.
+        # Reject a class_names that setup("fit") would reject inside trainer.fit(), before anything records or acts on
+        # it: the write below would save the rejected list, and PTL's _call_setup_hook starts every configured
+        # logger's experiment (wandb.init(), an MLflow run) before it calls datamodule setup, leaving an orphan
+        # crashed run behind. Runs on every rank, so none is left hanging in fit()'s first collective; keypoint mode
+        # is skipped for the reason the read below is -- the slot layout needs a built dataset.
+        if (
+            getattr(config, "class_names", None) is not None
+            and dataset_dir
+            and not self.model_config.use_grouppose_keypoints
+        ):
+            from rfdetr.training.module_data import _check_class_names_match_dataset
+
+            if not hasattr(self, "_coco_categories_cache"):
+                self._coco_categories_cache = {}
+            try:
+                dataset_class_names, labels_remapped = RFDETR._dataset_label_space_on_disk(
+                    dataset_dir,
+                    config.dataset_file,
+                    coco_categories=RFDETR._memoized_coco_categories(self._coco_categories_cache, dataset_dir),
+                )
+            except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                # Best-effort, like the read below: an unreadable layout fails with a better message inside fit().
+                logger.debug("Could not read class names from dataset '%s': %s", dataset_dir, exc)
+                dataset_class_names, labels_remapped = None, False
+            # Outside the except above: the ValueError this raises is the verdict, not a failed read.
+            _check_class_names_match_dataset(config.class_names, dataset_class_names, labels_remapped=labels_remapped)
+
+        if _is_launcher_main_process():
+            pre_fit_class_names = getattr(config, "class_names", None)
+            # Keypoint mode stays null: the readers below return the detection basis (e.g. ['person']), but the
+            # slot layout — a background-first schema such as [0, 17] pads a leading '' — is only known post-fit.
+            if pre_fit_class_names is None and dataset_dir and not self.model_config.use_grouppose_keypoints:
+                if not hasattr(self, "_coco_categories_cache"):
+                    self._coco_categories_cache = {}
+                try:
+                    # Reuses the parse the num_classes alignment above just did, when the layout is COCO.
+                    pre_fit_class_names = RFDETR._load_classes(
+                        dataset_dir,
+                        coco_categories=RFDETR._memoized_coco_categories(self._coco_categories_cache, dataset_dir),
+                    )
+                except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                    logger.debug("Could not read class names from dataset '%s': %s", dataset_dir, exc)
+                    pre_fit_class_names = None
+                if pre_fit_class_names is None and (Path(dataset_dir) / index_name("train")).exists():
+                    # A packed directory has no raw annotation file for _load_classes; its train shard index
+                    # carries the categories under the same "remap"/"raw" convention the num_classes alignment
+                    # above read. The tuple is wider than _detect_num_classes_for_training's own
+                    # WebDatasetSplitUnavailableError guard on purpose: a corrupt index raises ValueError/KeyError
+                    # from ShardIndex.from_json, and that must not block training either.
+                    try:
+                        pre_fit_class_names = read_shard_index(dataset_dir, "train").class_names()
+                    except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                        logger.debug("Could not read class names from the shard index in '%s': %s", dataset_dir, exc)
+            _save_training_config(config, self.model_config, pre_fit_class_names)
+        else:
+            # A non-zero launcher rank is the ordinary DDP case, but a non-zero task of a multi-task `srun` step
+            # (SLURM_PROCID≠0) — e.g. a per-task sweep with devices=1, where every task is its own single-process
+            # run — lands here too, writing neither this file nor the dataset grids. Say so at INFO, naming the
+            # variable, rather than leaving an absent file with no explanation anywhere; WARNING would fire on
+            # N-1 ranks of every ordinary DDP run.
+            logger.info(
+                "Not the launcher's main process (RANK=%s, SLURM_PROCID=%s); skipping the start-of-run "
+                "training_config.json write.",
+                os.environ.get("RANK"),
+                os.environ.get("SLURM_PROCID"),
+            )
 
         module = RFDETRModelModule(self.model_config, config)
         datamodule = RFDETRDataModule(self.model_config, config)
 
-        # Guard with LOCAL_RANK env var rather than is_main_process() because torch.distributed
-        # is not yet initialized here (it is set up inside trainer.fit()).  In Lightning DDP
-        # subprocesses, LOCAL_RANK is set by the launcher before the subprocess calls train(),
-        # so this correctly identifies rank 0 even before dist.init_process_group() runs.
-        if config.save_dataset_grids and os.environ.get("LOCAL_RANK", "0") == "0":
+        # Guard on the launcher's environment rather than is_main_process() because torch.distributed is not yet
+        # initialized here (it is set up inside trainer.fit()).  This used to read LOCAL_RANK alone, which let one
+        # process per node through on multi-node runs and every process through under srun, which sets neither
+        # LOCAL_RANK nor NODE_RANK.
+        if config.save_dataset_grids and _is_launcher_main_process():
+            # Outside the try: building the datasets is fatal to trainer.fit() below whatever happens here, so
+            # catching its failure only relabels the real cause as a grid-save warning and then reports it twice.
+            # The import stays inside, where a missing visualization dependency keeps costing only the grids.
+            datamodule.setup("fit")
             try:
                 from rfdetr.datasets.save_grids import DatasetGridSaver
 
-                datamodule.setup("fit")
                 grids_output_dir = Path(config.output_dir) / "dataset_grids"
                 DatasetGridSaver(datamodule.train_dataloader(), grids_output_dir, dataset_type="train").save_grid()
                 DatasetGridSaver(datamodule.val_dataloader(), grids_output_dir, dataset_type="val").save_grid()
@@ -680,8 +1518,94 @@ class RFDETR:
                     "Failed to save dataset grids; training will continue without them.",
                     exc_info=True,
                 )
+        elif config.save_dataset_grids:
+            logger.info(
+                "Not the launcher's main process (RANK=%s, SLURM_PROCID=%s); skipping the dataset-grid render.",
+                os.environ.get("RANK"),
+                os.environ.get("SLURM_PROCID"),
+            )
 
-        trainer_kwargs = {"accelerator": _accelerator}
+        if config.resume:
+            # BestModelCallback's four lightweight checkpoint files (unlike the trainer's own
+            # `last.ckpt` / `checkpoint_<epoch>.ckpt`, which retain full PTL state) intentionally
+            # omit optimizer/LR-scheduler state to stay small — see
+            # BestModelCallback._build_checkpoint_payload. They retain model weights, epoch
+            # metadata, and per-callback state only when the resumed callback configuration
+            # matches the saved keys. Checkpoints written before callback-state persistence have
+            # no such state. Best-score tracking additionally requires exactly the original
+            # output_dir because of PTL's ModelCheckpoint.load_state_dict() dirpath gate.
+            # Flag the optimizer/scheduler gap explicitly instead of letting it pass silently.
+            _light_checkpoint_names = frozenset(
+                {"checkpoint_best_regular.pth", "checkpoint_best_ema.pth", "checkpoint_best_total.pth", "last_ema.pth"}
+            )
+            if Path(config.resume).name in _light_checkpoint_names:
+                from rfdetr.utilities.io import _safe_torch_load
+
+                # checkpoint.get("callbacks") is None-checked by PTL's own
+                # _call_callbacks_load_state_dict(), which no-ops (skipping every callback's
+                # restoration) when the key is absent or empty. Checkpoints written before
+                # BestModelCallback._build_checkpoint_payload started persisting per-callback state
+                # — or from a run where every registered callback happened to have empty state —
+                # are exactly this case, so peek at the file rather than let the warning below
+                # overclaim a restoration that silently does not happen.
+                _resume_ckpt = _safe_torch_load(config.resume, trust=True)
+                _has_callback_state = bool(_resume_ckpt.get("callbacks"))
+                del _resume_ckpt
+                _resume_dir = Path(config.resume).resolve().parent
+                _configured_output_dir = Path(config.output_dir).resolve()
+                _best_score_restores = _resume_dir == _configured_output_dir
+
+                if _has_callback_state:
+                    logger.warning(
+                        "resume=%r points at one of BestModelCallback's lightweight checkpoints, "
+                        "which intentionally omit optimizer/LR-scheduler state to stay small. "
+                        "Model weights and epoch count will resume. Callback state can restore only "
+                        "for matching configured callbacks; the optimizer and LR scheduler restart cold. "
+                        "To resume with optimizer/scheduler state too, pass the trainer's full "
+                        "checkpoint instead (e.g. %s/last.ckpt or %s/checkpoint_<epoch>.ckpt).",
+                        config.resume,
+                        config.output_dir,
+                        config.output_dir,
+                    )
+                else:
+                    logger.warning(
+                        "resume=%r points at one of BestModelCallback's lightweight checkpoints, "
+                        "which intentionally omit optimizer/LR-scheduler state to stay small. "
+                        "Model weights and epoch count will resume, but this particular file has no "
+                        "saved callback state (it predates callback-state persistence, or every "
+                        "registered callback had nothing to save), so best-score tracking, EMA, and "
+                        "early-stopping state all restart cold this run too — not just the "
+                        "optimizer and LR scheduler. To resume with full state, pass the trainer's "
+                        "full checkpoint instead (e.g. %s/last.ckpt or %s/checkpoint_<epoch>.ckpt).",
+                        config.resume,
+                        config.output_dir,
+                        config.output_dir,
+                    )
+
+                # BestModelCallback always writes these four files directly under its own
+                # `dirpath` (== output_dir at save time; see BestModelCallback.__init__ and
+                # _build_checkpoint_payload). PTL's ModelCheckpoint.load_state_dict() only
+                # restores best_model_score/best_k_models/kth_value/last_model_path when the
+                # resumed dirpath matches the checkpoint's saved dirpath exactly (model_checkpoint.py,
+                # installed pytorch-lightning) — with a different output_dir this run only recovers
+                # best_model_path, so the first metric logged after resume looks like an automatic
+                # improvement over an empty best_model_score. Only worth flagging when there was
+                # callback state to lose in the first place.
+                if _has_callback_state and not _best_score_restores:
+                    logger.warning(
+                        "resume=%r was written under %s but output_dir=%r points elsewhere. "
+                        "PyTorch Lightning only restores best_model_score/best_k_models when "
+                        "output_dir matches the checkpoint's original directory exactly — with "
+                        "this output_dir, best-score tracking (BestModelCallback's high-water "
+                        "mark) restarts fresh in the new directory instead of resuming. Set "
+                        "output_dir=%r to keep it.",
+                        config.resume,
+                        _resume_dir,
+                        config.output_dir,
+                        str(_resume_dir),
+                    )
+
+        trainer_kwargs: dict[str, Any] = {"accelerator": _accelerator}
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
         trainer = build_trainer(config, self.model_config, **trainer_kwargs)
@@ -689,6 +1613,16 @@ class RFDETR:
 
         # Sync the trained weights back so predict() / export() see the updated model.
         self.model.model = module.model
+        # Rebuild model.args from the real training config (#1199): it was previously left as the
+        # construction-time snapshot built from a dummy TrainConfig, so overrides like lr/lr_encoder
+        # never appeared in model.model.__dict__['args'] even though the optimizer used them correctly.
+        self.model.args = _namespace_from_configs(self.model_config, config)
+        # Mark this instance as trained so a subsequent train() call warns that it will
+        # restart from pretrain_weights rather than continue from the in-memory state.
+        self._has_been_trained = True
+        # Invalidate any compiled inference snapshot: it was built from the pre-training
+        # weights and must not survive the model reassignment above.
+        self.remove_optimized_model()
         # Sync class names: prefer explicit config.class_names, otherwise fall back to dataset (#509).
         config_class_names = getattr(config, "class_names", None)
         if config_class_names is not None:
@@ -698,76 +1632,231 @@ class RFDETR:
             if dataset_class_names is not None:
                 self.model.class_names = dataset_class_names
 
-        # Save complete training configuration to disk for reproducibility.
-        # Guard to main process only to avoid races in distributed/multi-GPU training.
+        # Rewrite the configuration saved at the start of the run, now that the dataset's class names are known.
+        # Guard to main process only to avoid races in distributed/multi-GPU training; unlike the start-of-run
+        # write before trainer.fit(), torch.distributed is initialized here, so the global rank is authoritative.
         if is_main_process():
-            complete_config = {
-                "train_config": config.model_dump(),
-                "model_config": self.model_config.model_dump(),
-                "model_config_type": self.model_config.__class__.__name__,
-                "class_names": self.model.class_names,
-                "num_classes": len(self.model.class_names) if self.model.class_names else 0,
-            }
-            try:
-                os.makedirs(config.output_dir, exist_ok=True)
-                with open(os.path.join(config.output_dir, "training_config.json"), "w") as f:
-                    json.dump(complete_config, f, indent=2, default=str)
-            except OSError as exc:
-                logger.warning("Could not save training_config.json to %s: %s", config.output_dir, exc)
+            _save_training_config(config, self.model_config, self.model.class_names)
 
-    def optimize_for_inference(
-        self, compile: bool = True, batch_size: int = 1, dtype: torch.dtype | str = torch.float32
-    ) -> None:
-        """Optimize the model for inference with optional JIT compilation and dtype casting.
+    def evaluate(self, *, split: Literal["test", "val"] = "test", **kwargs: Any) -> dict[str, float]:
+        """Evaluate the current model on a dataset split and return COCO metrics.
 
-        Operations are wrapped in the correct CUDA device context to prevent context leaks on multi-GPU setups. When
-        ``compile=True`` the model is traced with ``torch.jit.trace`` using a dummy input of ``batch_size`` images at
-        the model's current resolution.
+        Runs a single evaluation pass over the requested split via the PyTorch Lightning stack and returns the COCO
+        metrics (mAP, mAR, and the macro-F1 sweep) computed by
+        :class:`~rfdetr.training.callbacks.coco_eval.COCOEvalCallback`. The same metrics are also printed to the
+        terminal. This works both directly after :meth:`train` and on a model loaded via :meth:`from_checkpoint` — the
+        weights already held in memory are evaluated; no checkpoint file is re-loaded.
+
+        Apart from ``split``, this method accepts exactly the same keyword arguments as :meth:`train` (``dataset_dir``,
+        ``device``, ``resolution``, ``batch_size``, ``output_dir``, ``num_workers``, ...); they are handled identically
+        via the shared :func:`_prepare_run_config`. This parity is for convenience — the same kwargs dict used for
+        :meth:`train` can be reused here — not a guarantee every field has an effect. Training-only fields (``epochs``,
+        ``lr``, ``weight_decay``, ``ema``, ``early_stopping``, ``run``, ``project``, ``checkpoint_interval``,
+        ``tensorboard``/``wandb``/``mlflow``/``clearml``, and similar) are silently accepted and ignored: ``evaluate()``
+        runs through an eval-only trainer (``include_training_callbacks=False``) that never builds EMA, drop-path,
+        checkpointing, early-stopping, or logger callbacks, so those fields have nothing to attach to.
+
+        Unlike :meth:`train`, this method never adapts the detection head to the dataset: the model is evaluated exactly
+        as configured. If the dataset's class count differs from the model's ``num_classes`` a :class:`UserWarning` is
+        emitted and evaluation proceeds with the model's head unchanged.
+
+        Unlike :meth:`train`, a ``resolution`` override does **not** persist: :attr:`model_config` (and any cached
+        ``model.resolution`` / ``model.args`` inference context) is restored to its pre-call values once the
+        eval-only config copy has captured the override, so a later :meth:`predict` / :meth:`export` / :meth:`train`
+        call is unaffected by an ``evaluate(resolution=...)`` call.
 
         Args:
-            compile: If ``True``, trace the model with ``torch.jit.trace`` to obtain
-                a JIT-compiled ``ScriptModule``. Set to ``False`` for broader compatibility (e.g. models with dynamic
-                control flow).
-            batch_size: Number of images the traced model will be optimized for. Ignored when ``compile=False``.
-            dtype: Target floating-point dtype for the inference model. Accepts a
-                ``torch.dtype`` directly (e.g. ``torch.float16``) or its string name (e.g. ``"float16"``). Defaults to
-                ``torch.float32``.
+            split: Which split to evaluate. ``"test"`` evaluates the ``test/`` folder (YOLO-format datasets — plain
+                YOLO datasets and Roboflow exports whose detected format is YOLO — fall back to the ``valid/`` split,
+                with a logged warning, when no ``test`` split can be resolved. A Roboflow export in COCO format has
+                no such fallback and still raises ``FileNotFoundError`` when its ``test`` split is missing;
+                COCO/Objects365 never attempt ``test`` and always evaluate ``valid/``) via ``trainer.test``;
+                ``"val"`` evaluates the ``valid/`` folder via ``trainer.validate``.
+            **kwargs: The same keyword arguments accepted by :meth:`train` — ``dataset_dir`` is required (here or
+                already on the config), and the rest are forwarded to :func:`_prepare_run_config` /
+                :meth:`get_train_config`.
+
+        Returns:
+            Mapping of metric name to value for the evaluated split, e.g. ``{"test/mAP_50_95": ..., "test/mAP_50": ...,
+            "test/F1": ...}``. Per-class keys (``"test/AP/<class>"``) are included only when
+            ``log_per_class_metrics=True`` (default ``False``). Empty when the trainer returns no metrics.
 
         Raises:
-            TypeError: If ``dtype`` is not a ``torch.dtype``, or if ``dtype`` is a
-                string that does not correspond to a valid ``torch.dtype`` attribute.
+            ImportError: If training dependencies are not installed. Install with
+                ``pip install "rfdetr[train,loggers]"``.
+            ValueError: If ``split`` is not ``"test"`` or ``"val"``.
+        """
+        from rfdetr.models.weights import interpolate_position_embeddings
+
+        # Training extras (pytorch_lightning et al.) are optional; mirror train()'s import guard.
+        try:
+            from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
+        except ModuleNotFoundError as exc:
+            if exc.name and exc.name.startswith("rfdetr."):
+                raise
+            raise ImportError(
+                "RF-DETR training dependencies are missing. "
+                'Install them with `pip install "rfdetr[train,loggers]"` and try again.',
+            ) from exc
+
+        if split not in ("test", "val"):
+            raise ValueError(f"split must be 'test' or 'val', got {split!r}.")
+
+        # Same kwarg handling as train() (device, resolution, deprecated knobs, auto-batch).  A `resolution`
+        # override mutates `model_config`/`model.args` in place inside `_prepare_run_config` — intentional and
+        # persistent for train(), but evaluate() is documented as inspection-only, so the mutation is snapshotted
+        # here and restored once the eval-only config copy below has captured the overridden values it needs.
+        _orig_resolution = self.model_config.resolution
+        _orig_pe = self.model_config.positional_encoding_size
+        _live_model = getattr(self, "model", None)
+        _live_args = getattr(_live_model, "args", None) if _live_model is not None else None
+        _orig_model_resolution = getattr(_live_model, "resolution", None) if _live_model is not None else None
+        _orig_args_resolution = getattr(_live_args, "resolution", None) if _live_args is not None else None
+        _orig_args_pe = getattr(_live_args, "positional_encoding_size", None) if _live_args is not None else None
+        try:
+            config, _accelerator, _devices = _prepare_run_config(self, for_eval=True, **kwargs)
+
+            # Build the module without re-loading pretrain weights, then transplant the
+            # already-loaded in-memory weights into it (the reverse of train()'s final
+            # `self.model.model = module.model`).  This evaluates the current weights and
+            # never passes ``ckpt_path``, sidestepping PTL's loop-state restore on a bare .pth.
+            eval_model_config = self.model_config.model_copy(update={"pretrain_weights": None})
+        finally:
+            self.model_config.resolution = _orig_resolution
+            self.model_config.positional_encoding_size = _orig_pe
+            if _live_model is not None:
+                if hasattr(_live_model, "resolution"):
+                    _live_model.resolution = _orig_model_resolution
+                if _live_args is not None:
+                    if hasattr(_live_args, "resolution"):
+                        _live_args.resolution = _orig_args_resolution
+                    if hasattr(_live_args, "positional_encoding_size"):
+                        _live_args.positional_encoding_size = _orig_args_pe
+        # Every weight is transplanted from the live model below, so skip fetching upstream encoder weights.
+        module = RFDETRModelModule(eval_model_config, config, load_encoder_weights=False)
+
+        # Free the original model's accelerator memory for the transplant -- otherwise the resident
+        # original and the freshly built (randomly initialized) eval module are both on the accelerator
+        # simultaneously (peak ~2x model memory), risking OOM on the largest variants right after train()
+        # just fit them.  state_dict() below returns references into the live parameter tensors, so this
+        # move is reflected in `source_state` regardless of call order; restored immediately once the eval
+        # module has consumed the weights, before the (possibly slow) datamodule/trainer setup below.
+        _original_device = getattr(self.model, "device", None)
+        _moved_to_cpu = _original_device is not None and str(_original_device) != "cpu"
+        source_model = self.model.model
+        if source_model is None:
+            raise RuntimeError("Cannot evaluate: the base model has been cleared by a previous inplace optimization.")
+        if _moved_to_cpu:
+            # Through ``_locked_move``: this is the live module, so the move must not overlap the deferred
+            # first-use move a concurrent ``predict()`` may be running on the same parameters.
+            source_model = _locked_move(source_model, "cpu")
+            self.model.model = source_model
+        try:
+            source_state = source_model.state_dict()
+            # Reconcile DINOv2 positional embeddings when a `resolution` override changed the PE grid
+            # (no-op when unchanged), so the transplant works at the evaluation resolution.
+            interpolate_position_embeddings(source_state, eval_model_config.positional_encoding_size)
+            module.model.load_state_dict(source_state)
+        finally:
+            if _moved_to_cpu:
+                _move_model_context_to_device(self.model)
+        # `self.model_config` was already restored to its pre-call values by the `finally` block above; a
+        # `resolution` override only survives on `eval_model_config`, which is what actually built `module`.
+        # The datamodule must use the same config so the dataloader resizes to the resolution being evaluated.
+        datamodule = RFDETRDataModule(eval_model_config, config)
+
+        # Warn (do not adapt) when the dataset class count differs from the model's head.
+        stage = "test" if split == "test" else "validate"
+        datamodule.setup(stage)
+        dataset_class_names = getattr(datamodule, "class_names", None)
+        if isinstance(dataset_class_names, list) and len(dataset_class_names) != self.model_config.num_classes:
+            warnings.warn(
+                f"Dataset '{config.dataset_dir}' has {len(dataset_class_names)} classes but the model has "
+                f"num_classes={self.model_config.num_classes}. Evaluating with the model's head unchanged; "
+                "class indices may not line up with the dataset.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        trainer_kwargs: dict[str, Any] = {"include_training_callbacks": False}
+        if _accelerator is not None:
+            trainer_kwargs["accelerator"] = _accelerator
+        if _devices is not None:
+            trainer_kwargs["devices"] = _devices
+        trainer = build_trainer(config, self.model_config, **trainer_kwargs)
+
+        # The eval trainer intentionally has no logger; the metric callback still logs with
+        # ``logger=True``, so PTL emits one "no logger configured" warning per metric.  Suppress
+        # only that specific message — the metrics are still collected from the trainer's results.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*no logger configured.*")
+            if split == "test":
+                results = trainer.test(module, datamodule)
+            else:
+                results = trainer.validate(module, datamodule)
+
+        return {key: float(value) for key, value in results[0].items()} if results else {}
+
+    def inference(
+        self,
+        compile: bool = True,
+        batch_size: int = 1,
+        dtype: torch.dtype | str = torch.float32,
+        *,
+        compile_backend: Literal["torchscript", "cudagraph", "inductor"] | None = None,
+    ) -> RFDETRInference:
+        """Create an independent, optimized predictor from the current base weights.
+
+        The returned predictor owns a snapshot of the weights, configuration, class names, normalization and
+        postprocessor. Creating or using it leaves this model's weights, device, dtype, training mode and optimization
+        state unchanged. Later training or edits to this model do not affect the snapshot. Do not mutate or train the
+        source concurrently with snapshot creation. An existing legacy optimized runtime is not copied; the current
+        base weights are the source of truth.
+
+        On MPS, the snapshot samples deformable attention with the fused ``F.grid_sample`` and, for TorchScript and
+        ``compile=False`` predictors, folds each DINOv2 LayerScale into the Linear layer before it. At float32 its
+        predictions match the source model's to float rounding, not bit for bit; in half precision they can differ by
+        more, while staying at least as close to float32 as the source's.
+
+        Capture the return value and call ``predictor.predict(images)``. Calling ``model.predict(images)`` continues
+        to use the source model. Each factory call allocates its own weight copy; release a predictor to release its
+        runtime, or release the source model when only inference is needed. The former ``inplace`` option is removed.
+
+        Args:
+            compile: Compile the snapshot for fixed batch size and resolution. Set to ``False`` to use its eager
+                export-mode forward, with a fixed resolution and flexible batch size.
+            batch_size: Positive batch size for compilation. Ignored when ``compile=False``.
+            dtype: Floating-point dtype for the snapshot, as a ``torch.dtype`` or its string name.
+            compile_backend: ``None`` picks ``"cudagraph"`` on CUDA, ``"inductor"`` on MPS, when the installed
+                PyTorch can compile for it, and ``"torchscript"`` everywhere else; ``compile=False`` ignores it.
+                ``"torchscript"`` traces the snapshot. ``"cudagraph"`` additionally
+                freezes the trace and captures its fixed-shape CUDA work for replay, cloning graph-owned outputs before
+                returning them. It is CUDA-only and retains a graph-private memory pool. ``"inductor"`` uses
+                ``torch.compile``, with ``mode="reduce-overhead"`` on CUDA and the default mode elsewhere, and warms up
+                the result before returning. On CUDA, this includes a second call and synchronization for CUDA Graph
+                Trees. Compilation support and setup cost
+                depend on the installed PyTorch version and device. TorchScript freezing does not guarantee
+                bit-identical numerics. Create CUDA graph predictors before serving threads start: capture synchronizes
+                the device and empties process-wide CUDA and pinned-host caches.
+
+        Returns:
+            An inference-only facade owning the optimized snapshot.
+
+        Raises:
+            TypeError: If ``dtype`` is neither a floating-point dtype nor the name of a torch dtype.
+            ValueError: If the dtype is non-floating, the backend is unknown, the compiled batch size is invalid,
+                or CUDA graph compilation targets a non-CUDA device.
+            RuntimeError: If the source has no base weights, or compilation/capture fails. A failed CUDA graph
+                capture can leave CUDA random-number state unusable; restart the process before trying another backend.
+            torch.cuda.OutOfMemoryError: If copying or compiling the snapshot exhausts device memory.
 
         Examples:
-            >>> from types import SimpleNamespace
-            >>> import torch
-            >>> class _TinyModel(torch.nn.Module):
-            ...     def __init__(self):
-            ...         super().__init__()
-            ...         self.linear = torch.nn.Linear(1, 1)
-            ...     def forward(self, x):
-            ...         return {"pred_boxes": self.linear(x[:, :1, :1, :1].squeeze(-1).squeeze(-1))}
-            ...     def export(self):
-            ...         return None
-            >>> class _TinyContext:
-            ...     def __init__(self):
-            ...         self.device = torch.device("cpu")
-            ...         self.resolution = 28
-            ...         self.model = _TinyModel()
-            ...         self.inference_model = None
-            >>> model = object.__new__(RFDETR)
-            >>> model.model_config = SimpleNamespace(num_channels=3)
-            >>> model.model = _TinyContext()
-            >>> model._is_optimized_for_inference = False
-            >>> model._has_warned_about_not_being_optimized_for_inference = False
-            >>> model._optimized_has_been_compiled = False
-            >>> model._optimized_batch_size = None
-            >>> model._optimized_resolution = None
-            >>> model._optimized_dtype = None
-            >>> model.optimize_for_inference(compile=False, dtype="float16")
-            >>> model._is_optimized_for_inference
-            True
-            >>> model._optimized_dtype
-            torch.float16
+            Requires model weights; the predictor can be reused for multiple images.
+
+            >>> from rfdetr import RFDETRSmall  # doctest: +SKIP
+            >>> model = RFDETRSmall()  # doctest: +SKIP
+            >>> predictor = model.inference(compile=False)  # doctest: +SKIP
+            >>> detections = predictor.predict("image.jpg")  # doctest: +SKIP
         """
         if isinstance(dtype, str):
             try:
@@ -776,361 +1865,907 @@ class RFDETR:
                 raise TypeError(f"dtype must be a torch.dtype or a string name of a dtype, got {dtype!r}") from None
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"dtype must be a torch.dtype or a string name of a dtype, got {type(dtype)!r}")
+        if not dtype.is_floating_point:
+            raise ValueError(f"dtype must be a floating-point torch.dtype or string name of one, got {dtype}")
+        if compile_backend not in (None, "torchscript", "cudagraph", "inductor"):
+            raise ValueError(
+                f"compile_backend must be 'torchscript', 'cudagraph', 'inductor' or None, got {compile_backend!r}"
+            )
+        if compile and (isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1):
+            raise ValueError("batch_size must be a positive integer when compile=True.")
+        device = torch.device(self.model.device)
+        if compile_backend is None:
+            compile_backend = _default_compile_backend(device)
+        if compile and compile_backend == "cudagraph" and device.type != "cuda":
+            raise ValueError("compile_backend='cudagraph' requires a CUDA device.")
+        source_model = self.model.model
+        if source_model is None:
+            raise RuntimeError("Cannot create a predictor: the base model has been cleared. Reload the source model.")
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
 
-        # Clear any previously optimized state before starting a new optimization run.
-        self.remove_optimized_model()
-
-        _ensure_model_on_device(self.model)
-        device = self.model.device
+        # Copy only prediction state, never training callbacks or a trainer which can retain the source model.
+        # Exclude both weight-bearing entries while copying metadata, then clone the base module exactly once.
+        snapshot = object.__new__(RFDETR)
         cuda_ctx = torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext()
-
-        try:
-            with cuda_ctx:
-                self.model.inference_model = deepcopy(self.model.model)
-                self.model.inference_model.eval()
-                self.model.inference_model.export()
-
-                self.model.inference_model = self.model.inference_model.to(dtype=dtype)
-
-                if compile:
-                    self.model.inference_model = torch.jit.trace(
-                        self.model.inference_model,
-                        torch.randn(
-                            batch_size,
-                            self._input_channels(),
-                            *as_pair(self.model.resolution),
-                            device=self.model.device,
-                            dtype=dtype,
-                        ),
+        with cuda_ctx:
+            with _device_move_lock(source_model), torch.inference_mode(False):
+                snapshot.model_config, snapshot.model, snapshot.means, snapshot.stds = deepcopy(
+                    (self.model_config, self.model, self.means, self.stds),
+                    {id(source_model): None, id(self.model.inference_model): None},
+                )
+                inference_model: Any = deepcopy(source_model)
+            snapshot.model.device = device
+            inference_model = inference_model.to(device=device)
+            inference_model.eval()
+            inference_model.export()
+            # Cast before the MPS rewrites so LayerScale folds in the snapshot's dtype: folding a float16 source and
+            # widening afterwards would keep products that underflowed in float16.
+            inference_model = inference_model.to(dtype=dtype)
+            if device.type == "mps":
+                # The snapshot never runs backward.
+                _rewrite_for_mps_prediction(
+                    inference_model, fold_layer_scales=not (compile and compile_backend == "inductor")
+                )
+            if compile:
+                dummy_input = torch.randn(
+                    batch_size,
+                    snapshot._input_channels(),
+                    *as_pair(snapshot.model.resolution),
+                    device=device,
+                    dtype=dtype,
+                )
+                if compile_backend in ("torchscript", "cudagraph"):
+                    if device.type != "cpu" and getattr(inference_model, "segmentation_head", None) is not None:
+                        # The owned prediction snapshot never runs backward. Its native upsample avoids the
+                        # deterministic-backward decomposition that TorchScript cannot trace on accelerators.
+                        inference_model.segmentation_head._native_prediction_upsample = True
+                    # A video backbone branches on grad mode; trace the no-grad path that predict() runs.
+                    video_model = snapshot._input_channels() != snapshot.model_config.num_channels
+                    with torch.no_grad() if video_model else contextlib.nullcontext():
+                        inference_model = _trace_for_prediction(inference_model, dummy_input)
+                    if compile_backend == "cudagraph":
+                        # The existing CUDA parity/latency measurements use a frozen trace; retain that capture path.
+                        inference_model = torch.jit.freeze(inference_model)
+                        inference_model = _CUDAGraphInferenceModel(inference_model, dummy_input, device)
+                else:
+                    # `reduce-overhead` only adds CUDA graph trees; elsewhere it records nothing and warns on compile.
+                    inference_model = torch.compile(
+                        inference_model, mode="reduce-overhead" if device.type == "cuda" else "default"
                     )
-                    self._optimized_has_been_compiled = True
-                    self._optimized_batch_size = batch_size
+                    with torch.inference_mode():
+                        # `predict()` passes inference tensors, and dynamo guards on that: a warm-up input built
+                        # outside inference mode makes the first prediction compile again.
+                        warmup_input = dummy_input.clone()
+                        inference_model(warmup_input)
+                        if device.type == "cuda":
+                            # CUDA Graph Trees reserve memory on the first call and record on the second.
+                            inference_model(warmup_input)
+                            torch.cuda.synchronize(device)
 
-                # Set success flags only after all operations complete.
-                self._optimized_resolution = as_pair(self.model.resolution)
-                self._is_optimized_for_inference = True
-                self._optimized_dtype = dtype
-        except Exception:
-            # Ensure the object is left in a consistent, unoptimized state if optimization fails.
-            with contextlib.suppress(Exception):
-                self.remove_optimized_model()
-            raise
+        snapshot.model.inference_model = inference_model
+        snapshot._is_optimized_for_inference = True
+        snapshot._has_warned_about_not_being_optimized_for_inference = False
+        snapshot._optimized_has_been_compiled = compile
+        snapshot._optimized_batch_size = batch_size if compile else None
+        snapshot._optimized_resolution = as_pair(snapshot.model.resolution)
+        snapshot._optimized_dtype = dtype
+        snapshot._optimized_inplace = False
+        return RFDETRInference._from_owned_model(snapshot)
 
     def remove_optimized_model(self) -> None:
-        """Remove the optimized inference model and reset all optimization flags.
+        """Clear legacy optimization state on this RFDETR instance.
 
-        Clears ``model.inference_model`` and resets all internal state set by :meth:`optimize_for_inference`. Safe to
-        call even if the model has not been optimized.
-
-        Examples:
-            >>> from types import SimpleNamespace
-            >>> import torch
-            >>> class _TinyModel(torch.nn.Module):
-            ...     def __init__(self):
-            ...         super().__init__()
-            ...         self.linear = torch.nn.Linear(1, 1)
-            ...     def forward(self, x):
-            ...         return {"pred_boxes": self.linear(x[:, :1, :1, :1].squeeze(-1).squeeze(-1))}
-            ...     def export(self):
-            ...         return None
-            >>> class _TinyContext:
-            ...     def __init__(self):
-            ...         self.device = torch.device("cpu")
-            ...         self.resolution = 28
-            ...         self.model = _TinyModel()
-            ...         self.inference_model = None
-            >>> model = object.__new__(RFDETR)
-            >>> model.model_config = SimpleNamespace(num_channels=3)
-            >>> model.model = _TinyContext()
-            >>> model._is_optimized_for_inference = False
-            >>> model._has_warned_about_not_being_optimized_for_inference = False
-            >>> model._optimized_has_been_compiled = False
-            >>> model._optimized_batch_size = None
-            >>> model._optimized_resolution = None
-            >>> model._optimized_dtype = None
-            >>> model.optimize_for_inference(compile=False)
-            >>> model.remove_optimized_model()
-            >>> model._is_optimized_for_inference
-            False
+        Predictors returned by :meth:`inference` own independent runtimes; this method does not change or release them.
+        Release the predictor itself when it is no longer needed. A legacy instance optimized destructively cannot
+        recover its original module, so cleanup warns and leaves that state intact.
         """
+        if getattr(self, "_optimized_inplace", False):
+            warnings.warn(
+                "remove_optimized_model() has no effect after inplace optimization — the original model "
+                "cannot be restored because export() and dtype casting mutate it. "
+                "Create or reload a new RFDETR instance instead.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return
         self.model.inference_model = None
         self._is_optimized_for_inference = False
         self._optimized_has_been_compiled = False
         self._optimized_batch_size = None
         self._optimized_resolution = None
         self._optimized_dtype = None
+        self._optimized_inplace = False
 
-    @deprecated(
-        target=True,
-        # `simplify` / `force` are retained for API compatibility and treated as no-op.
-        args_mapping={"simplify": None, "force": None},
-        deprecated_in="1.6.0",
-        remove_in="1.8.0",
-        num_warns=1,
-    )
+    @property
+    def is_optimized_inplace(self) -> bool:
+        """Report destructive optimization state retained by a legacy RFDETR instance.
+
+        The snapshot factory :meth:`inference` never sets this flag on its source.
+        """
+        return getattr(self, "_optimized_inplace", False)
+
+    @staticmethod
+    def _resolve_export_batch(
+        format: str, batch_size: int, dynamic_batch: bool, max_batch_size: int | None
+    ) -> tuple[str, int, int | None]:
+        """Normalize the format and validate the export's effective batch bounds.
+
+        Args:
+            format: Export format name or alias.
+            batch_size: Requested export batch size.
+            dynamic_batch: Whether the export has a dynamic batch dimension.
+            max_batch_size: TensorRT dynamic-batch profile upper bound; warned about and dropped for other exports.
+
+        Returns:
+            The normalized format, the validated batch size, and the validated maximum batch size or ``None``.
+
+        Raises:
+            ValueError: If the batch size or the TensorRT maximum batch size is not a positive integer.
+
+        Examples:
+            >>> RFDETR._resolve_export_batch("TRT", 2, True, 4)
+            ('tensorrt', 2, 4)
+        """
+        from rfdetr.export.prepare import validate_batch_size
+        from rfdetr.export.registry import normalize_format
+
+        export_batch_size = validate_batch_size(batch_size)
+        export_max_batch_size = None
+        format = normalize_format(format)
+        if max_batch_size is not None and format == "tensorrt" and dynamic_batch:
+            try:
+                export_max_batch_size = validate_batch_size(max_batch_size)
+            except ValueError:
+                raise ValueError(f"max_batch_size must be a positive integer, got {max_batch_size!r}.") from None
+        elif max_batch_size is not None:
+            warnings.warn(
+                f"`max_batch_size` is only used for format='tensorrt' with dynamic_batch=True "
+                f"(got format={format!r}, dynamic_batch={dynamic_batch!r}). This argument is ignored.",
+                UserWarning,
+                stacklevel=3,
+            )
+        return format, export_batch_size, export_max_batch_size
+
+    def write_export_metadata(
+        self,
+        artifact: str | os.PathLike[str],
+        *,
+        format: str = "onnx",
+        shape: tuple[int, int] | None = None,
+        patch_size: int | None = None,
+        batch_size: int = 1,
+        dynamic_batch: bool = False,
+        max_batch_size: int | None = None,
+        backbone_only: bool = False,
+        backend: str | None = None,
+        soc: str | None = None,
+        **export_settings: Any,
+    ) -> Path | None:
+        """Write inference metadata for an existing artifact from its live source model.
+
+        Load the checkpoint the artifact was exported from and supply the same export settings. This method reads
+        model configuration and prediction semantics without running the model or converting the artifact. Each
+        format's exporter supplies its artifact-specific input and output mapping before metadata is written.
+
+        Args:
+            artifact: Existing exported file or model bundle.
+            format: Export format, with the same names and aliases accepted by :meth:`export`.
+            shape: Exported ``(height, width)``; defaults to the source model's square resolution.
+            patch_size: Backbone patch size; must match the source model when supplied.
+            batch_size: Positive batch size used to export the artifact.
+            dynamic_batch: Whether the artifact was exported with a dynamic batch dimension.
+            max_batch_size: TensorRT dynamic-batch profile upper bound; ignored for other exports.
+            backbone_only: Whether the artifact contains only backbone features.
+            backend: ExecuTorch backend used to export the artifact.
+            soc: Target Qualcomm SoC for the ExecuTorch QNN backend.
+            **export_settings: Format settings forwarded to the exporter's configuration builder, such as
+                ``coreai_precision``. Use the values supplied to :meth:`export`.
+
+        Returns:
+            Adjacent digest-bound metadata path, or ``None`` when metadata is embedded in an ONNX artifact.
+
+        Raises:
+            FileNotFoundError: If the artifact does not exist.
+            ValueError: If the format, batch bounds, shape, patch size, backend, SoC, or format settings are invalid.
+            NotImplementedError: If the requested settings are unsupported by the format.
+            ImportError: If embedding metadata or reading the artifact's interface needs a missing optional package.
+            OSError: If the artifact cannot be read or metadata cannot be written.
+
+        Examples:
+            A real source checkpoint and its exported artifact are required.
+
+            >>> from rfdetr import RFDETRSmall
+            >>> model = RFDETRSmall(pretrain_weights="checkpoint.pth")  # doctest: +SKIP
+            >>> model.write_export_metadata("output/model.xml", format="openvino")  # doctest: +SKIP
+        """
+        from rfdetr.export._backend import _resolve_export_backend
+        from rfdetr.export._runtime.metadata import metadata_from_model, write_metadata
+        from rfdetr.export.base import reject_unsupported_dynamic_batch
+        from rfdetr.export.prepare import validate_export_shape
+        from rfdetr.export.registry import resolve_exporter
+
+        artifact = Path(artifact)
+        if not artifact.exists():
+            raise FileNotFoundError(artifact)
+        format, batch_size, max_batch_size = RFDETR._resolve_export_batch(
+            format, batch_size, dynamic_batch, max_batch_size
+        )
+        backend, soc = _resolve_export_backend(format, backend, soc)
+        reject_unsupported_dynamic_batch(format, dynamic_batch=dynamic_batch)
+        shape = validate_export_shape(
+            _default_export_shape(shape, self.model.resolution),
+            patch_size,
+            self.model_config,
+            self.model.resolution,
+            resolve_patch_size=_resolve_patch_size,
+            validate_shape_dims=_validate_shape_dims,
+        )
+        exporter_class = resolve_exporter(format)
+        config = exporter_class.build_config(
+            **export_settings,
+            backbone_only=backbone_only,
+            dynamic_batch=dynamic_batch,
+            batch_size=batch_size,
+            max_batch_size=max_batch_size,
+            backend=backend,
+            soc=soc,
+        )
+        exporter = exporter_class(config)
+        metadata = metadata_from_model(
+            self,
+            format=format,
+            shape=shape,
+            batch_size=batch_size,
+            dynamic_batch=dynamic_batch,
+            backbone_only=backbone_only,
+            backend=backend,
+            max_batch_size=max_batch_size,
+        )
+        return write_metadata(artifact, exporter._metadata_for_artifact(metadata, artifact))
+
     def export(
         self,
         output_dir: str = "output",
-        infer_dir: str = None,
-        simplify: Optional[bool] = None,
+        infer_dir: str | None = None,
         backbone_only: bool = False,
         opset_version: int = 17,
         verbose: bool = True,
-        force: Optional[bool] = None,
         shape: tuple[int, int] | None = None,
         batch_size: int = 1,
         dynamic_batch: bool = False,
         patch_size: int | None = None,
         format: str = "onnx",
         quantization: str | None = None,
-        calibration_data: str | np.ndarray | None = None,
+        calibration_data: str | Path | np.ndarray[Any, Any] | None = None,
         max_images: int = 100,
         *,
+        backend: str | None = None,
+        soc: str | None = None,
+        fp16: bool = True,
+        max_batch_size: int | None = None,
+        trt_metadata: bool = False,
+        trt_hardware_compatibility: Literal["ampere_plus", "same_compute_capability"] | None = None,
+        trt_version_compatible: bool = False,
         notes: object = None,
+        output_name: str | None = None,
+        trt_timing_cache: str | os.PathLike[str] | None = None,
+        coreml_precision: str | None = None,
+        coreml_neural_engine: bool = False,
+        coreai_precision: str | None = None,
+        openvino_precision: str | None = None,
     ) -> Path:
-        """Export the trained model to ONNX or TFLite format.
+        """Export the trained model to ONNX, TFLite, TensorRT, ExecuTorch, CoreML, OpenVINO, or LiteRT format.
 
-        See the `export documentation <https://rfdetr.roboflow.com/learn/export/>`_ for more information.
+        See the `export documentation <https://rfdetr.roboflow.com/exports/>`_ for more information.
 
         Args:
             output_dir: Directory to write the exported model to.
             infer_dir: Optional directory of sample images for dynamic-axes inference.
-            simplify: Deprecated and ignored. Simplification is no longer run.
-            backbone_only: Export only the backbone (feature extractor).
+            backbone_only: Export the encoder and feature projectors without prediction heads. Returns one NCHW
+                feature map per configured ``projector_scale`` level, followed by cross-attention feature levels
+                when a separate cross-attention projector is present.
             opset_version: ONNX opset version to target.
             verbose: Print export progress information.
-            force: Deprecated and ignored.
             shape: ``(height, width)`` tuple; defaults to square at model resolution.
                 Both dimensions must be divisible by ``patch_size * num_windows``.
-            batch_size: Static batch size to bake into the ONNX graph.
+            batch_size: Static batch size to bake into the ONNX graph; a positive integer. With ``dynamic_batch=True``
+                and ``format="tensorrt"`` it is also the batch the engine's optimization profile is tuned for.
             dynamic_batch: If True, export with a dynamic batch dimension
-                so the ONNX model accepts variable batch sizes at runtime.
-            patch_size: Backbone patch size. Defaults to the value stored in
-                ``model_config.patch_size`` (typically 14 or 16). When provided explicitly it must match the
-                instantiated model's patch size. Shape divisibility is validated against ``patch_size * num_windows``.
-            format: Export format — ``"onnx"`` (default) or ``"tflite"``.
-                When ``"tflite"`` is selected the model is first exported to ONNX then converted to TFLite via
-                ``onnx2tf``.  Requires ``pip install rfdetr[onnx,tflite]``.
+                so the model accepts variable batch sizes at runtime
+                (spatial dimensions always stay fixed). Applies to the ONNX
+                graph, and to ``format="tensorrt"``, where the engine is built with one
+                optimization profile spanning batch ``1 .. max_batch_size`` (tuned for *batch_size*); pass
+                *max_batch_size* in that case. Not supported for ExecuTorch export on
+                executorch 1.3.1 (raises ``NotImplementedError``): the runtime
+                cannot resize RF-DETR's windowed-attention reshapes, so a
+                dynamic ``.pte`` runs only at the traced batch — export one
+                ``.pte`` per batch size instead. Also unsupported for native CoreML
+                (``format="coreml"``): fixed shapes are required for reliable ANE / GPU scheduling.
+                Also refused for ``format="openvino"``, where it is not needed: omit ``dynamic_batch``;
+                the converted OpenVINO IR already accepts any batch size.
+                Also refused for ``format="tflite"``: ``onnx2tf`` fails on the dynamic-batch graph (an ``Add``
+                against the dynamic-shaped encoder input reports mismatched dimensions) — export one ``.tflite``
+                per batch size instead. Also unsupported for ``format="litert"``: the ``.tflite`` bakes a fixed
+                input shape; export one file per batch size instead.
+            patch_size: Backbone patch size. Defaults to the value stored
+                in ``model_config.patch_size`` (typically 14 or 16). When
+                provided explicitly it must match the instantiated model's
+                patch size. Shape divisibility is validated against
+                ``patch_size * num_windows``.
+            format: Export format — ``"onnx"`` (default), ``"tflite"``, ``"tensorrt"`` (alias: ``"trt"``),
+                ``"executorch"`` (alias: ``"pte"``), ``"coreml"``, ``"coreai"``, ``"openvino"`` or ``"litert"``,
+                in any case (``"ONNX"`` works too).
+                ``"tflite"`` and ``"tensorrt"`` both first export to ONNX,
+                then convert: ``"tflite"`` via ``onnx2tf`` (requires
+                ``pip install rfdetr[tflite]``); ``"tensorrt"`` via the
+                TensorRT Python API (requires ``pip install rfdetr[tensorrt]``).
+                Unlike ``"onnx"``/``"tflite"`` portable serialization,
+                ``"tensorrt"`` performs target-specific compilation at
+                export time and by default produces a ``.trt`` engine tied
+                to the build machine's GPU and TensorRT version;
+                ``trt_hardware_compatibility`` and ``trt_version_compatible``
+                widen that.
+                When ``"executorch"`` is selected the model is exported
+                directly via ``torch.export`` to an ExecuTorch
+                ``.pte`` file (no ONNX step), configured by *backend* / *soc* below.  Requires
+                ``pip install rfdetr[executorch]``. ``"openvino"`` converts directly from PyTorch to OpenVINO IR
+                format (requires ``pip install rfdetr[openvino]``). ``"litert"`` converts directly from PyTorch to
+                a LiteRT ``.tflite`` file via ``litert-torch`` (``torch.export`` capture, no ONNX or TensorFlow
+                step; requires ``pip install rfdetr[litert]``) — the same file type as ``"tflite"``, reached
+                without ``onnx2tf``. It writes a single float32 graph with the two-stage query selection
+                inside, so it runs on LiteRT's CPU (XNNPACK) delegate; keypoint models are refused before
+                conversion, because litert-torch cannot lower the keypoint head's rank-4 matmul.
+                When ``"coreml"`` is selected the model is exported via ``torch.export`` + ``coremltools`` to a
+                native ``.mlpackage`` (no ONNX step; requires
+                ``pip install rfdetr[coreml]``). This is distinct from
+                ExecuTorch's ``format="executorch", backend="coreml"``
+                path, which still produces a ``.pte``. If you know that
+                ExecuTorch delegate and expect ``format="coreml"`` to mean
+                the same thing: it does not — pass
+                ``format="executorch", backend="coreml"`` for the ``.pte``
+                route instead. Passing both ``format="coreml"`` and
+                ``backend="coreml"`` together does **not** fall through
+                to the ExecuTorch delegate; ``backend`` is ignored (with
+                a warning) and the native ``.mlpackage`` path always runs.
+                Detection, segmentation and keypoint models all have registry-clean and numerical-parity
+                test coverage for this format (see ``tests/export/coreml/test_coreml_op_coverage.py`` /
+                ``test_coreml_export.py``).
+                When ``"coreai"`` is selected the model is exported via ``torch.export`` + ``coreai-torch`` to an
+                Apple Core AI ``.aimodel`` (requires ``pip install rfdetr[coreai]``; the asset runs on iOS,
+                iPadOS and macOS 27 or later).
 
                 .. warning::
-                    TFLite export is experimental and subject to change; upstream dependency instabilities (``onnx2tf``,
-                    ``ai_edge_litert``) may affect results.
-            quantization: TFLite quantization mode (ignored when
-                ``format="onnx"``).  One of ``None``, ``"fp32"``, ``"fp16"``, ``"int8"``.  ``None`` / ``"fp32"`` /
-                ``"fp16"`` produce FP32 + FP16 ``.tflite`` files; ``"int8"`` additionally produces an INT8-quantized
-                model.
-            calibration_data: Representative images for INT8 calibration and ``onnx2tf`` output validation.  Accepts:
+                    TFLite, ExecuTorch, CoreML, and LiteRT export are experimental
+                    and subject to change; upstream dependency instabilities
+                    (``onnx2tf``, ``ai_edge_litert``, ``executorch``,
+                    ``coremltools``, ``litert-torch``) may affect results.
+            quantization: Quantization mode.  Its meaning is per format, and formats not listed here ignore it
+                (``format="executorch"``, for example):
 
-                * ``None`` — auto-generate random data (sufficient for fp32/fp16; warns for int8).
-                * A **directory path** (``str``) containing JPEG/PNG
-                  images — the converter automatically loads, resizes, and prepares them.  This is the simplest
-                  approach.
-                * A path (``str``) to a ``.npy`` file of shape ``(N, H, W, 3)``, dtype float32, values in ``[0, 1]``.
+                * ``format="tflite"`` — one of ``None``, ``"fp32"``, ``"fp16"``, ``"int8"``.  ``None`` / ``"fp32"``
+                  / ``"fp16"`` produce FP32 + FP16 ``.tflite`` files; ``"int8"`` additionally produces a
+                  **dynamic-range** INT8 model (INT8 weights, float activations; needs no calibration data).
+                * ``format="onnx"`` — one of ``None``, ``"fp32"``, ``"int8"``.  ``"int8"`` writes a **static** QDQ
+                  model alongside the FP32 graph, with 8-bit weights *and* activations on the matrix multiplies
+                  only, and **requires** *calibration_data*.  Attention scores, detection heads, normalization and
+                  the surrounding elementwise math stay in float; quantizing those costs accuracy and speed alike.
+                * ``format="openvino"`` — one of ``None``, ``"fp32"``, ``"int8"``.  ``"int8"`` compresses the
+                  converted IR with NNCF (``pip install nncf``, not part of the ``rfdetr[openvino]`` extra) before it
+                  is written, so the ``.xml`` / ``.bin`` pair is already 8-bit, and **requires** *calibration_data*.
+                * ``format="tensorrt"`` — ``None`` (an FP16 or FP32 engine, as ``fp16`` says) or ``"int8"``: most of
+                  the backbone encoder and decoder run in INT8 and the rest in FP16 (placement in the TensorRT export
+                  guide), with activation ranges calibrated on *calibration_data*, which is then required (a
+                  detection model's backbone norms are smoothed and its backbone MLP biases corrected for INT8 on the
+                  same data).  Detection, segmentation and keypoint models (the mask head and keypoint head stay
+                  FP16), static batch, ``fp16=True``, TensorRT 10 or newer; the engine is named ``*_int8.trt``.
+                * ``format="litert"`` — accepts only ``None`` / ``"fp32"`` (it writes one float32 ``.tflite``) and
+                  raises ``NotImplementedError`` for the other modes rather than silently ignoring them.
+            calibration_data: Representative data for static INT8.  **Required** for ``format="onnx"``,
+                ``format="openvino"`` and ``format="tensorrt"`` with ``quantization="int8"``, where activation ranges
+                are collected from it, and refused as missing there rather than defaulted.  ``format="tensorrt"``
+                also refuses it without ``"int8"``.  Accepts:
+
+                * ``None`` — the default; no calibration data.
+                * A **directory path** (``str`` or :class:`~pathlib.Path`) containing images, preprocessed exactly as
+                  :meth:`predict` does.
+                * A path (``str`` or :class:`~pathlib.Path`) to a ``.npy`` file of shape ``(N, C, H, W)``, already
+                  normalized the way the model expects.
                 * A :class:`numpy.ndarray` with the same format.
 
-                For INT8 quantization, provide 20–100 representative images from your training/validation set for best
-                accuracy.
-            max_images: Maximum number of images to load from a calibration directory.  Defaults to ``100``.  Only used
-                when *calibration_data* is a directory path.
-            notes: Optional user-defined metadata (string, dict, list, or
-                any JSON-serialisable value) to embed in the exported ONNX model under the ``"rfdetr_notes"`` metadata
-                property.  When ``None`` no metadata entry is written.  String values are stored verbatim; all other
-                types are JSON-encoded so consumers must call ``json.loads()`` to recover a dict or list.  The same
-                value can be passed to :meth:`train` so the checkpoint and the ONNX file share the same provenance
+                The resulting activation ranges decide the INT8 model's accuracy, so the data must be representative of
+                the deployment domain — out-of-domain data yields a model that loads, runs, and is quietly wrong.
+
+                For ``format="tflite"`` it is ignored: any value other than ``None`` raises a ``UserWarning`` and is
+                never read, so a missing path or a malformed array does not fail the export. No data could change the
+                exported ``.tflite`` models: ``quantization="int8"`` produces a dynamic-range model whose weight
+                scales come from the weights themselves, and fp32/fp16 involve no calibration.
+            max_images: Maximum number of images to load from a *calibration_data* directory (the first ones by file
+                name) for ONNX / OpenVINO / TensorRT static INT8.  Defaults to ``100``.  Only used when
+                *calibration_data* is a directory path; ignored for ``format="tflite"`` along with *calibration_data*.
+            backend: Hardware backend to specialize the export for.  Required when ``format="executorch"`` and
+                ignored — with a warning — for any other format.  Accepted values for ExecuTorch:
+                ``"xnnpack"`` (portable CPU, fp32), ``"coreml"`` (Apple devices, fp16; requires ``coremltools``),
+                and ``"qnn"`` (Qualcomm Snapdragon HTP, fp16; requires an ExecuTorch source build against the
+                QAIRT SDK — not available via pip).
+            soc: Target SoC (System on Chip) — the specific Qualcomm Snapdragon chip the exported model will run
+                on.  Required when ``backend="qnn"``: the QNN backend compiles the ``.pte`` ahead-of-time for one
+                chip's Hexagon Tensor Processor (HTP), unlike ``"xnnpack"``/``"coreml"`` which run on any device of
+                their platform, so the target chip must be known at export time.  Ignored — with a warning — for
+                any other backend or format.  Must be a
+                :class:`~executorch.backends.qualcomm.serialization.qc_schema.QcomChipset` name, e.g. ``"SM8650"``
+                (Snapdragon 8 Gen 3); see that enum for the full list of supported chips.  Has no effect for
+                ``"xnnpack"`` or ``"coreml"``.
+            fp16: Build the TensorRT engine with FP16 precision.  Only applies when ``format="tensorrt"``
+                (alias ``"trt"``); ignored for every other format.  Defaults to ``True`` for lowest latency
+                on NVIDIA GPUs.  TensorRT 11+ removed the FP16 builder flag, so there the engine is built
+                from an FP16-cast graph instead; engine I/O stays FP32 either way.  A lean/partial
+                TensorRT < 11 wheel that lacks the FP16 builder flag falls back to an FP32 engine with a
+                warning instead — see :meth:`~rfdetr.export._tensorrt.exporter.TensorRTExporter.build_engine`
+                for the full precision-resolution logic.  Pass ``False`` for an FP32 engine.
+            max_batch_size: Largest batch a dynamic TensorRT engine must accept.  Only read when
+                ``format="tensorrt"`` and ``dynamic_batch=True``, where it is required: the engine is built with
+                one optimization profile spanning batch ``1 .. max_batch_size`` and tuned for *batch_size*
+                (``batch_size <= max_batch_size``).  Ignored for every other format or combination; passing a
+                non-``None`` value there emits a ``UserWarning`` instead of silently doing nothing.
+            trt_metadata: Also write ``<engine>.json`` beside a ``format="tensorrt"`` engine, so a consumer that does
+                not import the model (a C++ service, Triton, DeepStream) can learn the engine's input size and
+                normalization, output names, batch profile, the precision actually built, the TensorRT version and GPU
+                it was built on, and the engine file's size and SHA-256.  A ``.trt`` file has no slot for this.  It does
+                not record class names.
+                ``False`` (default) writes no description.  Ignored for every other format; ``True`` there emits a
+                ``UserWarning`` instead of silently doing nothing.
+            trt_hardware_compatibility: Ask TensorRT for a ``format="tensorrt"`` engine that other GPUs may run too.
+                ``"ampere_plus"`` targets NVIDIA Ampere GPUs (compute capability 8.x) and newer, and needs an Ampere or
+                newer GPU to build; ``"same_compute_capability"`` targets GPUs that share the building GPU's compute
+                capability.  Not supported on Jetson (JetPack) or DriveOS.  The engine can run slower than one built
+                for a single GPU.  ``None`` (default) builds for the building GPU only.  Ignored for every other
+                format; passing a non-``None`` value there emits a ``UserWarning`` instead of silently doing nothing.
+            trt_version_compatible: Ask TensorRT for a ``format="tensorrt"`` engine that other releases of the same
+                TensorRT major version may load.  It worked between TensorRT 11.2 and 11.3, in both directions; an
+                engine did not load across major versions (10 and 11), nor between 10.13 and 10.16.  It needs
+                TensorRT's lean runtime library, a separate package from ``tensorrt`` (``tensorrt-lean-cu*-libs``).
+                The engine built by TensorRT 11 carries host code: load it with
+                ``TRTInference(..., engine_host_code_allowed=True)``, and only from a file you trust.  ``False``
+                (default) builds an engine that loads on the building TensorRT version only.  Ignored for every other
+                format; ``True`` there emits a ``UserWarning`` instead of silently doing nothing.
+            trt_timing_cache: File in which TensorRT keeps the kernel timings it measures while building an engine, for
+                ``format="tensorrt"``.  A build loads the file when it exists and writes the merged timings back, so a
+                later build with the same layer shapes at the same precision and batch profile, on the same GPU and
+                TensorRT version, skips the search it already did.  The timings depend on the layers' shapes, not the
+                weights, so a re-export with new weights reuses them for every layer whose shape did not change.  A
+                cache from a matching dynamic-batch build helps too; reuse between a static and a dynamic profile, or
+                across precisions, was not measured.  A relative path is relative to the working directory, not to
+                *output_dir*.  A cache written by another TensorRT major version, or an empty or damaged file, does
+                not stop the build: TensorRT logs an error, builds as if there were no cache, and the file gets this
+                build's timings.  A failed cache write does fail the export, and the built engine is not saved
+                (Polygraphy writes the cache before the engine is returned); the engine can simply be rebuilt.
+                ``None`` (default) reads and writes no file.  Ignored for every other format; passing a non-``None``
+                value there emits a ``UserWarning`` instead of silently doing nothing.
+            notes: Optional user-defined metadata (string, dict, list,
+                or any JSON-serialisable value) to embed in the metadata of
+                the exported artifact, for a format that carries it (see
+                "Read Embedded Notes" in the export documentation for where
+                each format stores it).
+                When ``None`` no metadata entry is written. String values
+                are stored verbatim; all other types are JSON-encoded so
+                consumers must call ``json.loads()`` to recover a dict or
+                list. The same value can be passed to :meth:`train` so the
+                checkpoint and the exported artifact share the same provenance
                 information.
+                **Ignored for ``format="executorch"``, ``format="openvino"``, and ``format="litert"``**: those
+                artifacts have no ONNX-style metadata slot, and a non-``None`` value emits a ``UserWarning``
+                instead of being embedded. Every other format refuses a value JSON cannot encode (``NaN``,
+                ``Infinity``, an arbitrary object) before any model work.
+            coreml_precision: ``ct.convert`` compute precision for ``format="coreml"`` — ``None`` (default) or
+                ``"float32"`` selects FP32 (tight CPU parity with eager
+                PyTorch); ``"float16"`` selects a smaller
+                ANE-oriented bundle (expect larger numeric drift) whose outputs are still float32. Bundles
+                declare iOS 15 / macOS 12 as the minimum OS. Ignored for every other format.
+            coreml_neural_engine: For ``format="coreml"``, export a graph for the Apple Neural Engine, with the same
+                weights: the backbone attention runs as one einsum pair per head in query chunks, and the two-stage
+                query selection as a one-hot matmul. In an fp16 export, only the deformable-attention ``resample`` and
+                its ``cast`` ops run on the CPU. This graph is faster than the default graph on the Neural Engine and
+                slower on the CPU and the GPU, so use it only with ``CPU_AND_NE`` or ``ALL`` compute units. Ignored for
+                every other format.
+            coreai_precision: Precision the graph is traced and stored in for ``format="coreai"`` — ``None``
+                (default) or ``"float32"``, or ``"float16"`` for a half-size asset whose input and outputs are
+                float16 too. A float16 keypoint model warns: the asset aborts the process on the Neural Engine.
+                Ignored for every other format.
+            openvino_precision: ``"float32"``, ``"float16"``, or ``None`` (default) for ``format="openvino"``
+                — ``None`` keeps OpenVINO's own ``compress_to_fp16=True`` default; ``"float32"`` disables
+                FP16 weight compression, controlling IR *storage* precision only (execution precision still
+                depends on the compiled device — not guaranteed to match eager PyTorch on non-CPU devices).
+                Ignored for every other format.
+            output_name: Full filename override (without extension), e.g. ``"my-model"``. When set, takes
+                precedence over the model's variant name (``self.size``) and the exported file is named
+                ``{output_name}.{ext}`` verbatim — this also suppresses the ``_fp32``/``_fp16``/``_{backend}``
+                detail suffix that would otherwise be appended to encode the resolved precision/backend/SoC
+                (see *format* / *coreml_precision* / *backend* / *soc* / *fp16* above), and the TensorRT
+                portability suffixes (``_ampere_plus``, ``_same_compute_capability``, ``_version_compatible``).
+                Sanitized against path traversal: only the basename is used, with an export file extension such
+                as ``.onnx`` stripped; other dots, as in ``"my-model-v1.2"``, are kept. Exception: ``format="tflite"``
+                always writes multiple files (one per precision/quantization mode), so the ``_fp32``/``_fp16``/
+                ``_dynamic_range_quant`` suffix is unavoidable even with
+                *output_name* set — it becomes the stem
+                instead of the model's variant name.
+                Exceptions: ONNX, CoreML, ExecuTorch, OpenVINO, LiteRT, and TensorRT with ``backbone_only=True``
+                append ``-backbone`` before the extension (e.g., ``{output_name}-backbone.onnx``); TFLite writes
+                per-precision files
+                instead of a single ``{output_name}.tflite`` file. TFLite filenames may include a ``_gs_patched`` infix
+                before the precision suffix when GridSample ops are patched, e.g.
+                ``{output_name}_gs_patched_fp32.tflite``; this is the standard RF-DETR path.
 
         Returns:
-            Path to the exported model file (``.onnx`` or ``.tflite``).
+            Path to the exported model file (``.onnx``, ``.tflite`` for both TFLite and LiteRT, ``.trt``,
+            ``.pte``, ``.mlpackage``, ``.aimodel`` or ``.xml`` for OpenVINO).  With ``format="onnx"`` and
+            ``quantization="int8"`` it is the quantized ``{stem}_int8.onnx``; the FP32 ``{stem}.onnx`` it was derived
+            from is left beside it.
+
+        Raises:
+            ValueError: If ``format`` is unrecognized; if ``batch_size``, or ``max_batch_size`` when given, is not
+                a positive integer; if
+                ``format="executorch"`` and ``backend`` is missing, unrecognized, or (for ``backend="qnn"``)
+                ``soc`` is missing; if the resolved export shape is not divisible by ``patch_size * num_windows``;
+                if ``coreml_precision``/``coreai_precision``/``openvino_precision``, or ``quantization`` for
+                ``format="tflite"``, is not one of their accepted values; if ``notes`` holds a non-finite float or a
+                circular reference, for a format that embeds it; or if ``format="tensorrt"`` with
+                ``dynamic_batch=True`` lacks ``max_batch_size`` or has ``batch_size > max_batch_size``; if
+                ``quantization`` is not a recognized mode for ``format="onnx"`` or ``format="openvino"`` (only
+                ``None``, ``"fp32"`` and ``"int8"`` are accepted there); if ``quantization="int8"`` is combined with
+                ``format="onnx"`` or ``format="openvino"`` and no ``calibration_data``; or, for those two INT8
+                requests, if ``calibration_data`` points to a missing path, a file that is not ``.npy``, an
+                image-less directory, or an array that is not ``(N, C, H, W)`` or does not match the graph's
+                input size.
+                Also raised for ``format="tensorrt"`` when ``quantization`` is neither ``None`` nor ``"int8"``,
+                ``calibration_data`` is given without ``"int8"``, ``"int8"`` has no ``calibration_data``,
+                ``max_images`` is not a positive integer, or ``"int8"`` is combined with ``fp16=False``,
+                ``dynamic_batch=True`` or ``backbone_only=True``; ``calibration_data`` that is not a directory, a
+                ``.npy`` path or a non-empty ``(N, C, H, W)`` float array, a path that does not exist, a directory
+                without an image, a file that is not ``.npy`` and a ``.npy`` that does not hold such an array are all
+                refused before the forward pass. During the INT8 conversion, calibration data that yields no usable
+                image or a non-finite range, a range too large for an FP16 scale, and attention INT8 cannot be placed
+                around, also raise.
+                Also raised for ``format="tensorrt"`` when ``trt_metadata`` is not a ``bool``.
+                Also raised for ``format="tensorrt"`` when ``trt_hardware_compatibility`` is neither ``None``,
+                ``"ampere_plus"`` nor ``"same_compute_capability"``, when ``trt_version_compatible`` is not a
+                ``bool``, when the installed TensorRT has no hardware compatibility level of the requested name, or
+                when ``trt_hardware_compatibility="ampere_plus"`` is asked of a CUDA device older than Ampere.
+                Also raised for ``format="tensorrt"`` when ``trt_timing_cache`` is not a non-empty file path, ends in
+                a path separator, or is a directory.
+            TypeError: If ``notes`` holds a value JSON cannot encode, for a format that embeds it.
+            OSError: If ``format="tensorrt"`` and the directory or files of ``trt_timing_cache`` cannot be created or
+                written, or it is a symbolic link to a missing file.
+            NotImplementedError: If ``dynamic_batch=True`` is combined with ``format="executorch"``,
+                ``format="coreml"``, ``format="openvino"``, ``format="tflite"``, or ``format="litert"`` — those
+                paths require a fixed batch size; if ``format="litert"`` is combined with a ``quantization``
+                other than ``None`` / ``"fp32"``; if ``format="litert"`` is asked to export a keypoint model
+                (``backbone_only=True`` still converts).
+            ImportError: If the optional dependencies for the requested
+                ``format``/``backend`` are not installed (e.g.
+                ``rfdetr[onnx]``, ``rfdetr[tensorrt]``, ``rfdetr[executorch]``,
+                ``rfdetr[coreml]``, ``coremltools`` for ExecuTorch
+                ``backend="coreml"``, ``openvino`` for OpenVINO export,
+                ``rfdetr[litert]`` for LiteRT export,
+                ``onnxruntime`` for ``format="onnx"`` with ``quantization="int8"``, ``nncf`` for
+                ``format="openvino"`` with ``quantization="int8"``,
+                or an ExecuTorch source build against the QAIRT SDK for
+                ``backend="qnn"``); also raised for ``format="tensorrt"`` with ``fp16=True`` on a
+                strongly typed TensorRT (11+) if ``onnx``/``onnxconverter-common`` are not installed
+                to cast the graph — install ``rfdetr[tensorrt]`` for the complete set, or pass
+                ``fp16=False``; and for ``format="tensorrt"`` with ``quantization="int8"`` without onnxruntime or
+                ``onnxconverter-common``, or on a TensorRT older than 10. Each format's availability check runs before
+                the model does, and so do the check for TensorRT's lean runtime library that
+                ``trt_version_compatible=True`` needs and the TensorRT INT8 host checks; what they do not cover (a
+                backend's extension, the TensorRT cast's packages, the Core AI runtime package, ``onnxruntime`` or
+                ``nncf`` for INT8) is found missing only during the conversion.
+            RuntimeError: If called after the model has undergone in-place inference optimization (the original
+                model has been cleared; instantiate a new :class:`RFDETR` to export).
+            OSError: If ``trt_metadata=True`` and the description file cannot be written, after the engine was built.
+
+        Examples:
+            Skipped because this example requires pretrained weights and optional ONNX export dependencies.
+
+            >>> from rfdetr import RFDETRSmall  # doctest: +SKIP
+            >>> model = RFDETRSmall()  # doctest: +SKIP
+            >>> model.export(format="onnx", output_dir="output")  # doctest: +SKIP
         """
-        logger.info("Exporting model to ONNX format")
-        _valid_formats = ("onnx", "tflite")
-        if format not in _valid_formats:
-            raise ValueError(f"Unsupported export format {format!r}. Choose from: {_valid_formats}")
-        try:
-            from rfdetr.export.main import export_onnx, make_infer_image
-        except ImportError:
-            logger.error(
-                "It seems some dependencies for ONNX export are missing."
-                " Please run `pip install rfdetr[onnx]` and try again.",
-            )
-            raise
+        from rfdetr.export._backend import _resolve_export_backend
+        from rfdetr.export.base import reject_unsupported_dynamic_batch
+        from rfdetr.export.prepare import prepare_export_graph, validate_export_shape
+        from rfdetr.export.registry import resolve_exporter
 
-        device = self.model.device
-        # deepcopy(self.model.model.to("cpu")) moves the live model to CPU as a
-        # side-effect before copying.  The finally block guarantees the original
-        # model is restored to its original device even if export or conversion
-        # raises an exception (review H1).
-        model = deepcopy(self.model.model.to("cpu"))
-        model.to(device)
-        try:
-            os.makedirs(output_dir, exist_ok=True)
-            output_dir_path = Path(output_dir)
-            patch_size = _resolve_patch_size(patch_size, self.model_config, "export")
-            num_windows = getattr(self.model_config, "num_windows", 1)
-            if isinstance(num_windows, bool) or not isinstance(num_windows, int) or num_windows <= 0:
-                raise ValueError(f"num_windows must be a positive integer, got {num_windows!r}")
-            block_size = patch_size * num_windows
-            if shape is None:
-                shape = as_pair(self.model.resolution)
-                if shape[0] % block_size or shape[1] % block_size:
-                    raise ValueError(
-                        f"Model's default resolution ({shape}) is not divisible by "
-                        f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
-                        f"Provide an explicit shape divisible by {block_size}.",
-                    )
-            else:
-                shape = _validate_shape_dims(shape, block_size, patch_size, num_windows)
-
-            input_tensors = make_infer_image(
-                infer_dir, shape, batch_size, device, num_channels=self.model_config.num_channels
-            ).to(device)
-            input_names = ["input"]
-            if backbone_only:
-                output_names = ["features"]
-            elif self.model_config.segmentation_head:
-                output_names = ["dets", "labels", "masks"]
-            else:
-                output_names = ["dets", "labels"]
-
-            if dynamic_batch:
-                dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
-            else:
-                dynamic_axes = None
-            model.eval()
-            with torch.no_grad():
-                if backbone_only:
-                    features = model(input_tensors)
-                    logger.debug(f"PyTorch inference output shape: {features.shape}")
-                elif self.model_config.segmentation_head:
-                    outputs = model(input_tensors)
-                    dets = outputs["pred_boxes"]
-                    labels = outputs["pred_logits"]
-                    masks = outputs["pred_masks"]
-                    if isinstance(masks, torch.Tensor):
-                        logger.debug(
-                            f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}, "
-                            f"Masks: {masks.shape}",
-                        )
-                    else:
-                        logger.debug(f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}")
-                else:
-                    outputs = model(input_tensors)
-                    dets = outputs["pred_boxes"]
-                    labels = outputs["pred_logits"]
-                    logger.debug(f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}")
-
-            model.cpu()
-            input_tensors = input_tensors.cpu()
-
-            output_file = export_onnx(
-                output_dir=str(output_dir_path),
-                model=model,
-                input_names=input_names,
-                input_tensors=input_tensors,
-                output_names=output_names,
-                dynamic_axes=dynamic_axes,
-                backbone_only=backbone_only,
-                verbose=verbose,
-                opset_version=opset_version,
-                variant_name=getattr(self, "size", None),
-                notes=notes,
-            )
-
-            logger.info(f"Successfully exported ONNX model to: {output_file}")
-
-            if format == "tflite":
+        # Every format builds its example batch from this, so it is checked before any exporter is imported.
+        format, export_batch_size, export_max_batch_size = RFDETR._resolve_export_batch(
+            format, batch_size, dynamic_batch, max_batch_size
+        )
+        for keyword, requested in (
+            ("trt_metadata", trt_metadata),
+            ("trt_hardware_compatibility", trt_hardware_compatibility is not None),
+            ("trt_version_compatible", trt_version_compatible),
+            ("trt_timing_cache", trt_timing_cache is not None),
+        ):
+            if requested and format != "tensorrt":
                 warnings.warn(
-                    "TFLite export is experimental and work-in-progress. "
-                    "Upstream dependency instabilities (onnx2tf, ai_edge_litert) may affect results.",
+                    f"`{keyword}` is only used for format='tensorrt' (got format={format!r}). "
+                    "This argument is ignored.",
                     UserWarning,
                     stacklevel=2,
                 )
-                try:
-                    from rfdetr.export._tflite.converter import export_tflite
-                except ImportError:
-                    logger.error(
-                        "It seems some dependencies for TFLite export are missing."
-                        " Please run `pip install rfdetr[onnx,tflite]` and try again.",
-                    )
-                    raise
+        backend, soc = _resolve_export_backend(format, backend, soc)
+        # Refuse a statically impossible request from the registry's own capability data, before resolving the
+        # exporter imports the format's heavy optional dependency (coremltools, executorch, openvino, ...) and long
+        # before the user pays for a full DINOv2 forward pass.
+        reject_unsupported_dynamic_batch(format, dynamic_batch=dynamic_batch)
+        if getattr(self, "_optimized_inplace", False) or self.model.model is None:
+            raise RuntimeError(
+                "RFDETR.export() is not available after inplace optimization. "
+                "The original model has been cleared. Create a new RFDETR instance."
+            )
+        # The shape needs only the model's configuration, so it is checked with the arguments above, before the exporter
+        # is resolved.
+        shape = validate_export_shape(
+            _default_export_shape(shape, self.model.resolution),
+            patch_size,
+            self.model_config,
+            self.model.resolution,
+            resolve_patch_size=_resolve_patch_size,
+            validate_shape_dims=_validate_shape_dims,
+        )
+        exporter_class = resolve_exporter(format)
+        # The exporter class owns its configuration: it picks the settings its format reads out of this method's
+        # union-of-every-format signature and drops the rest, so no dispatcher here has to know which is which.
+        config = exporter_class.build_config(
+            output_dir=Path(output_dir),
+            output_name=output_name,
+            variant_name=getattr(self, "size", None),
+            backbone_only=backbone_only,
+            dynamic_batch=dynamic_batch,
+            verbose=verbose,
+            notes=notes,
+            opset_version=opset_version,
+            backend=backend,
+            soc=soc,
+            fp16=fp16,
+            coreml_precision=coreml_precision,
+            coreml_neural_engine=coreml_neural_engine,
+            coreai_precision=coreai_precision,
+            openvino_precision=openvino_precision,
+            quantization=quantization,
+            calibration_data=calibration_data,
+            max_images=max_images,
+            batch_size=export_batch_size,
+            max_batch_size=export_max_batch_size,
+            trt_metadata=trt_metadata,
+            trt_hardware_compatibility=trt_hardware_compatibility,
+            trt_version_compatible=trt_version_compatible,
+            trt_timing_cache=trt_timing_cache,
+        )
+        # Constructing the exporter validates the format's own settings (precision, quantization, notes, ...), then
+        # warns about the ones it ignores.
+        exporter = exporter_class(config)
+        # The request holds up; now the host must too. A missing install is refused here rather than inside the
+        # conversion, which is reached only after prepare_export_graph's full forward pass below. It follows every check
+        # of the request above, so an invalid request is reported as one whether or not the format's dependency happens
+        # to be installed: installing an extra would not help it. The configuration-dependent check comes last, once the
+        # packages it may import are known to be there.
+        exporter_class.check_dependencies()
+        exporter.check_environment()
+        logger.info(f"Exporting model to {format} format")
 
-                tflite_path = export_tflite(
-                    onnx_path=output_file,
-                    output_dir=str(output_dir_path),
-                    quantization=quantization,
-                    calibration_data=calibration_data,
-                    verbosity="info" if verbose else "error",
-                    max_images=max_images,
-                    verbose=verbose,
+        device = self.model.device
+
+        # Move the live model to CPU before deepcopying and keep it there during export. ``nn.Module.to(...)`` mutates
+        # in place, so this frees GPU memory for the local export copy, ONNX tracing, TFLite conversion, and any
+        # calibration tensors. The ``finally`` block restores the live model even if export or conversion raises.
+        # Both moves go through ``_locked_move``: they rewrite the parameters a concurrent first ``predict()`` may be
+        # moving to the accelerator at the same time. The span between them is not locked — a ``predict()`` arriving
+        # mid-export can move the weights back onto the accelerator, costing this staging its freed memory.
+        self.model.model = _locked_move(self.model.model, "cpu")
+        model = deepcopy(self.model.model)
+        model.to(device)
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            from rfdetr.export._runtime.metadata import metadata_from_model
+
+            try:
+                metadata = metadata_from_model(
+                    self,
+                    format=format,
+                    shape=shape,
+                    batch_size=export_batch_size,
+                    dynamic_batch=dynamic_batch,
+                    backbone_only=backbone_only,
+                    backend=backend,
+                    max_batch_size=export_max_batch_size,
                 )
-                logger.info(f"Successfully exported TFLite model to: {tflite_path}")
-                return tflite_path
+            except ValidationError as error:
+                logger.warning(
+                    "Could not capture inference metadata: %s. Export will proceed without inference metadata; "
+                    "load the artifact with RFDETRInference(metadata=<json>).",
+                    error,
+                    exc_info=True,
+                )
+                metadata = None
 
-            logger.info("Export completed successfully")
-            return Path(output_file)
+            graph = prepare_export_graph(
+                model,
+                self.model_config,
+                shape=shape,
+                device=device,
+                infer_dir=infer_dir,
+                batch_size=export_batch_size,
+                dynamic_batch=dynamic_batch,
+                backbone_only=backbone_only,
+                metadata=metadata,
+            )
+            return exporter(graph)
         finally:
-            self.model.model = self.model.model.to(device)
+            self.model.model = _locked_move(self.model.model, device)
 
     @staticmethod
-    def _load_classes(dataset_dir: str) -> list[str]:
-        """Load class names from a COCO or YOLO dataset directory."""
+    def _filtered_coco_categories(dataset_dir: str) -> list[dict[str, Any]]:
+        """Read the train-split COCO categories that survive the grouping-category filter.
+
+        Single source for the category basis shared by :meth:`_load_classes` and
+        :meth:`_detect_num_classes_for_training`: both need the categories of ``train/_annotations.coco.json`` that
+        :func:`~rfdetr.datasets.coco.filter_parent_categories` keeps. Hand-copying that read-and-filter pair into each
+        method lets the two drift apart, and drift here means ``num_classes`` disagreeing with the label space.
+
+        Args:
+            dataset_dir: Path to the dataset root directory containing the ``train`` split.
+
+        Returns:
+            The kept ``categories`` entries ordered by category id — the same basis and order
+            :class:`~rfdetr.datasets.coco.CocoDetection` uses to assign label indices.
+        """
+        coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
+        with open(coco_path, encoding="utf-8") as f:
+            anns = json.load(f)
+        return filter_parent_categories(anns["categories"], annotated_category_ids(anns))
+
+    @staticmethod
+    def _memoized_coco_categories(
+        cache: dict[str, list[dict[str, Any]]], dataset_dir: str
+    ) -> list[dict[str, Any]] | None:
+        """Return :meth:`_filtered_coco_categories` for *dataset_dir*, parsing the annotation file at most once.
+
+        :meth:`train` needs the same category basis twice back to back — once to align ``num_classes``, once to
+        record the label space in ``training_config.json`` — and the annotation file can be large. The memo holds
+        one directory at a time, keyed on its resolved path, so pointing the same detector at a different dataset
+        replaces the entry rather than accumulating. The cache is passed in rather than read off ``self`` so the
+        static readers this feeds stay callable without an instance; on a test double whose attribute is not a real
+        dict, membership tests are false and assignment is a no-op, so it degrades to parsing every time.
+
+        Args:
+            cache: The owning detector's ``_coco_categories_cache``.
+            dataset_dir: Path to the dataset root directory.
+
+        Returns:
+            The kept categories, or ``None`` when *dataset_dir* is not a COCO-style layout and there is nothing to
+            parse — the readers then take their own non-COCO branches.
+
+        Examples:
+            >>> RFDETR._memoized_coco_categories({}, "/missing") is None
+            True
+        """
+        if not is_valid_coco_dataset(dataset_dir):
+            return None
+        key = str(Path(dataset_dir).resolve())
+        if key in cache:
+            return cache[key]
+        categories = RFDETR._filtered_coco_categories(dataset_dir)
+        cache.clear()
+        cache[key] = categories
+        return categories
+
+    @staticmethod
+    def _dataset_label_space_on_disk(
+        dataset_dir: str, dataset_file: str, *, coco_categories: list[dict[str, Any]] | None = None
+    ) -> tuple[list[str] | None, bool]:
+        """Read the dataset's class names and whether its labels are remapped category ids, without building it.
+
+        :meth:`RFDETRDataModule._dataset_label_space` answers the same question from a built dataset; :meth:`train`
+        has to answer it before one exists.
+
+        Args:
+            dataset_dir: Path to the dataset root directory.
+            dataset_file: ``TrainConfig.dataset_file``, which picks the builder and so the label convention: only
+                ``"roboflow"`` reaches :func:`~rfdetr.datasets.coco.build_roboflow_from_coco`, the one COCO builder
+                passing ``remap_category_ids=True``; ``"coco"`` and ``"o365"`` keep the source ids.
+            coco_categories: An already-parsed :meth:`_filtered_coco_categories` result for *dataset_dir* (see
+                :meth:`_memoized_coco_categories`); ``None`` reads the annotation file here.
+
+        Returns:
+            The class names, or ``None`` for a layout neither reader understands, and whether labels are remapped. A
+            YOLO layout returns ``(None, False)``: its ids are already 0-based, so nothing there can shift.
+        """
         if is_valid_coco_dataset(dataset_dir):
-            coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
-            with open(coco_path, encoding="utf-8") as f:
-                anns = json.load(f)
-            categories = sorted(anns["categories"], key=lambda category: category.get("id", float("inf")))
+            return RFDETR._load_classes(dataset_dir, coco_categories=coco_categories), dataset_file == "roboflow"
+        if (Path(dataset_dir) / index_name("train")).exists():
+            train_index = read_shard_index(dataset_dir, "train")
+            return train_index.class_names(), train_index.category_ids == "remap"
+        return None, False
 
-            # Catch possible placeholders for no supercategory
-            placeholders = {"", "none", "null", None}
+    @staticmethod
+    def _load_classes(dataset_dir: str, *, coco_categories: list[dict[str, Any]] | None = None) -> list[str]:
+        """Load class names from a COCO or YOLO dataset directory.
 
-            # If no meaningful supercategory exists anywhere, treat as flat dataset
-            has_any_sc = any(c.get("supercategory", "none") not in placeholders for c in categories)
-            if not has_any_sc:
-                return [c["name"] for c in categories]
+        Unannotated grouping categories are dropped by :func:`~rfdetr.datasets.coco.filter_parent_categories`, so the
+        returned names are index-aligned with ``CocoDetection.cat2label``. See
+        :meth:`_detect_num_classes_for_training` for the shared filter basis.
 
-            # Mixed/Hierarchical: keep only categories that are not parents of other categories.
-            # Both leaves (with a real supercategory) and standalone top-level nodes (supercategory is a
-            # placeholder) satisfy this condition — neither appears as another category's supercategory.
-            parents = {c.get("supercategory") for c in categories if c.get("supercategory", "none") not in placeholders}
-            has_children = {c["name"] for c in categories if c["name"] in parents}
+        Args:
+            dataset_dir: Path to the dataset root directory.
+            coco_categories: An already-parsed :meth:`_filtered_coco_categories` result for *dataset_dir*, so a
+                caller holding one (see :meth:`_memoized_coco_categories`) skips the second parse. ``None`` reads
+                the annotation file here. Only consulted for a COCO-style layout.
+        """
+        if is_valid_coco_dataset(dataset_dir):
+            if coco_categories is None:
+                coco_categories = RFDETR._filtered_coco_categories(dataset_dir)
+            return [category["name"] for category in coco_categories]
 
-            class_names = [c["name"] for c in categories if c["name"] not in has_children]
-            # Safety fallback for pathological inputs
-            return class_names or [c["name"] for c in categories]
-
-        # list all YAML files in the folder
-        if is_valid_yolo_dataset(dataset_dir):
-            yaml_paths = glob.glob(os.path.join(dataset_dir, "*.yaml")) + glob.glob(os.path.join(dataset_dir, "*.yml"))
-            # any YAML file starting with data e.g. data.yaml, dataset.yaml
-            yaml_data_files = [yp for yp in yaml_paths if os.path.basename(yp).startswith("data")]
-            yaml_path = yaml_data_files[0]
-            with open(yaml_path) as f:
-                data = yaml.safe_load(f)
-            if "names" in data:
-                if isinstance(data["names"], dict):
-                    return [data["names"][i] for i in sorted(data["names"].keys())]
-                return data["names"]
-            raise ValueError(f"Found {yaml_path} but it does not contain 'names' field.")
+        yaml_path = find_yolo_data_file(dataset_dir)
+        if yaml_path is not None and is_valid_yolo_dataset(dataset_dir):
+            return _extract_yolo_class_names(str(yaml_path))
+        if yaml_path is not None:
+            # A data file that is present but whose splits do not resolve is a different
+            # problem from having none, and listing the names checked for implied the latter.
+            raise FileNotFoundError(
+                f"Could not find class names in {dataset_dir}. Found the YOLO data file {yaml_path}, but its"
+                " training and validation splits could not both be resolved, and class discovery needs both."
+                " Enable debug logging to see each declaration that was rejected.",
+            )
         raise FileNotFoundError(
             f"Could not find class names in {dataset_dir}."
             " Checked for COCO (train/_annotations.coco.json) and YOLO (data.yaml, data.yml) styles.",
         )
 
     @staticmethod
-    def _detect_num_classes_for_training(dataset_dir: str) -> int:
+    def _detect_num_classes_for_training(
+        dataset_dir: str,
+        *,
+        use_grouppose_keypoints: bool = False,
+        coco_categories: list[dict[str, Any]] | None = None,
+    ) -> int:
         """Detect the class count using the same category basis as training labels.
 
-        For COCO-style datasets this counts all categories by ``id`` from ``train/_annotations.coco.json`` (matching the
-        remapping based on ``coco.cats`` used by the training datamodule). For YOLO-style datasets it falls back to
-        ``_load_classes``.
+        For COCO-style datasets this counts the categories of ``train/_annotations.coco.json`` that
+        :func:`~rfdetr.datasets.coco.filter_parent_categories` keeps, which is the same basis
+        :class:`~rfdetr.datasets.coco.CocoDetection` uses to build ``cat2label`` — unannotated grouping categories
+        consume neither a label index nor an output slot. In keypoint mode it instead counts the
+        inferred RF-DETR keypoint label slots. In legacy background-first schemas (e.g. ``[0, 17]``) slot ``0`` is
+        reserved for classes without keypoints; active-first schemas (e.g. ``[17]``) use normal 0-based indices. For
+        a packed ``dataset_file="webdataset"`` directory (keypoints unsupported there, so only reached when
+        *use_grouppose_keypoints* is false) it reads the train shard index instead of a raw annotation file, using
+        the same ``"remap"``/``"raw"`` convention :func:`~rfdetr.datasets.webdataset.load.build_webdataset` does.
+        For YOLO-style datasets it falls back to ``_load_classes``.
+
+        Args:
+            dataset_dir: Path to the dataset root directory.
+            use_grouppose_keypoints: Count keypoint label slots instead of detection categories.
+            coco_categories: An already-parsed :meth:`_filtered_coco_categories` result for *dataset_dir* (see
+                :meth:`_memoized_coco_categories`); ``None`` reads the annotation file here. Only consulted on the
+                COCO detection branch — the keypoint branch parses its own schema.
         """
         if is_valid_coco_dataset(dataset_dir):
-            coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
-            with open(coco_path, encoding="utf-8") as f:
-                anns = json.load(f)
-            categories = anns["categories"]
-            cat_by_id = {category["id"]: category for category in categories}
-            return len(cat_by_id)
+            if use_grouppose_keypoints:
+                coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
+                return len(infer_coco_keypoint_schema(coco_path).class_names)
+            if coco_categories is None:
+                coco_categories = RFDETR._filtered_coco_categories(dataset_dir)
+            return len({category["id"] for category in coco_categories})
+
+        if not use_grouppose_keypoints and (Path(dataset_dir) / index_name("train")).exists():
+            try:
+                train_index = read_shard_index(dataset_dir, "train")
+            except WebDatasetSplitUnavailableError:
+                pass
+            else:
+                if train_index.category_ids == "raw":
+                    return max((int(category["id"]) for category in train_index.categories), default=-1) + 1
+                return len(train_index.cat2label() or {})
 
         return len(RFDETR._load_classes(dataset_dir))
 
@@ -1140,36 +2775,64 @@ class RFDETR:
         Must be called before ``RFDETRModelModule`` is constructed so that weight loading inside the module uses the
         correct (dataset-derived) class count.
 
-        When the user did **not** explicitly override ``num_classes`` (or passed the class-config default),
-        ``model_config.num_classes`` and ``self.model.args.num_classes`` are updated to match the dataset.  When the
-        user *did* set a non-default value that differs from the dataset, the configured value is preserved and a
-        warning is emitted.
+        When the user did **not** explicitly set ``num_classes`` (it is left unset, e.g. inferred from a
+        checkpoint), ``model_config.num_classes`` and ``self.model.args.num_classes`` are updated to match the dataset.
+        When the user *did* set ``num_classes`` explicitly — to any value, including the class default — and it differs
+        from the dataset, the configured value is preserved and a warning is emitted.
 
         Failures from ``_detect_num_classes_for_training`` are caught and logged at DEBUG level so that training is
         never blocked by detection errors.
 
+        When ``model_config.use_grouppose_keypoints`` is True and
+        ``model_config.num_keypoints_per_class`` is shorter than the adjusted
+        ``num_classes``, the schema is zero-padded in-place so that
+        ``len(num_keypoints_per_class) == num_classes``.  Both ``model_config``
+        and ``model.args`` (if present) are updated.  Appended classes receive
+        zero keypoints and contribute no class-logit boost.
+
         Args:
             dataset_dir: Path to the training dataset root directory.
         """
+        if not hasattr(self, "_coco_categories_cache"):
+            self._coco_categories_cache = {}
         try:
-            dataset_num_classes = RFDETR._detect_num_classes_for_training(dataset_dir)
+            # The keypoint branch parses its own schema, so only the detection branch has a parse worth sharing
+            # with the start-of-run training_config.json write in train().
+            coco_categories = (
+                None
+                if self.model_config.use_grouppose_keypoints
+                else RFDETR._memoized_coco_categories(self._coco_categories_cache, dataset_dir)
+            )
+            dataset_num_classes = RFDETR._detect_num_classes_for_training(
+                dataset_dir,
+                use_grouppose_keypoints=self.model_config.use_grouppose_keypoints,
+                coco_categories=coco_categories,
+            )
         except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
             # Best-effort only; do not block training if detection fails.
             logger.debug("Could not auto-detect num_classes from dataset '%s': %s", dataset_dir, exc)
             return
+
+        # Hoist so both branches below can reference the schema without re-fetching.
+        keypoint_schema: list[int] = []
+        if self.model_config.use_grouppose_keypoints:
+            # Older configs may omit the schema; absence means no schema-based class-count expansion.
+            keypoint_schema = list(getattr(self.model_config, "num_keypoints_per_class", []) or [])
+            if keypoint_schema:
+                dataset_num_classes = max(dataset_num_classes, len(keypoint_schema))
 
         model_num_classes = self.model_config.num_classes
 
         if dataset_num_classes == model_num_classes:
             return
 
-        # Determine whether the user explicitly overrode num_classes to a non-default value.
-        # "num_classes" in model_fields_set is True when the field was explicitly set at
-        # construction time; comparing against the class default filters out cases where the
-        # user passed the default value explicitly (treat those like "not set").
-        user_set = "num_classes" in getattr(self.model_config, "model_fields_set", set())
-        default_nc = type(self.model_config).model_fields["num_classes"].default
-        user_overrode = user_set and model_num_classes != default_nc
+        # Determine whether the user explicitly set num_classes.  "num_classes" in
+        # model_fields_set is True only when the field was explicitly provided at construction
+        # (or assigned afterwards); an explicit value is honored regardless of whether it equals
+        # the class default, so an intentional num_classes is never silently overridden by the
+        # dataset count.  A checkpoint-derived num_classes is cleared from model_fields_set by
+        # ``from_checkpoint`` (see PR #1106 / issue #1092), so it correctly counts as "not set" here.
+        user_overrode = "num_classes" in getattr(self.model_config, "model_fields_set", set())
 
         if not user_overrode:
             logger.debug(
@@ -1184,6 +2847,15 @@ class RFDETR:
             model_args = getattr(self.model, "args", None)
             if model_args is not None:
                 model_args.num_classes = dataset_num_classes
+            # Pad keypoint schema with zeros so len(num_keypoints_per_class) == num_classes.
+            # Without this, _aggregate_keypoint_class_logits emits a one-time mismatch
+            # warning per model instance and the config state is inconsistent with the
+            # detection head width.
+            if keypoint_schema and len(keypoint_schema) < dataset_num_classes:
+                padded_schema = keypoint_schema + [0] * (dataset_num_classes - len(keypoint_schema))
+                self.model_config.num_keypoints_per_class = padded_schema
+                if model_args is not None:
+                    model_args.num_keypoints_per_class = padded_schema
         else:
             logger.warning(
                 "Dataset '%s' has %d classes but model was initialized with num_classes=%d. "
@@ -1195,21 +2867,207 @@ class RFDETR:
                 model_num_classes,
                 dataset_num_classes,
             )
+            # Also pad schema when the user-configured num_classes exceeds the schema length,
+            # to prevent the _aggregate_keypoint_class_logits mismatch warning in this path too.
+            if keypoint_schema and len(keypoint_schema) < model_num_classes:
+                padded_schema = keypoint_schema + [0] * (model_num_classes - len(keypoint_schema))
+                self.model_config.num_keypoints_per_class = padded_schema
+                model_args = getattr(self.model, "args", None)
+                if model_args is not None:
+                    model_args.num_keypoints_per_class = padded_schema
 
-    def get_train_config(self, **kwargs) -> TrainConfig:
-        """Retrieve the configuration parameters that will be used for training."""
-        return self._train_config_class(**kwargs)
+    @staticmethod
+    def _roboflow_keypoint_annotation_path(dataset_dir: str) -> Path | None:
+        """Return the Roboflow COCO train annotation path when it exists.
 
-    def get_model(self, config: ModelConfig) -> ModelContext:
+        Args:
+            dataset_dir: Path to the Roboflow dataset root.
+
+        Returns:
+            Train split annotation path, or ``None`` when the dataset is not Roboflow COCO style.
+
+        Raises:
+            This helper does not raise.
+
+        Example:
+            >>> RFDETR._roboflow_keypoint_annotation_path("/missing") is None
+            True
+        """
+        if not is_valid_coco_dataset(dataset_dir):
+            return None
+        annotation_path = Path(dataset_dir) / "train" / "_annotations.coco.json"
+        return annotation_path if annotation_path.exists() else None
+
+    @staticmethod
+    def _coco_keypoint_annotation_path(dataset_dir: str) -> Path | None:
+        """Return the native COCO train keypoint annotation path when it exists.
+
+        Args:
+            dataset_dir: Path to the COCO dataset root.
+
+        Returns:
+            Path to ``annotations/person_keypoints_train2017.json``, or ``None`` when it is absent.
+
+        Raises:
+            This helper does not raise.
+
+        Example:
+            >>> RFDETR._coco_keypoint_annotation_path("/missing") is None
+            True
+        """
+        annotation_path = Path(dataset_dir) / "annotations" / "person_keypoints_train2017.json"
+        return annotation_path if annotation_path.exists() else None
+
+    @staticmethod
+    def _flip_idx_to_pairs(flip_idx: list[int]) -> list[int]:
+        """Convert Ultralytics ``flip_idx`` permutation metadata to flat swap pairs."""
+        pairs: list[int] = []
+        seen: set[int] = set()
+        for idx, mirror_idx in enumerate(flip_idx):
+            if idx in seen or mirror_idx in seen or idx == mirror_idx:
+                seen.add(idx)
+                continue
+            if 0 <= mirror_idx < len(flip_idx) and flip_idx[mirror_idx] == idx:
+                pairs.extend([idx, mirror_idx])
+                seen.update({idx, mirror_idx})
+        return pairs
+
+    def _align_keypoint_schema_from_dataset(self, config: TrainConfig) -> None:
+        """Infer or validate keypoint schema from COCO, Roboflow COCO, or YOLO pose metadata.
+
+        Args:
+            config: Training configuration containing dataset location and format.
+
+        Returns:
+            ``None``. The model config is updated in-place when dataset metadata is available.
+
+        Raises:
+            This method does not raise for missing or malformed metadata; later dataset construction still validates
+            keypoint-mode requirements.
+
+        Example:
+            >>> from rfdetr.config import RFDETRKeypointPreviewConfig, TrainConfig
+            >>> model = object.__new__(RFDETR)
+            >>> model.model_config = RFDETRKeypointPreviewConfig(pretrain_weights=None)
+            >>> model.model = type("Context", (), {"args": None})()
+            >>> model._align_keypoint_schema_from_dataset(TrainConfig(dataset_dir="/missing", tensorboard=False))
+        """
+
+        if not self.model_config.use_grouppose_keypoints:
+            return
+        dataset_file = getattr(config, "dataset_file", None)
+        if dataset_file not in ("coco", "roboflow", "yolo"):
+            return
+        dataset_dir = getattr(config, "dataset_dir", None)
+        if not dataset_dir:
+            return
+
+        if not hasattr(self, "_keypoint_schema_cache"):
+            self._keypoint_schema_cache: dict[Any, Any] = {}
+
+        cache_key = (dataset_file, dataset_dir)
+        if cache_key in self._keypoint_schema_cache:
+            inferred, source_path, source_kind = self._keypoint_schema_cache[cache_key]
+        else:
+            try:
+                if dataset_file == "coco":
+                    annotation_path = RFDETR._coco_keypoint_annotation_path(dataset_dir)
+                    if annotation_path is None:
+                        return
+                    source_path = annotation_path
+                    source_kind = "COCO"
+                    inferred = infer_coco_keypoint_schema(annotation_path)
+                elif dataset_file == "roboflow":
+                    annotation_path = RFDETR._roboflow_keypoint_annotation_path(dataset_dir)
+                    if annotation_path is not None:
+                        source_path = annotation_path
+                        source_kind = "Roboflow COCO"
+                        inferred = infer_coco_keypoint_schema(annotation_path)
+                    else:
+                        yolo_data_file = find_yolo_data_file(dataset_dir)
+                        if yolo_data_file is None:
+                            return
+                        source_path = yolo_data_file
+                        source_kind = "YOLO pose"
+                        inferred = infer_yolo_keypoint_schema(yolo_data_file)
+                else:
+                    yolo_data_file = find_yolo_data_file(dataset_dir)
+                    if yolo_data_file is None:
+                        return
+                    source_path = yolo_data_file
+                    source_kind = "YOLO pose"
+                    inferred = infer_yolo_keypoint_schema(yolo_data_file)
+            except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+                logger.info("Could not infer keypoint schema from dataset '%s': %s", dataset_dir, exc)
+                return
+            self._keypoint_schema_cache[cache_key] = (inferred, source_path, source_kind)
+
+        inferred_schema = inferred.num_keypoints_per_class
+        if not getattr(config, "keypoint_flip_pairs", []):
+            config.keypoint_flip_pairs = list(inferred.keypoint_flip_pairs)
+        # Older configs may omit the schema; absence lets dataset inference populate it.
+        current_schema = list(getattr(self.model_config, "num_keypoints_per_class", []) or [])
+        user_set_schema = "num_keypoints_per_class" in getattr(self.model_config, "model_fields_set", set())
+
+        if user_set_schema and active_keypoint_counts(current_schema) == active_keypoint_counts(inferred_schema):
+            return
+
+        if current_schema != inferred_schema:
+            if user_set_schema:
+                logger.warning(
+                    "Configured num_keypoints_per_class=%s does not match dataset keypoint metadata %s from '%s'. "
+                    "Using dataset metadata as the source of truth.",
+                    current_schema,
+                    inferred_schema,
+                    source_path,
+                )
+            else:
+                if _is_bg_first_schema(current_schema) and inferred_schema and not _is_bg_first_schema(inferred_schema):
+                    warnings.warn(
+                        f"Loaded checkpoint uses a legacy background-first keypoint schema "
+                        f"num_keypoints_per_class={current_schema!r}, but the dataset infers "
+                        f"active-first {inferred_schema!r}. Training will shift person from slot 1 "
+                        f"to slot 0; checkpoint head weights are now misaligned. "
+                        f"Pass num_keypoints_per_class={current_schema!r} to the model constructor "
+                        f"to keep the legacy schema.",
+                        UserWarning,
+                        stacklevel=2,
+                    )
+                logger.info(
+                    "Inferred num_keypoints_per_class=%s from %s keypoint metadata at '%s'.",
+                    inferred_schema,
+                    source_kind,
+                    source_path,
+                )
+            self.model_config.num_keypoints_per_class = inferred_schema
+            model_args = getattr(self.model, "args", None)
+            if model_args is not None:
+                model_args.num_keypoints_per_class = inferred_schema
+
+    def get_train_config(self, **kwargs: Any) -> TrainConfig:
+        """Retrieve the configuration parameters that will be used for training.
+
+        The config class follows the model heads: a model built with ``use_grouppose_keypoints=True`` trains with
+        :class:`~rfdetr.config.KeypointTrainConfig`, or :class:`~rfdetr.config.SegmentationKeypointTrainConfig` when
+        it also has a segmentation head, whatever its variant class declares.
+        """
+        # Test shims may omit model_config; the variant's declared class then applies unchanged.
+        model_config = getattr(self, "model_config", None)
+        return _resolve_train_config_class(self._train_config_class, model_config)(**kwargs)
+
+    def get_model(self, config: ModelConfig, *, trust_checkpoint: bool = False) -> ModelContext:
         """Retrieve a model context from the provided architecture configuration.
 
         Args:
             config: Architecture configuration.
+            trust_checkpoint: Forwarded to :func:`~rfdetr.inference._build_model_context` — set
+                ``True`` only when ``config.pretrain_weights`` is a checkpoint the caller
+                explicitly trusts (mirrors ``RFDETR.from_checkpoint(..., trust_checkpoint=True)``).
 
         Returns:
             ModelContext with model, postprocess, device, resolution, args, and class_names attributes.
         """
-        return _build_model_context(config)
+        return _build_model_context(config, trust_checkpoint=trust_checkpoint)
 
     @property
     def class_names(self) -> list[str]:
@@ -1224,278 +3082,294 @@ class RFDETR:
 
         return list(COCO_CLASS_NAMES)
 
-    def predict(
-        self,
-        images: str | Image.Image | np.ndarray | torch.Tensor | list[str | np.ndarray | Image.Image | torch.Tensor],
-        threshold: float = 0.5,
-        shape: tuple[int, int] | None = None,
-        patch_size: int | None = None,
-        include_source_image: bool = True,
-        **kwargs: Any,
-    ) -> sv.Detections | list[sv.Detections]:
-        """Performs object detection on the input images and returns bounding box predictions.
+    def _ensure_eval_mode_for_unoptimized_inference(self) -> None:
+        """Put the underlying module in eval mode before unoptimized inference.
 
-        This method accepts a single image or a list of images in various formats (file path, image url, PIL Image,
-        NumPy array, or torch.Tensor). The images should be in RGB channel order. If a torch.Tensor is provided, it must
-        already be normalized to values in the [0, 1] range and have the shape (C, H, W).
+        Inference must not run with dropout / batch-norm in training mode. The registered module tree is checked on
+        every call, but ``eval()`` is only applied when at least one module is in training mode. This covers both a
+        directly toggled submodule and ``train()`` reassigning ``self.model.model`` to the module returned by PyTorch
+        Lightning (see ``train()``). The warning that the model is not optimized is emitted at most once, but gating the
+        mode check behind that once-only warning would let a later ``predict()`` silently run with dropout active, so
+        the two are independent.
 
-        Args:
-            images:
-                A single image or a list of images to process. Images can be provided
-                as file paths, PIL Images, NumPy arrays, or torch.Tensors.
-            threshold:
-                The minimum confidence score needed to consider a detected bounding box valid.
-            shape:
-                Optional ``(height, width)`` tuple to resize images to before inference. When provided, overrides the
-                model's default inference resolution. The tuple should match the resolution used when exporting the
-                model (typically a square shape). Both dimensions must be positive integers divisible by ``patch_size *
-                num_windows``. Defaults to ``(model.resolution, model.resolution)`` when not set.
-            patch_size:
-                Backbone patch size used for shape divisibility validation. Defaults to ``model_config.patch_size``
-                (typically 14 for large models, 16 for smaller ones). Divisibility is checked against ``patch_size *
-                num_windows``.
-            include_source_image:
-                Whether to attach the original image as ``source_image`` in ``detections.metadata``. Defaults to
-                ``True``.  Set to ``False`` to reduce memory use when source images are not needed.
-            **kwargs:
-                Additional keyword arguments.
-
-        Returns:
-            A single or multiple Detections objects, each containing bounding box coordinates, confidence scores, and
-            class IDs. The ``data`` dict of each :class:`~supervision.Detections` object contains ``class_name`` as a
-            string array corresponding to each detection and ``source_shape`` as an ``int64`` array of shape ``(N, 2)``
-            with ``[height, width]`` rows. ``source_shape`` is stored per detection so supervision indexing works
-            correctly. It was previously a ``(height, width)`` Python ``tuple``; callers using ``isinstance(v, tuple)``
-            or ``v == (H, W)`` must be updated. The ``metadata`` dict contains ``source_image`` as the original
-            ``uint8`` image array of shape ``(H, W, 3)`` when ``include_source_image=True``.
-
-        Note:
-            ``source_image`` moved from ``detections.data`` to ``detections.metadata``. Update callers reading
-            ``detections.data["source_image"]`` to use ``detections.metadata["source_image"]``.
-
-        Note:
-            ``class_name`` mapping uses one of two modes depending on the checkpoint. For pretrained COCO checkpoints
-            (detected when ``model.args.num_classes > len(class_names)`` and ``class_names`` matches
-            ``COCO_CLASS_NAMES``), raw COCO category IDs (1–90, sparse) are looked up by category ID rather than by
-            position — so ``class_id=18`` yields ``"dog"``, not ``class_names[18]``. For fine-tuned models, ``class_id``
-            is a 0-based index into ``class_names``.
-
-        Raises:
-            ValueError: If ``shape`` cannot be unpacked as a two-element sequence,
-                if either dimension does not support the ``__index__`` protocol (e.g. ``float``) or is a ``bool``, if
-                either dimension is zero or negative, if either dimension is not divisible by ``patch_size *
-                num_windows``, or if ``patch_size`` is not a positive integer.
+        When ``_is_optimized_for_inference`` is ``True``, the method returns immediately — the compiled
+        ``inference_model`` snapshot is already in eval mode and ``self.model.model`` is not used for inference.
         """
-        import supervision as sv
-
-        _ensure_model_on_device(self.model)
-
-        patch_size = _resolve_patch_size(patch_size, self.model_config, "predict")
-        num_windows = getattr(self.model_config, "num_windows", 1)
-        if isinstance(num_windows, bool) or not isinstance(num_windows, int) or num_windows <= 0:
-            raise ValueError(f"model_config.num_windows must be a positive integer, got {num_windows!r}")
-        block_size = patch_size * num_windows
-
-        if shape is None:
-            default_res = as_pair(self.model.resolution)
-            if default_res[0] % block_size or default_res[1] % block_size:
-                raise ValueError(
-                    f"Model's default resolution ({default_res}) is not divisible by "
-                    f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
-                    f"Provide an explicit shape divisible by {block_size}.",
-                )
-        else:
-            shape = _validate_shape_dims(shape, block_size, patch_size, num_windows)
-
-        if not self._is_optimized_for_inference and not self._has_warned_about_not_being_optimized_for_inference:
+        if self._is_optimized_for_inference:
+            return
+        if not self._has_warned_about_not_being_optimized_for_inference:
             logger.warning(
                 "Model is not optimized for inference. Latency may be higher than expected."
-                " You can optimize the model for inference by calling model.optimize_for_inference().",
+                " Create predictor = native_model.inference(...) and use predictor.predict(...)."
+                " For a checkpoint, first load native_model = RFDETR.from_checkpoint(...).",
             )
             self._has_warned_about_not_being_optimized_for_inference = True
+        # self.model.model is only cleared when optimized for inference (guarded by the early return above).
+        model = self.model.model
+        assert model is not None
+        # ``eval()`` recursively reassigns ``training`` through ``nn.Module.__setattr__`` on every node. Reading the
+        # existing flags still visits the tree when it is already in eval mode, but avoids those repeated assignments.
+        # If the root is in training mode, ``any`` stops on its first item before ``eval()`` performs the required walk.
+        if any(module.training for module in model.modules()):
+            model.eval()
 
-            self.model.model.eval()
+    def _runtime_info(self) -> dict[str, Any]:
+        """Return native runtime policy and input constraints without preparing the model."""
+        # _prediction_context moves the model to its device; reading runtime_info must not.
+        config = self.model_config
+        batch_size = self._optimized_batch_size if self._optimized_has_been_compiled else None
+        spatial_size = (
+            as_pair(self._optimized_resolution)
+            if self._is_optimized_for_inference and self._optimized_resolution is not None
+            else (None, None)
+        )
+        return {
+            "backend": "pytorch",
+            "device": str(self.model.device),
+            "task": _task_of(config),
+            "input_shape": (batch_size, self._input_channels(), *spatial_size),
+            "default_shape": as_pair(self.model.resolution),
+            "batch_size": batch_size,
+            "max_batch_size": None,
+        }
 
-        if not isinstance(images, list):
-            images = [images]
-
-        orig_sizes = []
-        processed_images = []
-        source_images = [] if include_source_image else None
-
-        for img in images:
-            if isinstance(img, str):
-                if img.startswith("http"):
-                    img = requests.get(img, stream=True).raw
-                img = Image.open(img)
-
-            if not isinstance(img, torch.Tensor):
-                if include_source_image:
-                    src = np.array(img)
-                    if src.dtype != np.uint8:
-                        src = (src * 255).clip(0, 255).astype(np.uint8)
-                    source_images.append(src)
-                img = F.to_tensor(img)
-            elif include_source_image:
-                source_images.append((img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
-
-            if (img > 1).any():
-                raise ValueError(
-                    "Image has pixel values above 1. Please ensure the image is normalized (scaled to [0, 1]).",
-                )
-            if (img < 0).any():
-                raise ValueError(
-                    "Image has pixel values below 0. Please ensure the image is normalized (scaled to [0, 1]).",
-                )
-            if img.shape[0] != self._input_channels():
-                raise ValueError(
-                    "Invalid tensor image shape. Tensor inputs to `predict()` must be in (C, H, W) format "
-                    f"with C matching the model configuration ({self._input_channels()} channels). "
-                    f"Received tensor with shape {tuple(img.shape)}."
-                )
-            img_tensor = img
-
-            h, w = img_tensor.shape[1:]
-            orig_sizes.append((h, w))
-
-            img_tensor = img_tensor.to(self.model.device)
-            resize_to = list(shape) if shape is not None else list(as_pair(self.model.resolution))
-            img_tensor = F.resize(img_tensor, resize_to)
-            img_tensor = F.normalize(img_tensor, self.means, self.stds)
-
-            processed_images.append(img_tensor)
-
-        batch_tensor = torch.stack(processed_images)
-
-        if self._is_optimized_for_inference:
-            optimized_hw = as_pair(self._optimized_resolution)
-            if optimized_hw != (batch_tensor.shape[2], batch_tensor.shape[3]):
-                # this could happen if someone manually changes self.model.resolution after optimizing the model,
-                # or if predict(shape=...) is used with a shape that doesn't match the compiled resolution.
-                raise ValueError(
-                    f"Resolution mismatch. "
-                    f"Model was optimized for resolution {optimized_hw[0]}x{optimized_hw[1]}, "
-                    f"but got {batch_tensor.shape[2]}x{batch_tensor.shape[3]}."
-                    " You can explicitly remove the optimized model by calling model.remove_optimized_model().",
-                )
-            if self._optimized_has_been_compiled:
-                if self._optimized_batch_size != batch_tensor.shape[0]:
-                    raise ValueError(
-                        f"Batch size mismatch. "
-                        f"Optimized model was compiled for batch size {self._optimized_batch_size}, "
-                        f"but got {batch_tensor.shape[0]}."
-                        " You can explicitly remove the optimized model by calling model.remove_optimized_model()."
-                        " Alternatively, you can recompile the optimized model for a different batch size"
-                        " by calling model.optimize_for_inference(batch_size=<new_batch_size>).",
-                    )
-
-        with torch.no_grad():
-            if self._is_optimized_for_inference:
-                predictions = self.model.inference_model(batch_tensor.to(dtype=self._optimized_dtype))
-            else:
-                predictions = self.model.model(batch_tensor)
-            if isinstance(predictions, tuple):
-                return_predictions = {
-                    "pred_logits": predictions[1],
-                    "pred_boxes": predictions[0],
-                }
-                if len(predictions) == 3:
-                    return_predictions["pred_masks"] = predictions[2]
-                predictions = return_predictions
-            target_sizes = torch.tensor(orig_sizes, device=self.model.device)
-            results = self.model.postprocess(predictions, target_sizes=target_sizes)
-
-        model_class_names = self.class_names
-        n = len(model_class_names)
-        # Pretrained COCO models use COCO category IDs (1–90, with gaps) as class_ids,
-        # while class_names is a flat 0-indexed list of 80 entries. Detected when
-        # args.num_classes > len(class_names) AND class_names == COCO_CLASS_NAMES.
-        # Fine-tuned models remap category IDs to 0-based contiguous indices, so
-        # class_id i maps directly to class_names[i].
-        _model_args = getattr(self.model, "args", None)
-        if _model_args is None and model_class_names == list(COCO_CLASS_NAMES):
+    @_ensure_model_on_device
+    def _prediction_context(self) -> PredictionContext:
+        """Read the live native model's prediction rules for one call."""
+        labels = prediction_labels(self)
+        if getattr(self.model, "args", None) is None and labels.class_names == list(COCO_CLASS_NAMES):
             logger.warning_once(
                 "predict(): model has no 'args' attribute — COCO sparse-ID mapping cannot activate; "
                 "class_ids are treated as 0-indexed (may be wrong for pretrained COCO checkpoints)"
             )
-        num_logit_slots: int = getattr(_model_args, "num_classes", n)
-        _is_coco_pretrained = num_logit_slots > n and model_class_names == list(COCO_CLASS_NAMES)
-        if _is_coco_pretrained:
-            _class_id_to_name: dict[int, str] = {
-                coco_id: model_class_names[i] for i, coco_id in enumerate(COCO_CLASSES) if i < n
-            }
+        return PredictionContext(
+            config=self._prediction_config(),
+            device=self.model.device,
+            default_shape=as_pair(self.model.resolution),
+            means=self.means,
+            stds=self.stds,
+            class_names=labels.class_names,
+            class_id_to_name=labels.class_id_to_name,
+            num_classes=labels.num_classes,
+            num_keypoints_per_class=labels.num_keypoints_per_class,
+            postprocess=self.model.postprocess,
+            run=self._run_inference_batch,
+            prepare=self._ensure_eval_mode_for_unoptimized_inference,
+            runtime_info={"backend": "pytorch", "device": str(self.model.device)},
+            # A compiled snapshot runs only the batch size it was compiled for; eager models take any.
+            batch_size=self._optimized_batch_size if self._optimized_has_been_compiled else None,
+        )
+
+    def _run_inference_batch(self, batch_tensor: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Execute the current eager or optimized native model."""
+        if self._is_optimized_for_inference:
+            optimized_hw = as_pair(cast("int | tuple[int, int]", self._optimized_resolution))
+            if optimized_hw != (batch_tensor.shape[2], batch_tensor.shape[3]):
+                # this could happen if someone manually changes self.model.resolution after optimizing the model,
+                # or if predict(shape=...) is used with a shape that doesn't match the compiled resolution.
+                _restore_hint = (
+                    " Use native_model.predict(..., shape=...) on the source model for a different resolution,"
+                    " or create a new predictor from a source configured for that resolution."
+                )
+                raise ValueError(
+                    f"Resolution mismatch. "
+                    f"Model was optimized for resolution {optimized_hw[0]}x{optimized_hw[1]}, "
+                    f"but got {batch_tensor.shape[2]}x{batch_tensor.shape[3]}." + _restore_hint,
+                )
+            if self._optimized_has_been_compiled:
+                if self._optimized_batch_size != batch_tensor.shape[0]:
+                    _restore_hint = (
+                        " Create predictor = native_model.inference(batch_size=<new_batch_size>)"
+                        " and use predictor.predict(...), or use native_model.predict(...) for flexible batches."
+                    )
+                    raise ValueError(
+                        f"Batch size mismatch. "
+                        f"Optimized model was compiled for batch size {self._optimized_batch_size}, "
+                        f"but got {batch_tensor.shape[0]}." + _restore_hint,
+                    )
+
+        if self._is_optimized_for_inference:
+            inference_model = self.model.inference_model
+            assert inference_model is not None, "inference_model is set whenever _is_optimized_for_inference is True."
+            predictions = inference_model(batch_tensor.to(dtype=self._optimized_dtype))
         else:
-            _class_id_to_name = dict(enumerate(model_class_names))
-        detections_list = []
-        for i, result in enumerate(results):
-            scores = result["scores"]
-            labels = result["labels"]
-            boxes = result["boxes"]
+            model = self.model.model
+            assert model is not None, "self.model.model is only cleared when optimized for inference."
+            predictions = model(batch_tensor)
+        if isinstance(predictions, tuple):
+            return_predictions = {
+                "pred_logits": predictions[1],
+                "pred_boxes": predictions[0],
+            }
+            if len(predictions) == 4:
+                return_predictions["pred_masks"] = predictions[2]
+                return_predictions["pred_keypoints"] = predictions[3]
+            elif len(predictions) == 3:
+                # Distinguish optional keypoint vs mask tuple output for legacy compiled/export shims.
+                if getattr(getattr(self.model, "args", None), "use_grouppose_keypoints", False):
+                    return_predictions["pred_keypoints"] = predictions[2]
+                else:
+                    return_predictions["pred_masks"] = predictions[2]
+            predictions = return_predictions
+        return cast(dict[str, torch.Tensor], predictions)
 
-            keep = scores > threshold
-            scores = scores[keep]
-            labels = labels[keep]
-            boxes = boxes[keep]
+    def predict(
+        self,
+        images: _ImageInput | Iterable[_ImageInput],
+        threshold: _ThresholdInput = 0.5,
+        shape: tuple[int, int] | None = None,
+        patch_size: int | None = None,
+        include_source_image: bool = True,
+        *,
+        antialias: bool = False,
+        **kwargs: Any,
+    ) -> _PredictionOutput:
+        """Performs model inference on the input images.
 
-            if "masks" in result:
-                masks = result["masks"]
-                masks = masks[keep]
+        This method accepts a single image or an iterable of images (string or path-like file path, image URL string,
+        PIL Image, NumPy array, or torch.Tensor) and runs them as one batch. The images should be in RGB channel order.
+        A torch.Tensor must already be normalized to values in the [0, 1] range and have the shape (C, H, W); a
+        (B, C, H, W) tensor is split into B images of one batch. Videos, directories, globs, manifests, webcams and
+        streams are not images: predict them through ``RFDETRInference(model).predict(...)``.
 
-                detections = sv.Detections(
-                    xyxy=boxes.float().cpu().numpy(),
-                    confidence=scores.float().cpu().numpy(),
-                    class_id=labels.cpu().numpy(),
-                    mask=masks.squeeze(1).cpu().numpy(),
-                )
-            else:
-                detections = sv.Detections(
-                    xyxy=boxes.float().cpu().numpy(),
-                    confidence=scores.float().cpu().numpy(),
-                    class_id=labels.cpu().numpy(),
-                )
+        Args:
+            images:
+                A single image or an iterable of images to process. Images can be provided as string or path-like
+                file paths, URL strings, PIL Images, NumPy arrays, or torch.Tensors. Iterables other than lists and
+                tuples are read into a list first. PIL and file inputs convert to grayscale for one-channel models and
+                RGB for three-channel models.
+                HTTP(S) URL strings are downloaded with ``requests`` using a 30-second connect and read timeout,
+                which does not bound the total download time. Redirects are followed, and the whole response body is
+                read into memory with no size limit or host restriction. Pass only URLs you trust; for untrusted
+                URLs, download and validate the image yourself and pass the decoded image instead.
+            threshold:
+                The confidence score a detection must exceed to be kept. A single float applies to every class. A
+                :class:`~rfdetr.ClassThresholds`, such as ``ClassThresholds({"person": 0.35}, default=0.5)``, applies
+                each class's own threshold to its detections, so that a class the model finds less reliably can be
+                held to a different bar. It leaves out every detection that belongs to no entry of ``class_names``:
+                the no-object slot of a fine-tuned model, the background slot of a legacy keypoint checkpoint, and the
+                unused category IDs of a pretrained COCO model. A threshold of ``float("inf")`` drops every detection of
+                that class.
+            shape:
+                Resize to ``(height, width)``; defaults to the model resolution. Both dimensions must be positive
+                integers divisible by ``patch_size * num_windows``. Use the model's export resolution when applicable.
+            patch_size:
+                Backbone patch size for shape validation. Defaults to ``model_config.patch_size``.
+            include_source_image:
+                Whether to attach the original image to the returned prediction. Detection and segmentation outputs use
+                ``detections.metadata["source_image"]``. Keypoint outputs use per-object
+                ``key_points.data["source_image"]`` because Supervision ``KeyPoints`` currently has no collection-level
+                metadata field. Defaults to ``True``. Set to ``False`` to reduce memory use when source images are not
+                needed.
+            antialias:
+                Whether to use antialiasing during the inference resize. Match it to the resize the checkpoint was
+                trained with. Keep this ``False`` for checkpoints trained with the antialias-free Albumentations
+                pipeline, which is what the default CPU augmentation backend uses when ``rfdetr[augment]`` is
+                installed. Set it to ``True`` for checkpoints trained with torchvision resizing: the Kornia/GPU
+                augmentation backend, the CPU backend without ``rfdetr[augment]``, older RF-DETR releases, or
+                antialiased platform preprocessing. Whether ``rfdetr[augment]`` was installed at training time
+                therefore decides which setting a default-trained checkpoint expects.
+                ``RFDETRInference`` uses the artifact metadata's ``resize_antialias`` by default for exported
+                models; callers can override it with an explicit ``antialias`` argument. The lower-level
+                ``rfdetr.export`` runtime preprocessing helpers always resize with ``antialias=False``.
+                Defaults to ``False`` to preserve the existing inference behavior.
+            **kwargs:
+                Unknown keyword arguments are ignored with a FutureWarning. Passing them is deprecated since
+                v1.12.0 and will raise TypeError in v2.0.0. The source options of
+                :meth:`RFDETRInference.predict` (``stream``, ``batch``, ``vid_stride``, ``stream_buffer``) raise
+                ``TypeError`` now.
 
-            if include_source_image:
-                detections.metadata["source_image"] = source_images[i]
-            # Carry the keypoint head's output through to the caller.
-            # postprocess emits result["keypoints"] as [num_select, K, 3]
-            # (x, y absolute; visibility sigmoid) for keypoint models.
-            if "keypoints" in result:
-                detections.data["keypoints"] = (
-                    result["keypoints"][keep].cpu().numpy())
-            detections.data["source_shape"] = np.tile(np.array(orig_sizes[i], dtype=np.int64), (len(detections), 1))
+        Returns:
+            One result for a single image, or a list with one result per image for an iterable or a BCHW tensor.
+            Detection and segmentation return :class:`~supervision.Detections`; keypoints return
+            :class:`~supervision.KeyPoints` with ``xy`` coordinates.
+            ``key_points.detection_confidence`` is the per-object score used by ``threshold``. For keypoint models this
+            is the postprocessed detection score and, by default, includes normalized keypoint uncertainty fusion
+            controlled by ``model_config.postprocess_trace_alpha``. ``key_points.keypoint_confidence`` is separate: it
+            is a ``(num_detections, num_keypoints)`` array of per-keypoint findability scores decoded from the keypoint
+            head, not a repeated copy of the detection score. When RF-DETR emits keypoint precision parameters,
+            ``key_points.data["covariance"]`` stores per-keypoint pixel-space covariance matrices with shape
+            ``(num_detections, num_keypoints, 2, 2)``. ``key_points.data["xyxy"]`` stores the corresponding detection
+            boxes as a ``(num_detections, 4)`` array in the same row order as ``key_points.xy`` because Supervision
+            ``KeyPoints`` does not have a native bounding-box field. The ``data`` dict also contains ``class_name`` and
+            ``source_shape`` as per-object arrays. When ``include_source_image=True`` for keypoint models,
+            ``source_image`` is stored as per-object data until Supervision exposes collection-level metadata for
+            ``KeyPoints``. A model with both a segmentation head and a keypoint head returns
+            :class:`~supervision.Detections` with ``mask`` set, and ``detections.data["keypoints"]`` as a
+            ``(num_detections, num_keypoints, 3)`` array of pixel ``x``, ``y`` and per-keypoint confidence.
 
-            # Attach class names so callers can map class_id → name without a
-            # separate lookup. Always set data["class_name"] for a consistent interface.
-            #
-            # For fine-tuned models, logit index num_logit_slots is the no-object slot —
-            # map it to "__background__" without warning. For COCO-pretrained models,
-            # background is implicit (filtered by threshold); class ID 90 is "toothbrush".
-            # IDs not in _class_id_to_name are genuinely unexpected and produce an empty
-            # string with a one-time warning.
-            class_ids = detections.class_id if detections.class_id is not None else np.array([], dtype=int)
-            truly_oob = [cid for cid in class_ids if cid not in _class_id_to_name and cid != num_logit_slots]
-            if truly_oob:
-                logger.warning_once(
-                    "predict() encountered unmapped class_id(s): %s — mapping to empty string",
-                    truly_oob[:5],
-                )
-            if _is_coco_pretrained:
-                class_names = [_class_id_to_name.get(cid, "") for cid in class_ids]
-            else:
-                class_names = [
-                    "__background__" if cid == num_logit_slots else _class_id_to_name.get(cid, "") for cid in class_ids
-                ]
-            detections.data["class_name"] = np.array(class_names, dtype=object)
+        Note:
+            For ``Detections`` outputs, ``source_image`` moved from ``detections.data`` to ``detections.metadata``.
+            Update detection callers reading ``detections.data["source_image"]`` to use
+            ``detections.metadata["source_image"]``.
 
-            detections_list.append(detections)
+        Note:
+            ``class_name`` mapping uses one of three modes depending on the checkpoint. For pretrained COCO checkpoints
+            (detected when ``model.args.num_classes > len(class_names)`` and ``class_names`` matches
+            ``COCO_CLASS_NAMES``), raw COCO category IDs (1–90, sparse) are looked up by category ID rather than by
+            position — so ``class_id=18`` yields ``"dog"``, not ``class_names[18]``. For fine-tuned detection and
+            segmentation models and active-first keypoint models, ``class_id`` is a 0-based index into
+            ``class_names``. In the one-class preview keypoint setup, that means ``class_id=0`` is the foreground
+            class and ``class_id=1`` is ``"__background__"``.
+            Legacy keypoint checkpoints with ``args.num_keypoints_per_class[0] == 0`` use a background-first layout:
+            slot 0 maps to ``"__background__"`` and foreground slots map to ``class_names`` in order.
 
-        return detections_list if len(detections_list) > 1 else detections_list[0]
+        Note:
+            A CPU tensor image is pinned before its transfer to a CUDA-device model, and that transfer is
+            non-blocking; passing a tensor already on the model's accelerator skips this image transfer entirely.
+            But with the default ``include_source_image=True``, capturing ``source_image`` from that same tensor
+            still does its own separate, blocking ``.cpu()`` call earlier in the loop — so an already-CUDA tensor
+            input alone does not make the call fully round-trip-free. Pass ``include_source_image=False`` to avoid
+            that copy as well. The exception is MPS with ``antialias=True`` on torch < 2.7, which has no MPS kernel
+            for antialiased resize: there the whole preprocessing path, including an MPS-resident tensor input, runs
+            on the CPU and the resized batch is transferred to the device once.
+
+            Tensor and non-uint8 NumPy range checks and every input's shape check are evaluated before inference.
+            PIL images, natively decoded local files and uint8 NumPy images skip a redundant range scan because
+            their byte-to-float conversion guarantees values in ``[0, 1]``. Any resulting ``ValueError`` is raised
+            only after all inputs have been inspected, so valid-shaped images later in a multi-image call still
+            have their conversion and transfer queued before an earlier validation failure raises.
+
+        Raises:
+            TypeError: If a source option of :meth:`RFDETRInference.predict` is passed, or if ``threshold`` is neither a
+                number nor a sequence of numbers, such as a ``dict`` keyed by class name.
+            ValueError: If ``shape`` cannot be unpacked as a two-element sequence,
+                if either dimension does not support the ``__index__`` protocol (e.g. ``float``) or is a ``bool``, if
+                either dimension is zero or negative, if either dimension is not divisible by ``patch_size *
+                num_windows``, if ``patch_size`` is not a positive integer, or if ``threshold`` is a sequence that is
+                not one-dimensional, whose length differs from ``len(class_names)``, or that holds a NaN.
+
+        Examples:
+            Skipped because this example requires pretrained weights and a local image file.
+
+            >>> from rfdetr import RFDETRSmall  # doctest: +SKIP
+            >>> model = RFDETRSmall()  # doctest: +SKIP
+            >>> detections = model.predict("image.jpg", threshold=0.5)  # doctest: +SKIP
+        """
+        source_options = sorted(_SOURCE_PREDICT_OPTIONS.intersection(kwargs))
+        if source_options:
+            raise TypeError(
+                f"RFDETR.predict does not accept {', '.join(source_options)}: it predicts images only. "
+                "Use RFDETRInference(model).predict(...) for videos, directories, globs, manifests, webcams, "
+                "streams and lazy results."
+            )
+        if kwargs:
+            deprecation_warning(
+                "Passing unknown keyword arguments to RFDETR.predict is deprecated since v1.12.0: "
+                f"{', '.join(sorted(kwargs))}. They are ignored and will raise TypeError in v2.0.0.",
+                stacklevel=2,
+            )
+        if isinstance(images, torch.Tensor) and images.ndim == 4:
+            images = list(images.unbind(0))
+        return _predict_batch(
+            self._prediction_context, images, threshold, shape, patch_size, include_source_image, antialias
+        )
 
     def deploy_to_roboflow(
         self,
         workspace: str,
         project_id: str,
-        version: int | str,
+        version: int | str | None = None,
         api_key: str | None = None,
         size: str | None = None,
     ) -> None:
@@ -1509,7 +3383,10 @@ class RFDETR:
         Args:
             workspace: The name of the Roboflow workspace to deploy to.
             project_id: The project ID to which the model will be deployed.
-            version: The project version to which the model will be deployed.
+            version: The project version to which the model will be deployed. If not provided, the highest
+                existing dataset version is resolved automatically via the Roboflow API; for a project with
+                no generated versions yet the lookup falls back to version ``1``, and the Roboflow SDK then
+                raises its own ``RuntimeError`` ("Version number 1 is not found.").
             api_key: Your Roboflow API key. If not provided,
                 it will be read from the environment variable `ROBOFLOW_API_KEY`.
             size: The size of the model to deploy. If not provided,
@@ -1518,11 +3395,19 @@ class RFDETR:
         Raises:
             ValueError: If the `api_key` is not provided and not found in the
                 environment variable `ROBOFLOW_API_KEY`, or if the `size` is not set for custom architectures.
+            RuntimeError: If a legacy in-place optimization cleared the base weights.
 
         Note:
             Bundle creation is delegated to :meth:`export_for_roboflow`, which can be called independently
             to write ``weights.pt`` and ``class_names.txt`` without a network round-trip.
         """
+        if getattr(self, "_optimized_inplace", False) or self.model.model is None:
+            raise RuntimeError(
+                "Cannot deploy after legacy inplace optimization — "
+                "the model weights have been cleared from memory. "
+                "Call export_for_roboflow() before optimizing, then deploy the exported bundle."
+            )
+
         from roboflow import Roboflow
 
         if api_key is None:
@@ -1531,15 +3416,32 @@ class RFDETR:
                 raise ValueError("Set api_key=<KEY> in deploy_to_roboflow or export ROBOFLOW_API_KEY=<KEY>")
 
         rf = Roboflow(api_key=api_key)
-        workspace = rf.workspace(workspace)
+        rf_workspace = rf.workspace(workspace)
 
         if self.size is None and size is None:
             raise ValueError("Must set size for custom architectures")
 
-        size = self.size or size
+        if size is not None and self.size is not None and size != self.size:
+            warnings.warn(
+                f"deploy_to_roboflow(size={size!r}) overrides this model's own size {self.size!r}; "
+                f"deploying as {size!r}. Omit size to deploy with the model's own size.",
+                UserWarning,
+                stacklevel=2,
+            )
+        # Explicit user argument wins; fall back to the trained model's size (documented behaviour).
+        size = self.size if size is None else size
         with tempfile.TemporaryDirectory(prefix="roboflow_upload_") as tmp_out_dir:
             self.export_for_roboflow(tmp_out_dir)
-            project = workspace.project(project_id)
+            project = rf_workspace.project(project_id)
+            if version is None:
+                # Version ids come back as "<workspace>/<project>/<number>"; the highest number is the
+                # newest dataset version. default=1 keeps the SDK's own "Version number 1 is not found."
+                # as the error surface for a project with no generated versions.
+                version = max(
+                    (int(os.path.basename(info["id"])) for info in project.get_version_information()),
+                    default=1,
+                )
+                logger.info(f"deploy_to_roboflow: no version given, resolved latest version {version}")
             project_version = project.version(version)
             project_version.deploy(model_type=size, model_path=tmp_out_dir, filename="weights.pt")
 
@@ -1547,7 +3449,7 @@ class RFDETR:
         """Write a Roboflow upload bundle (``weights.pt`` + ``class_names.txt``) into *output_dir*.
 
         This is the network-free core of :meth:`deploy_to_roboflow`: it serialises the model state and
-        training args into ``weights.pt``, always embedding ``class_names`` into a copy of the args so
+        a sanitized copy of the training args into ``weights.pt``, always embedding ``class_names`` so
         the bundle is self-contained, and writes the class labels to ``class_names.txt``.  The Roboflow
         SDK uses this format to adapt raw PyTorch-Lightning checkpoints into a deploy-ready bundle.
 
@@ -1559,7 +3461,14 @@ class RFDETR:
             PermissionError: If the process lacks write access to *output_dir* or its parent directory.
             OSError: On disk-full, invalid path, or other filesystem failure during directory creation,
                 file write, or ``torch.save``.
+            RuntimeError: If a legacy in-place optimization cleared the base weights.
         """
+        if getattr(self, "_optimized_inplace", False) or self.model.model is None:
+            raise RuntimeError(
+                "Cannot export after legacy inplace optimization — "
+                "the model has been cleared from memory. "
+                "Call export_for_roboflow() before optimizing."
+            )
         os.makedirs(output_dir, exist_ok=True)
         # Write class_names.txt so the Roboflow upload pipeline can discover
         # the class labels without relying on args.class_names in the checkpoint.
@@ -1567,11 +3476,12 @@ class RFDETR:
         with open(class_names_path, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(self.class_names))
 
-        # Embed class_names in a shallow copy of args so the saved bundle is
-        # self-contained (roboflow-python's second fallback reads args.class_names
-        # directly from the checkpoint).  Using a copy leaves self.model.args
-        # unmodified — each export call is independent regardless of call order.
+        # Serialize a sanitized copy so trained bundles do not expose the caller's
+        # filesystem layout.  Keep self.model.args unchanged for runtime consumers.
         args = copy(self.model.args)
+        args.dataset_dir = None
+        args.output_dir = "output"
+        args.resume = ""
         if not hasattr(args, "class_names") or args.class_names is None:
             args.class_names = self.class_names
 
@@ -1579,7 +3489,7 @@ class RFDETR:
         torch.save({"model": self.model.model.state_dict(), "args": args}, outpath)
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """Lazily resolve legacy re-exports without creating import-order cycles."""
     if name in _VARIANT_EXPORTS:
         module = importlib.import_module("rfdetr.variants")

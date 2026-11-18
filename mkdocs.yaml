@@ -6,9 +6,10 @@
 site_name: RF-DETR
 site_url: https://rfdetr.roboflow.com/
 site_author: Roboflow
-site_description: "Real-time transformer for object detection and instance segmentation. DINOv2 backbone, SOTA on COCO (60.1 AP50:95). Apache 2.0. Works with Python ≥3.10."
+site_description: "Real-time transformer for object detection and instance segmentation. DINOv2 backbone, SOTA on COCO (60.1 AP50:95 with RF-DETR-2XL). Nano–Large detection and all segmentation models are Apache 2.0 and commercially usable. Works with Python ≥3.10."
 exclude_docs: |
   root-static/
+  snippets/
 repo_name: roboflow/rf-detr
 repo_url: https://github.com/roboflow/rf-detr
 edit_uri: https://github.com/roboflow/rf-detr/tree/main/docs
@@ -30,27 +31,53 @@ extra:
 
 nav:
   - Home: index.md
-  - Getting Started:
-      - Install: getting-started/install.md
-      - Migration Guide: getting-started/migration.md
+  # Pages listed both under "How to" and in their own tab (Train Model, Inference,
+  # Export Model) are cross-navigation links: MkDocs keeps one page object, so the
+  # label must match in both places and the later (dedicated) tab is marked active.
   - How to:
+      - Getting Started:
+          - Install: getting-started/install.md
+          - Pretrained Models: learn/pretrained.md
+          - Migration Guide: getting-started/migration.md
       - Run Model:
           - Detection: learn/run/detection.md
           - Segmentation: learn/run/segmentation.md
-          - Pretrained Models: learn/pretrained.md
-      - Train Model:
-          - Overview: learn/train/index.md
-          - Dataset Formats: learn/train/dataset-formats.md
-          - Training Parameters: learn/train/training-parameters.md
-          - Advanced Training: learn/train/advanced.md
-          - Custom Training API: learn/train/customization.md
-          - Augmentations: learn/train/augmentations.md
-          - Training Loggers: learn/train/loggers.md
-      - Export Model: learn/export.md
+          - Keypoints: learn/run/keypoints.md
+          - Videos and Streams: learn/run/videos-and-streams.md
+          - Inference: learn/inference.md
+      - Train Model: learn/train/index.md
+      - Export Model: exports/index.md
       - Deploy Model: learn/deploy.md
+      - How It Works: learn/how-it-works.md
       - Benchmarks: learn/benchmarks.md
+  - Train:
+      - Train Model: learn/train/index.md
+      - Dataset Formats: learn/train/dataset-formats.md
+      - Training Parameters: learn/train/training-parameters.md
+      - Augmentations: learn/train/augmentations.md
+      - Training Loggers: learn/train/loggers.md
+      - Advanced Training: learn/train/advanced.md
+      - Custom Training API: learn/train/customization.md
+  - Inference & Export:
+      - Inference: learn/inference.md
+      - Export Model: exports/index.md
+      - Export Basics: exports/basics.md
+      - Advanced Export: exports/advanced.md
+      - Export Formats:
+          - ONNX: exports/onnx.md
+          - TensorRT: exports/tensorrt.md
+          - TFLite: exports/tflite.md
+          - LiteRT: exports/litert.md
+          - OpenVINO: exports/openvino.md
+          - ExecuTorch: exports/executorch.md
+          - CoreML: exports/coreml.md
+          - Core AI: exports/coreai.md
+      - Contributing:
+          - Exporter Blueprint: exports/blueprint.md
+  - Cookbooks: cookbooks.md
   - API Reference:
       - RF-DETR: reference/rfdetr.md
+      - Inference: reference/inference.md
       - Detection Models:
           - RF-DETR Nano: reference/nano.md
           - RF-DETR Small: reference/small.md
@@ -65,14 +92,18 @@ nav:
           - RF-DETR Seg Large: reference/seg_large.md
           - RF-DETR Seg XLarge: reference/seg_xlarge.md
           - RF-DETR Seg 2XLarge: reference/seg_2xlarge.md
+      - Keypoint Models:
+          - RF-DETR Keypoint Preview: reference/kp_preview.md
       - Training Configs:
           - Train Config: reference/train_config.md
           - Segmentation Train Config: reference/segmentation_train_config.md
+          - Keypoint Train Config: reference/keypoint_train_config.md
       - Lightning Training:
           - Training Primitives: reference/training.md
-  - Cookbooks: cookbooks.md
-  - Resources: resources/index.md
-  - Changelog: changelog.md
+  - Resources:
+      - FAQ: faq.md
+      - Articles and Videos: resources/index.md
+      - Changelog: changelog.md
 
 theme:
   name: "material"
@@ -110,9 +141,16 @@ theme:
     - navigation.tracking
     - content.tooltips
     - navigation.tabs.sticky
+    - search.suggest
+    - search.highlight
+    - toc.follow
 
 plugins:
   - search
+  - redirects:
+      redirect_maps:
+        learn/export.md: exports/index.md
+        learn/export-blueprint.md: exports/blueprint.md
   - mkdocs-jupyter:
       kernel_name: python3
       execute: false
@@ -142,6 +180,7 @@ plugins:
 hooks:
   - docs/hooks/package_version.py
   - docs/hooks/cookbooks_cards.py
+  - docs/hooks/notebook_toc.py
 
 markdown_extensions:
   - admonition
@@ -168,4 +207,5 @@ markdown_extensions:
 extra_css:
   - stylesheets/rf.css
 
-extra_javascript: []
+extra_javascript:
+  - javascripts/version-banner.js

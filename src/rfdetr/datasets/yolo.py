@@ -6,32 +6,51 @@
 
 from __future__ import annotations
 
-import os
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+import yaml
 
 if TYPE_CHECKING:
-    import supervision as sv
-from PIL import Image, ImageDraw
+    from supervision import Detections
+from numpy.typing import NDArray
+from PIL import Image, ImageDraw, UnidentifiedImageError
 from torchvision.datasets import VisionDataset
 
+from rfdetr.config import MultiScale
+from rfdetr.datasets._aug_utils import resolve_keypoint_flip_pairs
+from rfdetr.datasets._keypoint_schema import YoloKeypointSchema, infer_yolo_keypoint_schema
+from rfdetr.datasets._torchvision import Compose
+from rfdetr.datasets._yolo_yaml import _extract_yolo_class_names_from_data, _load_yaml_mapping
 from rfdetr.datasets.coco import (
-    _resolve_runtime_augmentation_backend,
     make_coco_transforms,
     make_coco_transforms_square_div_64,
 )
+from rfdetr.datasets.io_utils import decode_image
+from rfdetr.datasets.kornia_transforms import is_gpu_postprocess, resolve_backend_for_build
+from rfdetr.utilities.logger import get_logger
+
+logger = get_logger()
 
 REQUIRED_YOLO_YAML_FILES = ["data.yaml", "data.yml"]
-REQUIRED_SPLIT_DIRS = ["train", "valid"]
-REQUIRED_DATA_SUBDIRS = ["images", "labels"]
+_VALID_VAL_DIR_NAMES = ("valid", "val")
+#: Deferred log records from split resolution: ``(level, message)`` pairs that the caller emits.
+#: Resolution is consulted by several gates per training run, so a resolver that logged directly
+#: repeated the same fallback message once per gate; returning the records lets the builder — the
+#: one caller that acts on the resolved directories — report each fallback exactly once.
+_ResolutionNotes = tuple[tuple[int, str], ...]
 YOLO_IMAGE_EXTENSIONS = {".bmp", ".dng", ".jpg", ".jpeg", ".mpo", ".png", ".tif", ".tiff", ".webp"}
 
 
-def _parse_yolo_box(values: list[str]) -> np.ndarray:
+class YoloSplitUnavailableError(FileNotFoundError):
+    """Signal that a requested YOLO split has no image directory to evaluate."""
+
+
+def _parse_yolo_box(values: list[str]) -> NDArray[np.float32]:
     """Parse a YOLO center-width-height box into relative XYXY coordinates."""
     x_center, y_center, width, height = values
     return np.array(
@@ -45,7 +64,7 @@ def _parse_yolo_box(values: list[str]) -> np.ndarray:
     )
 
 
-def _box_to_polygon(box: np.ndarray) -> np.ndarray:
+def _box_to_polygon(box: NDArray[np.float32]) -> NDArray[np.float32]:
     """Convert a relative XYXY box into a 4-corner polygon."""
     return np.array(
         [[box[0], box[1]], [box[2], box[1]], [box[2], box[3]], [box[0], box[3]]],
@@ -53,12 +72,12 @@ def _box_to_polygon(box: np.ndarray) -> np.ndarray:
     )
 
 
-def _parse_yolo_polygon(values: list[str]) -> np.ndarray:
+def _parse_yolo_polygon(values: list[str]) -> NDArray[np.float32]:
     """Parse a flattened YOLO polygon into relative XY points."""
     return np.array(values, dtype=np.float32).reshape(-1, 2)
 
 
-def _polygon_to_mask(polygon: np.ndarray, resolution_wh: tuple[int, int]) -> np.ndarray:
+def _polygon_to_mask(polygon: NDArray[np.float32], resolution_wh: tuple[int, int]) -> NDArray[np.bool_]:
     """Rasterize a polygon into a dense boolean mask.
 
     TODO: remove once supervision ships a direct CompactMask.from_polygon factory;
@@ -71,7 +90,7 @@ def _polygon_to_mask(polygon: np.ndarray, resolution_wh: tuple[int, int]) -> np.
     return np.array(mask, dtype=bool)
 
 
-def _polygons_to_masks(polygons: tuple[np.ndarray, ...], resolution_wh: tuple[int, int]) -> np.ndarray:
+def _polygons_to_masks(polygons: tuple[NDArray[np.float32], ...], resolution_wh: tuple[int, int]) -> NDArray[np.bool_]:
     """Rasterize per-instance polygons into an ``(N, H, W)`` boolean array.
 
     TODO: remove once supervision ships a direct CompactMask.from_polygon factory;
@@ -94,53 +113,9 @@ def _list_yolo_image_paths(images_directory_path: str) -> list[str]:
 
 def _extract_yolo_class_names(data_file: str) -> list[str]:
     """Read class names from a YOLO ``data.yaml`` file."""
-    import yaml
-
-    with Path(data_file).open(encoding="utf-8") as handle:
-        data = yaml.safe_load(handle)
-    if not isinstance(data, dict):
-        raise ValueError(f"Expected mapping in data file {data_file!r}, got {type(data).__name__}.")
-    names = data.get("names")
-    if isinstance(names, dict):
-        # YOLO label files use integer class IDs. When ``names`` is a mapping, we
-        # only support the standard numeric-keyed form where keys are a contiguous
-        # 0-based range: {0: "cat", 1: "dog", ...}. This keeps class IDs consistent
-        # with range checks downstream that assume valid IDs are 0..N-1.
-        numeric_keys: list[int] = []
-        non_numeric_keys: list[Any] = []
-        for key in names.keys():
-            key_str = str(key)
-            if key_str.isdigit():
-                numeric_keys.append(int(key_str))
-            else:
-                non_numeric_keys.append(key)
-
-        if not numeric_keys:
-            raise ValueError(
-                "Unsupported 'names' mapping in data file "
-                f"{data_file!r}: expected integer keys 0..N-1 when 'names' is a dict, "
-                f"got only non-numeric keys {list(names.keys())!r}. "
-                "Please provide 'names' as a list or as a dict with 0-based contiguous "
-                "integer keys."
-            )
-
-        unique_sorted_keys = sorted(set(numeric_keys))
-        expected_keys = list(range(len(unique_sorted_keys)))
-        if unique_sorted_keys != expected_keys or non_numeric_keys:
-            raise ValueError(
-                "Unsupported 'names' mapping in data file "
-                f"{data_file!r}: expected integer keys 0..N-1 with no gaps, "
-                f"got numeric keys {unique_sorted_keys!r} and "
-                f"non-numeric keys {non_numeric_keys!r}. "
-                "This loader assumes class IDs are contiguous 0..N-1; please remap "
-                "the 'names' keys or use the list form."
-            )
-
-        # At this point, keys are exactly 0..N-1; order them by numeric ID.
-        return [str(names[idx]) for idx in unique_sorted_keys]
-    if isinstance(names, list):
-        return [str(name) for name in names]
-    raise ValueError(f"Expected 'names' to be a list or dict in {data_file!r}, got {type(names).__name__}.")
+    path = Path(data_file)
+    data = _load_yaml_mapping(path)
+    return _extract_yolo_class_names_from_data(data, path)
 
 
 @dataclass(frozen=True)
@@ -155,28 +130,29 @@ class _LazyYoloSample:
     image_path: str
     width: int
     height: int
-    xyxy: np.ndarray
-    class_id: np.ndarray
-    polygons: tuple[np.ndarray, ...]
+    xyxy: NDArray[np.float32]
+    class_id: NDArray[np.int64]
+    polygons: tuple[NDArray[np.float32], ...]
+    keypoints: NDArray[np.float32]
 
-    def to_detections(self) -> "sv.Detections":
+    def to_detections(self) -> Detections:
         """Materialize the current sample as a supervision ``Detections`` object."""
-        import supervision as sv
+        from supervision import Detections
 
         if len(self.class_id) == 0:
-            return sv.Detections.empty()
+            return Detections.empty()
         if len(self.polygons) == 0:
             # Detection-only path: no masks were computed, return bare boxes.
-            return sv.Detections(class_id=self.class_id, xyxy=self.xyxy)
+            return Detections(class_id=self.class_id, xyxy=self.xyxy)
         # TODO: once supervision v0.28 ships CompactMask, wrap the dense result:
         #   compact = sv.CompactMask.from_dense(mask, self.xyxy, (self.height, self.width))
-        #   return sv.Detections(..., mask=compact)
+        #   return Detections(..., mask=compact)
         # CompactMask stores crop-RLE instead of a full H×W bool array, reducing memory
         # at the detections level for large images with sparse objects.
         # Note: _polygon_to_mask / _polygons_to_masks remain required as the intermediate
         # rasterization step until supervision provides a direct from_polygon factory.
         mask = _polygons_to_masks(self.polygons, (self.width, self.height))
-        return sv.Detections(class_id=self.class_id, xyxy=self.xyxy, mask=mask)
+        return Detections(class_id=self.class_id, xyxy=self.xyxy, mask=mask)
 
 
 class _LazyYoloDetectionDataset:
@@ -189,14 +165,13 @@ class _LazyYoloDetectionDataset:
     def __len__(self) -> int:
         return len(self._samples)
 
-    def __getitem__(self, idx: int) -> tuple[str, np.ndarray, "sv.Detections"]:
-        import cv2
-
+    def __getitem__(self, idx: int) -> tuple[str, NDArray[np.uint8], Detections]:
         sample = self._samples[idx]
-        image = cv2.imread(sample.image_path)
-        if image is None:
-            raise ValueError(f"Could not read image from path: {sample.image_path}")
-        return sample.image_path, image, sample.to_detections()
+        try:
+            rgb_image, _ = decode_image(Path(sample.image_path))
+        except (FileNotFoundError, OSError, UnidentifiedImageError) as exc:
+            raise ValueError(f"Could not read image from path: {sample.image_path}") from exc
+        return sample.image_path, rgb_image, sample.to_detections()
 
     def get_image_info(self, idx: int) -> _LazyYoloSample:
         """Return lightweight metadata without loading pixels or dense masks."""
@@ -212,7 +187,7 @@ def _parse_yolo_label_line(
     height: int,
     *,
     parse_polygons: bool = True,
-) -> tuple[int, np.ndarray, np.ndarray | None]:
+) -> tuple[int, NDArray[np.float32], NDArray[np.float32] | None]:
     """Parse one YOLO label line and return ``(class_id, xyxy_px, polygon_px)``.
 
     Args:
@@ -231,7 +206,7 @@ def _parse_yolo_label_line(
         when ``parse_polygons=False``.
 
     Raises:
-        ValueError: If the line is malformed or the class ID is out of range.
+        ValueError: If the line is malformed, the coordinates are non-finite, or the class ID is out of range.
     """
     if len(values) < 5:
         raise ValueError(
@@ -261,31 +236,38 @@ def _parse_yolo_label_line(
             f"class ID {cid} is out of range for dataset with {num_classes} classes "
             f"(valid range 0\u2013{num_classes - 1})."
         )
-    if len(values) == 5:
-        box = _parse_yolo_box(values[1:])
-        # Skip polygon creation on the detection path — only the bbox is needed.
-        polygon: np.ndarray | None = _box_to_polygon(box) if parse_polygons else None
-    else:
-        try:
-            _raw_polygon = _parse_yolo_polygon(values[1:])
-        except ValueError as exc:
-            raise ValueError(
-                f"Malformed polygon in {str(label_path)!r} at line {line_num}: "
-                f"could not parse coordinate values as floats."
-            ) from exc
-        box = np.array(
-            [
-                np.min(_raw_polygon[:, 0]),
-                np.min(_raw_polygon[:, 1]),
-                np.max(_raw_polygon[:, 0]),
-                np.max(_raw_polygon[:, 1]),
-            ],
-            dtype=np.float32,
+    # Report float32 conversion and scaling overflow with the source label location.
+    with np.errstate(over="ignore", invalid="ignore"):
+        if len(values) == 5:
+            box = _parse_yolo_box(values[1:])
+            # Skip polygon creation on the detection path — only the bbox is needed.
+            polygon: NDArray[np.float32] | None = _box_to_polygon(box) if parse_polygons else None
+        else:
+            try:
+                _raw_polygon = _parse_yolo_polygon(values[1:])
+            except ValueError as exc:
+                raise ValueError(
+                    f"Malformed polygon in {str(label_path)!r} at line {line_num}: "
+                    f"could not parse coordinate values as floats."
+                ) from exc
+            box = np.array(
+                [
+                    np.min(_raw_polygon[:, 0]),
+                    np.min(_raw_polygon[:, 1]),
+                    np.max(_raw_polygon[:, 0]),
+                    np.max(_raw_polygon[:, 1]),
+                ],
+                dtype=np.float32,
+            )
+            # On the detection path, _raw_polygon was only needed for bbox extraction;
+            # skip the pixel-space conversion to avoid a redundant allocation.
+            polygon = _raw_polygon if parse_polygons else None
+        xyxy_px = box * np.array([width, height, width, height], dtype=np.float32)
+    # The polygon bounds also expose any non-finite vertex before clipping.
+    if not np.isfinite(xyxy_px).all():
+        raise ValueError(
+            f"Malformed label in {str(label_path)!r} at line {line_num}: non-finite box or polygon coordinates."
         )
-        # On the detection path, _raw_polygon was only needed for bbox extraction;
-        # skip the pixel-space conversion to avoid a redundant allocation.
-        polygon = _raw_polygon if parse_polygons else None
-    xyxy_px = box * np.array([width, height, width, height], dtype=np.float32)
     if polygon is None:
         return cid, xyxy_px, None
     polygon_px = polygon * np.array([width, height], dtype=np.float32)
@@ -294,8 +276,93 @@ def _parse_yolo_label_line(
     return cid, xyxy_px, polygon_px.astype(np.float32)
 
 
+def _parse_yolo_pose_label_line(
+    values: list[str],
+    line_num: int,
+    label_path: Path,
+    num_classes: int,
+    width: int,
+    height: int,
+    *,
+    num_keypoints: int,
+    keypoint_dim: int,
+) -> tuple[int, NDArray[np.float32], NDArray[np.float32]]:
+    """Parse one Ultralytics YOLO pose row into pixel boxes and COCO-style keypoints."""
+    expected_fields = 5 + num_keypoints * keypoint_dim
+    if len(values) != expected_fields:
+        hint = (
+            " This looks like a detection-only label row (5 fields). "
+            "Check whether the dataset mixes detection and pose annotations "
+            "or whether the kpt_shape in data.yaml is correct."
+            if len(values) == 5 and num_keypoints > 0
+            else ""
+        )
+        raise ValueError(
+            f"Malformed YOLO pose label in {str(label_path)!r} at line {line_num}: "
+            f"expected {expected_fields} fields from kpt_shape=[{num_keypoints}, {keypoint_dim}], "
+            f"got {len(values)}.{hint}"
+        )
+
+    cid, xyxy_px, _ = _parse_yolo_label_line(
+        values[:5],
+        line_num,
+        label_path,
+        num_classes,
+        width,
+        height,
+        parse_polygons=False,
+    )
+    try:
+        raw_keypoints = np.asarray(values[5:], dtype=np.float32).reshape(num_keypoints, keypoint_dim)
+    except ValueError as exc:
+        raise ValueError(
+            f"Malformed YOLO pose label in {str(label_path)!r} at line {line_num}: "
+            "could not parse keypoint values as floats."
+        ) from exc
+
+    if not np.isfinite(raw_keypoints).all():
+        raise ValueError(f"Malformed YOLO pose label in {str(label_path)!r} at line {line_num}: non-finite keypoint.")
+    xy = raw_keypoints[:, :2]
+
+    keypoints = np.zeros((num_keypoints, 3), dtype=np.float32)
+    if keypoint_dim == 3:
+        # v is authoritative for absent/present; clamp OOB coords to image edge.
+        visibility = raw_keypoints[:, 2]
+        if np.any((visibility < 0.0) | (visibility > 2.0)):
+            raise ValueError(
+                f"Malformed YOLO pose label in {str(label_path)!r} at line {line_num}: "
+                "keypoint visibility values must be in [0, 2]."
+            )
+        np.clip(xy, 0.0, 1.0, out=xy)
+        keypoints[:, 2] = visibility
+    else:
+        # Ultralytics dim-2 format: absent keypoints are marked with negative
+        # coordinates (any coord < 0 → absent).  Detect BEFORE clamping so that
+        # a keypoint like (-0.1, 0.5) is not clamped to (0.0, 0.5) and
+        # mistakenly treated as a present keypoint at the left image edge.
+        absent_2d = (xy[:, 0] < 0.0) | (xy[:, 1] < 0.0)
+        np.clip(xy, 0.0, 1.0, out=xy)
+        # Zero coords for absent keypoints so the (0, 0) absent sentinel is set.
+        xy[absent_2d, :] = 0.0
+        present = ~((xy[:, 0] == 0.0) & (xy[:, 1] == 0.0))
+        keypoints[present, 2] = 2.0
+
+    keypoints[:, 0] = xy[:, 0] * float(width)
+    keypoints[:, 1] = xy[:, 1] * float(height)
+
+    absent = keypoints[:, 2] <= 0.0
+    keypoints[absent, :2] = 0.0
+    return cid, xyxy_px, keypoints
+
+
 def _build_yolo_samples(
-    img_folder: str, lb_folder: str, data_file: str, *, include_polygons: bool
+    img_folder: str,
+    lb_folder: str,
+    data_file: str,
+    *,
+    include_polygons: bool,
+    include_keypoints: bool = False,
+    keypoint_schema: YoloKeypointSchema | None = None,
 ) -> tuple[list[str], list[_LazyYoloSample]]:
     """Build the class list and sample list shared by both YOLO builder functions.
 
@@ -310,6 +377,12 @@ def _build_yolo_samples(
         include_polygons: When ``True`` polygon coordinates are stored in each
             :class:`_LazyYoloSample` (segmentation path).  When ``False`` polygon coordinates returned by
             :func:`_parse_yolo_label_line` are discarded and ``polygons=()`` is stored instead (detection-only path).
+            Mutually exclusive with ``include_keypoints``.
+        include_keypoints: When ``True`` keypoint coordinates are stored in each :class:`_LazyYoloSample` (pose path).
+            Mutually exclusive with ``include_polygons``; raises :class:`ValueError` when both are ``True``.
+        keypoint_schema: Keypoint schema describing class names, per-class keypoint counts, OKS sigmas, keypoint names,
+            flip index, and keypoint dimensionality.  When ``None`` and ``include_keypoints=True`` the schema is
+            auto-inferred from ``data_file`` via :func:`infer_yolo_keypoint_schema`.
 
     Returns:
         A ``(classes, samples)`` tuple where ``classes`` is the ordered list of class names and ``samples`` is a list of
@@ -320,7 +393,17 @@ def _build_yolo_samples(
         >>> # _build_lazy_yolo_segmentation_dataset — not part of the public API.
         >>> pass
     """
-    classes = _extract_yolo_class_names(data_file)
+    if include_polygons and include_keypoints:
+        raise ValueError("YOLO segmentation masks and keypoints cannot be loaded at the same time.")
+    if include_keypoints:
+        keypoint_schema = keypoint_schema or infer_yolo_keypoint_schema(data_file)
+        classes = keypoint_schema.class_names
+        num_keypoints = max(keypoint_schema.num_keypoints_per_class, default=0)
+        keypoint_dim = keypoint_schema.keypoint_dim
+    else:
+        classes = _extract_yolo_class_names(data_file)
+        num_keypoints = 0
+        keypoint_dim = 0
     samples: list[_LazyYoloSample] = []
 
     for image_path in _list_yolo_image_paths(img_folder):
@@ -328,26 +411,43 @@ def _build_yolo_samples(
         with Image.open(image_path) as image:
             width, height = image.size
 
-        xyxy: list[np.ndarray] = []
+        xyxy: list[NDArray[np.float32]] = []
         class_id: list[int] = []
-        polygons: list[np.ndarray] = []
+        polygons: list[NDArray[np.float32]] = []
+        keypoints: list[NDArray[np.float32]] = []
         if label_path.exists():
             with label_path.open(encoding="utf-8") as handle:
-                lines = [line.strip() for line in handle if line.strip()]
-            for i, line in enumerate(lines):
-                cid, xyxy_px, polygon_px = _parse_yolo_label_line(
-                    line.split(),
-                    i + 1,
-                    label_path,
-                    len(classes),
-                    width,
-                    height,
-                    parse_polygons=include_polygons,
-                )
-                class_id.append(cid)
-                xyxy.append(xyxy_px)
-                if include_polygons and polygon_px is not None:
-                    polygons.append(polygon_px)
+                for line_num, line in enumerate(handle, start=1):
+                    values = line.split()
+                    if not values:
+                        continue
+                    if include_keypoints:
+                        cid, xyxy_px, keypoints_px = _parse_yolo_pose_label_line(
+                            values=values,
+                            line_num=line_num,
+                            label_path=label_path,
+                            num_classes=len(classes),
+                            width=width,
+                            height=height,
+                            num_keypoints=num_keypoints,
+                            keypoint_dim=keypoint_dim,
+                        )
+                        polygon_px = None
+                        keypoints.append(keypoints_px)
+                    else:
+                        cid, xyxy_px, polygon_px = _parse_yolo_label_line(
+                            values=values,
+                            line_num=line_num,
+                            label_path=label_path,
+                            num_classes=len(classes),
+                            width=width,
+                            height=height,
+                            parse_polygons=include_polygons,
+                        )
+                    class_id.append(cid)
+                    xyxy.append(xyxy_px)
+                    if include_polygons and polygon_px is not None:
+                        polygons.append(polygon_px)
 
         samples.append(
             _LazyYoloSample(
@@ -357,6 +457,11 @@ def _build_yolo_samples(
                 xyxy=np.array(xyxy, dtype=np.float32).reshape(-1, 4),
                 class_id=np.array(class_id, dtype=np.int64),
                 polygons=tuple(polygons),
+                keypoints=(
+                    np.stack(keypoints).astype(np.float32, copy=False)
+                    if keypoints
+                    else np.zeros((0, num_keypoints, 3), dtype=np.float32)
+                ),
             )
         )
 
@@ -401,7 +506,29 @@ def _build_lazy_yolo_segmentation_dataset(img_folder: str, lb_folder: str, data_
     return _LazyYoloDetectionDataset(classes=classes, samples=samples)
 
 
-def _build_coco_api_from_samples(classes: list[str], dataset: Any) -> Any:
+def _build_lazy_yolo_keypoint_dataset(
+    img_folder: str,
+    lb_folder: str,
+    data_file: str,
+    keypoint_schema: YoloKeypointSchema,
+) -> _LazyYoloDetectionDataset:
+    """Build a YOLO pose dataset that stores keypoints without dense masks."""
+    classes, samples = _build_yolo_samples(
+        img_folder,
+        lb_folder,
+        data_file,
+        include_polygons=False,
+        include_keypoints=True,
+        keypoint_schema=keypoint_schema,
+    )
+    return _LazyYoloDetectionDataset(classes=classes, samples=samples)
+
+
+def _build_coco_api_from_samples(
+    classes: list[str],
+    dataset: Any,
+    keypoint_schema: YoloKeypointSchema | None = None,
+) -> Any:
     """Build an in-memory ``pycocotools.COCO`` object from YOLO lazy samples.
 
     Args:
@@ -415,9 +542,13 @@ def _build_coco_api_from_samples(classes: list[str], dataset: Any) -> Any:
 
     images: list[dict[str, Any]] = []
     annotations: list[dict[str, Any]] = []
-    categories: list[dict[str, Any]] = [
-        {"id": idx, "name": class_name, "supercategory": "none"} for idx, class_name in enumerate(classes)
-    ]
+    categories: list[dict[str, Any]] = []
+    for idx, class_name in enumerate(classes):
+        category = {"id": idx, "name": class_name, "supercategory": "none"}
+        if keypoint_schema is not None:
+            category["keypoints"] = list(keypoint_schema.keypoint_names)
+            category["skeleton"] = []
+        categories.append(category)
 
     use_lazy_path = hasattr(dataset, "get_image_info")
     ann_id = 0
@@ -429,12 +560,14 @@ def _build_coco_api_from_samples(classes: list[str], dataset: Any) -> Any:
             xyxy = sample.xyxy
             class_id = sample.class_id
             has_masks = len(sample.polygons) > 0
+            keypoints = sample.keypoints
         else:
-            image_path, cv2_image, detections = dataset[img_id]
-            height, width = cv2_image.shape[:2]
+            image_path, image_array, detections = dataset[img_id]
+            height, width = image_array.shape[:2]
             xyxy = detections.xyxy
             class_id = detections.class_id
             has_masks = detections.mask is not None
+            keypoints = np.zeros((len(xyxy), 0, 3), dtype=np.float32)
 
         images.append({"id": img_id, "file_name": str(image_path), "height": int(height), "width": int(width)})
 
@@ -453,6 +586,10 @@ def _build_coco_api_from_samples(classes: list[str], dataset: Any) -> Any:
             if has_masks:
                 # Keep bbox evaluation compatible without eager mask encoding at init.
                 ann["segmentation"] = []
+            if keypoint_schema is not None:
+                keypoints_i = keypoints[i] if i < len(keypoints) else np.zeros((0, 3), dtype=np.float32)
+                ann["keypoints"] = keypoints_i.reshape(-1).astype(float).tolist()
+                ann["num_keypoints"] = int(np.count_nonzero(keypoints_i[:, 2] > 0))
             annotations.append(ann)
             ann_id += 1
 
@@ -468,43 +605,448 @@ def _build_coco_api_from_samples(classes: list[str], dataset: Any) -> Any:
     return coco
 
 
-def is_valid_yolo_dataset(dataset_dir: str) -> bool:
-    """Checks if the specified dataset directory is in yolo format.
+def find_yolo_data_file(dataset_dir: str | Path, default: Path | None = None) -> Path | None:
+    """Return the YOLO data file of a dataset root.
 
-    We accept a dataset to be in yolo format if the following conditions are met:
-    - The dataset_dir contains a data.yaml or data.yml file
-    - The dataset_dir contains "train" and "valid" subdirectories, each containing "images" and "labels" subdirectories
-    - The "test" subdirectory is optional
+    The names in :data:`REQUIRED_YOLO_YAML_FILES` are probed in order, so ``data.yaml``
+    wins over ``data.yml`` when a root holds both.
 
-    Returns a boolean indicating whether the dataset is in correct yolo format.
+    Args:
+        dataset_dir: Dataset root that may contain ``data.yaml`` or ``data.yml``.
+        default: Returned when the root holds neither name. Callers that only need to know
+            whether a YOLO config exists leave it ``None``; a caller that must name a path
+            in an error message passes a concrete one.
+
+    Returns:
+        The first existing data file, or *default* when the root holds none.
+
+    Examples:
+        >>> find_yolo_data_file("/missing") is None
+        True
     """
-    contains_required_yolo_yaml = any(
-        os.path.exists(os.path.join(dataset_dir, yaml_file)) for yaml_file in REQUIRED_YOLO_YAML_FILES
+    root = Path(dataset_dir)
+    for filename in REQUIRED_YOLO_YAML_FILES:
+        data_file = root / filename
+        if data_file.exists():
+            return data_file
+    return default
+
+
+def find_yolo_train_images(dataset_dir: str | Path) -> Path | None:
+    """Return the training image directory of a YOLO dataset root.
+
+    Format detection asks only whether a root ships YOLO training images. This is the supported
+    entry point for that question: it keeps the split-resolution rules — a YAML ``train:`` path,
+    the ``path:`` base, and the Roboflow directory convention — inside this module, so a caller
+    does not import the resolver to ask.
+
+    Labels are not required. A declared training directory with no derivable ``labels`` sibling
+    still identifies the dataset as YOLO, matching the legacy ``train/images`` rule and keeping
+    background-only and not-yet-labelled datasets — which the loader reads — detectable.
+    Building a split still needs labels; see :func:`_resolve_yolo_split_dirs`.
+
+    Args:
+        dataset_dir: Dataset root that may contain ``data.yaml`` or ``data.yml``.
+
+    Returns:
+        The training image directory, or ``None`` when the root holds no YOLO data file or no
+        training image directory resolves from it.
+
+    Examples:
+        >>> find_yolo_train_images("/missing") is None
+        True
+    """
+    root = Path(dataset_dir)
+    data_file = find_yolo_data_file(root)
+    if data_file is None:
+        return None
+    resolved, notes = _resolve_split_from_yaml(root, data_file, "train")
+    # Detection runs before anything is built, so every rejection is reported at debug level
+    # only: the builder emits the same records at their own level once it commits to a split.
+    for _, note_message in notes:
+        logger.debug(note_message)
+    if resolved is not None:
+        return resolved[0]
+    try:
+        declared, _ = _declared_split_images(root, data_file, "train")
+    except (OSError, ValueError, TypeError, yaml.YAMLError):
+        declared = None  # an unreadable data file cannot declare images; try the convention
+    if declared is not None:
+        nested_images = declared / "images"
+        return nested_images if nested_images.is_dir() else declared
+    images_dir, _ = _resolve_yolo_split_dirs(root, data_file, "train")
+    return images_dir if _usable_split_dir(images_dir, root) else None
+
+
+def is_valid_yolo_dataset(dataset_dir: str) -> bool:
+    """Check for a YOLO YAML file and resolvable training and validation directories.
+
+    Image and label directories follow :func:`_resolve_yolo_split_dirs`, including
+    YAML split paths and the Roboflow filesystem fallback. The test split is optional.
+
+    Args:
+        dataset_dir: Path to the dataset root containing ``data.yaml`` or ``data.yml``.
+
+    Returns:
+        ``True`` if the directory satisfies all YOLO format requirements,
+        ``False`` otherwise.
+    """
+    root = Path(dataset_dir)
+    data_file = find_yolo_data_file(root)
+    if data_file is None:
+        return False
+    return all(
+        _usable_split_dir(directory, root)
+        for split in ("train", "val")
+        for directory in _resolve_yolo_split_dirs(root, data_file, split)
     )
-    contains_required_split_dirs = all(
-        os.path.exists(os.path.join(dataset_dir, split_dir)) for split_dir in REQUIRED_SPLIT_DIRS
+
+
+def _within_root(candidate: Path, root: Path) -> bool:
+    """Report whether *candidate* stays inside *root* once symlinks are followed.
+
+    The check is total: an unresolvable candidate counts as outside *root* rather than
+    propagating out of the caller, because every caller uses it to choose between a
+    declared path and the filesystem fallback.
+
+    Args:
+        candidate: Path to test. It need not exist.
+        root: Dataset root that must contain *candidate*.
+
+    Returns:
+        ``True`` when the resolved candidate is *root* itself or lives under it.
+
+    Examples:
+        >>> _within_root(Path("/data/ds/train/images"), Path("/data/ds"))
+        True
+        >>> _within_root(Path("/data/other/images"), Path("/data/ds"))
+        False
+    """
+    try:
+        candidate.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False  # resolved candidate lies outside root
+    except (OSError, RuntimeError):
+        # A symlink loop raises RuntimeError from resolve() up to Python 3.12 and OSError
+        # on some platforms; either way the candidate is unusable, not a reason to crash.
+        return False
+    return True
+
+
+def _usable_split_dir(candidate: Path, root: Path) -> bool:
+    """Report whether *candidate* is a directory this dataset may read.
+
+    Applies containment to whatever resolution returned, so a conventional ``train/images``
+    symlinked out of the dataset root is refused exactly like a YAML declaration pointing
+    there. Resolving both sides leaves a dataset whose whole root is a symlink untouched.
+
+    Args:
+        candidate: Resolved split directory.
+        root: Dataset root that must contain it.
+
+    Returns:
+        ``True`` when *candidate* is an existing directory inside *root*.
+    """
+    return candidate.is_dir() and _within_root(candidate, root)
+
+
+def _declared_split_images(root: Path, data_file: Path, split: str) -> tuple[Path | None, _ResolutionNotes]:
+    """Resolve the image directory a YAML declares for ``split``, ignoring labels.
+
+    Holds the ``path:`` base and containment rules that apply to any declared split. Format
+    detection needs the declared images on their own, so deriving the matching labels
+    directory is left to :func:`_parse_yaml_split_dirs`.
+
+    Raises:
+        OSError: File I/O failure reading ``data_file``.
+        ValueError: Unexpected value type inside the YAML mapping.
+        TypeError: Unexpected type inside the YAML mapping.
+        yaml.YAMLError: Malformed YAML content.
+
+    Args:
+        root: Dataset root directory.
+        data_file: Path to ``data.yaml`` or ``data.yml``.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+
+    Returns:
+        ``(images_dir, notes)`` when the YAML declares a directory that exists inside *root*,
+        otherwise ``(None, notes)``.
+    """
+    data = _load_yaml_mapping(data_file)
+    declared_base = data.get("path")
+    base_notes: _ResolutionNotes = ()
+    if declared_base:
+        yaml_base = Path(declared_base)
+        if not yaml_base.is_absolute():
+            # A relative ``path:`` is declared against the dataset root. Only a declared base is
+            # joined onto the root — joining the root onto itself doubled a relative root.
+            joined_base = root / yaml_base
+            if joined_base.is_dir():
+                yaml_base = joined_base
+            else:
+                # Ultralytics resolves a relative ``path:`` against its datasets directory, whose
+                # default is the YAML file's own directory. A stock ``coco8.yaml`` therefore pairs
+                # ``path: coco8`` with a root already named ``coco8``, and joining the two would
+                # look for a ``coco8`` child that does not exist.
+                yaml_base = root
+                base_notes = (
+                    (
+                        logging.INFO,
+                        f"YOLO data file {data_file} declares path {declared_base!r}, which is not a directory "
+                        f"under {root} — resolving splits against the dataset root instead.",
+                    ),
+                )
+    else:
+        yaml_base = root
+
+    raw_path: str | None = data.get(split)
+    if raw_path is None and split == "val":
+        raw_path = data.get("valid")
+
+    if raw_path is None:
+        return None, ()  # nothing declared for this split, so the base was never used
+
+    split_images = yaml_base / raw_path
+    # Path traversal guard: reject yaml-declared paths that escape
+    # the dataset root (e.g. "../../other_project/val/images").
+    if not _within_root(split_images, root):
+        # Rejecting a declaration silently used to leave the caller reporting a missing data
+        # file, so each refusal names the key and the path it resolved to.
+        return None, base_notes + (
+            (
+                logging.DEBUG,
+                f"YOLO split {split!r} declared at {split_images} resolves outside the dataset root "
+                f"{root} — ignoring the declaration.",
+            ),
+        )
+    if not split_images.is_dir():
+        return None, base_notes + (
+            (
+                logging.DEBUG,
+                f"YOLO split {split!r} declared at {split_images} is not a directory — ignoring the declaration.",
+            ),
+        )
+    return split_images, base_notes
+
+
+def _parse_yaml_split_dirs(
+    root: Path, data_file: Path, split: str
+) -> tuple[tuple[Path, Path] | None, _ResolutionNotes]:
+    """Parse ``data_file`` and resolve image *and* label dirs for ``split``.
+
+    Resolves without logging: a rejected declaration is reported through the returned
+    notes so the caller decides whether it is worth a message.
+
+    Raises:
+        OSError: File I/O failure reading ``data_file``.
+        ValueError: Unexpected value type inside the YAML mapping.
+        TypeError: Unexpected type inside the YAML mapping.
+        yaml.YAMLError: Malformed YAML content.
+
+    Args:
+        root: Dataset root directory.
+        data_file: Path to ``data.yaml`` or ``data.yml``.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+
+    Returns:
+        ``((images_dir, labels_dir), notes)`` on success, or ``(None, notes)`` when the YAML
+        declares no usable path for the split, the declared path is missing on disk, a path
+        traversal is detected, or no labels directory can be derived.
+    """
+    split_images, base_notes = _declared_split_images(root, data_file, split)
+    if split_images is None:
+        return None, base_notes
+
+    parts = split_images.parts
+    if "images" in parts:
+        # Scan ``images`` segments right to left, as Ultralytics does: an earlier one can
+        # belong to a parent of the root, and the rightmost segment with an existing
+        # ``labels`` sibling is the correct swap target, not merely the last one in the path.
+        for idx in (i for i in range(len(parts) - 1, -1, -1) if parts[i] == "images"):
+            split_labels = Path(*parts[:idx], "labels", *parts[idx + 1 :])
+            # Path traversal guard mirroring the split_images check above: a crafted parts
+            # sequence could otherwise swap a component that lands outside root.
+            if not _within_root(split_labels, root):
+                continue  # traversal detected or unresolvable; skip this candidate
+            if split_labels.is_dir():
+                return (split_images, split_labels), base_notes
+    sub_images = split_images / "images"
+    sub_labels = split_images / "labels"
+    if sub_images.is_dir() and sub_labels.is_dir():
+        return (sub_images, sub_labels), base_notes
+    return None, base_notes + (
+        (
+            logging.WARNING,
+            f"YOLO split {split!r} declared at {split_images} exists but its labels directory "
+            f"could not be derived — falling back to the Roboflow directory convention.",
+        ),
     )
-    contains_required_data_subdirs = all(
-        os.path.exists(os.path.join(dataset_dir, split_dir, data_subdir))
-        for split_dir in REQUIRED_SPLIT_DIRS
-        for data_subdir in REQUIRED_DATA_SUBDIRS
-    )
-    return contains_required_yolo_yaml and contains_required_split_dirs and contains_required_data_subdirs
+
+
+def _resolve_split_from_yaml(
+    root: Path, data_file: Path, split: str
+) -> tuple[tuple[Path, Path] | None, _ResolutionNotes]:
+    """Try to resolve image and label dirs for ``split`` from ``data_file``.
+
+    Turns every failure mode of :func:`_parse_yaml_split_dirs` into a fallback plus notes,
+    so no caller has to handle a YAML problem and none of them logs twice.
+
+    Args:
+        root: Dataset root directory.
+        data_file: Path to ``data.yaml`` or ``data.yml``.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+
+    Returns:
+        ``((images_dir, labels_dir), notes)`` on success, or ``(None, notes)`` when the YAML
+        file is absent, declares no usable path for the split, is unreadable, or is malformed.
+    """
+    if not data_file.exists():
+        return None, ()
+    try:
+        return _parse_yaml_split_dirs(root, data_file, split)
+    except OSError:
+        return None, ()
+    except (ValueError, TypeError) as exc:
+        return None, (
+            (
+                logging.WARNING,
+                f"Could not resolve YAML split path for {split!r} in {data_file}: {exc} — "
+                f"falling back to Roboflow directory convention.",
+            ),
+        )
+    except yaml.YAMLError as exc:
+        return None, (
+            (
+                logging.WARNING,
+                f"Failed to parse YAML file {data_file}: {exc} — falling back to Roboflow directory convention.",
+            ),
+        )
+
+
+def _resolve_yolo_split_dirs(root: Path, data_file: Path, split: str) -> tuple[Path, Path]:
+    """Resolve image and label directories for a YOLO dataset split.
+
+    Supports both Roboflow (``valid/``) and Ultralytics (``val/``, paths in
+    ``data.yaml``) layouts.  When the YAML file declares ``train``/``val``/
+    ``test`` path keys the function uses those; otherwise it falls back to the
+    existing Roboflow convention with an additional check for ``val/`` when
+    ``valid/`` is absent.
+
+    When ``split`` is ``"val"``, the function first queries the YAML for a
+    ``"val"`` key and, if absent, retries with a ``"valid"`` key before falling
+    back to the filesystem convention.
+
+    Labels are derived from the resolved images path by scanning its
+    ``"images"`` segments right to left and swapping the rightmost one whose
+    sibling ``"labels"`` directory exists, mirroring the Ultralytics
+    ``img2label_paths`` convention.  This handles both trailing-images
+    (``val/images``) and intermediate-images (``images/val2017``) layouts,
+    including a dataset root nested under an ancestor also named ``images``.
+
+    Args:
+        root: Dataset root directory.
+        data_file: Path to ``data.yaml`` or ``data.yml``.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+
+    Returns:
+        ``(images_dir, labels_dir)`` as resolved :class:`~pathlib.Path` objects.
+    """
+    return _resolve_yolo_split_dirs_with_notes(root, data_file, split)[0]
+
+
+def _resolve_yolo_split_dirs_with_notes(
+    root: Path, data_file: Path, split: str
+) -> tuple[tuple[Path, Path], _ResolutionNotes]:
+    """Resolve a split as :func:`_resolve_yolo_split_dirs` does, keeping the fallback notes.
+
+    Args:
+        root: Dataset root directory.
+        data_file: Path to ``data.yaml`` or ``data.yml``.
+        split: One of ``"train"``, ``"val"``, or ``"test"``.
+
+    Returns:
+        ``((images_dir, labels_dir), notes)``, where *notes* explains any fallback the caller
+        may want to report. A caller that only needs the directories uses
+        :func:`_resolve_yolo_split_dirs` instead.
+
+    Raises:
+        ValueError: If the YAML declares a ``test`` split that cannot be resolved.
+    """
+    if split == "test" and data_file.exists():
+        try:
+            declared_test_path = _load_yaml_mapping(data_file).get("test")
+        except (OSError, ValueError, TypeError, yaml.YAMLError):
+            declared_test_path = None
+        if declared_test_path is not None:
+            result, notes = _resolve_split_from_yaml(root, data_file, split)
+            if result is None:
+                raise ValueError(f"YOLO test split declared in {data_file} could not be resolved")
+            return result, notes
+
+    result, notes = _resolve_split_from_yaml(root, data_file, split)
+    if result is not None:
+        return result, notes
+
+    roboflow_map = {"train": "train", "val": "valid", "test": "test"}
+    mapped = roboflow_map.get(split, split)
+    img_dir = root / mapped / "images"
+    lb_dir = root / mapped / "labels"
+
+    if split == "val" and not img_dir.exists():
+        for alt in _VALID_VAL_DIR_NAMES:
+            candidate = root / alt / "images"
+            candidate_labels = root / alt / "labels"
+            if candidate.is_dir() and candidate_labels.is_dir():
+                return (candidate, candidate_labels), notes
+
+    return (img_dir, lb_dir), notes
+
+
+def _validate_yolo_test_split(images_dir: Path, labels_dir: Path) -> None:
+    """Validate the filesystem contract for a YOLO test split.
+
+    A missing image directory means that the split is unavailable and may be
+    replaced with validation data.  Once the image directory exists, an empty
+    image directory or missing labels directory is invalid test data and must
+    propagate as an error instead of being relabeled as validation data.  An
+    existing labels directory may contain omitted or empty label files for
+    legitimate background images.
+
+    Args:
+        images_dir: Resolved directory containing test images.
+        labels_dir: Resolved directory containing test labels.
+
+    Raises:
+        YoloSplitUnavailableError: If the test image directory is absent.
+        ValueError: If the test images or labels directory is unusable.
+    """
+    if not images_dir.is_dir():
+        if images_dir.is_symlink():
+            raise ValueError(f"YOLO test images directory is an invalid symlink: {images_dir}")
+        raise YoloSplitUnavailableError(f"YOLO test images directory not found: {images_dir}")
+    if not labels_dir.is_dir():
+        raise ValueError(f"YOLO test labels directory not found: {labels_dir}")
+
+    image_paths = _list_yolo_image_paths(str(images_dir))
+    if not image_paths:
+        raise ValueError(f"YOLO test images directory contains no supported images: {images_dir}")
 
 
 class ConvertYolo:
     """Converts supervision Detections to the target dict format expected by RF-DETR.
 
     Args:
-        include_masks: whether to include segmentation masks
+        include_masks: whether to include segmentation masks.
+        include_keypoints: whether to include pose keypoints.
+        num_keypoints: Number of keypoints per instance when keypoints are enabled.
 
     Examples:
         >>> import numpy as np
-        >>> import supervision as sv
+        >>> from supervision import Detections
         >>> from PIL import Image
         >>> # Create a sample image and target
         >>> image = Image.new("RGB", (100, 100))
-        >>> detections = sv.Detections(
+        >>> detections = Detections(
         ...     xyxy=np.array([[10, 20, 30, 40]]),
         ...     class_id=np.array([0])
         ... )
@@ -523,15 +1065,17 @@ class ConvertYolo:
         [0]
     """
 
-    def __init__(self, include_masks: bool = False):
+    def __init__(self, include_masks: bool = False, include_keypoints: bool = False, num_keypoints: int = 0):
         self.include_masks = include_masks
+        self.include_keypoints = include_keypoints
+        self.num_keypoints = num_keypoints
 
-    def __call__(self, image: Image.Image, target: dict) -> tuple:
+    def __call__(self, image: Image.Image, target: dict[str, Any]) -> tuple[Image.Image, dict[str, torch.Tensor]]:
         """Convert image and YOLO detections to RF-DETR format.
 
         Args:
             image: PIL Image
-            target: dict with 'image_id' and 'detections' (sv.Detections)
+            target: dict with 'image_id' and 'detections'
 
         Returns:
             tuple of (image, target_dict)
@@ -558,7 +1102,7 @@ class ConvertYolo:
         boxes = boxes[keep]
         classes = classes[keep]
 
-        target_out = {}
+        target_out: dict[str, torch.Tensor] = {}
         target_out["boxes"] = boxes
         target_out["labels"] = classes
         target_out["image_id"] = image_id
@@ -579,13 +1123,22 @@ class ConvertYolo:
 
             target_out["masks"] = target_out["masks"].bool()
 
+        if self.include_keypoints:
+            raw_keypoints = target.get("keypoints")
+            if raw_keypoints is None:
+                # Allocate with pre-filter size so `keep` indexing below is valid
+                keypoints = torch.zeros((keep.shape[0], self.num_keypoints, 3), dtype=torch.float32)
+            else:
+                keypoints = torch.as_tensor(raw_keypoints, dtype=torch.float32).reshape(-1, self.num_keypoints, 3)
+            target_out["keypoints"] = keypoints[keep]
+
         target_out["orig_size"] = torch.as_tensor([int(h), int(w)])
         target_out["size"] = torch.as_tensor([int(h), int(w)])
 
         return image, target_out
 
 
-class YoloDetection(VisionDataset):
+class YoloDetection(VisionDataset):  # type: ignore[misc]  # torchvision ships no py.typed, so the base is Any
     """YOLO format dataset with lazy image loading and optional mask support.
 
     Both detection (``include_masks=False``) and segmentation (``include_masks=True``) paths use a lazy backend: image
@@ -605,6 +1158,8 @@ class YoloDetection(VisionDataset):
         transforms: Optional transforms to apply to images and targets
         include_masks: Whether to load segmentation masks (for YOLO segmentation format).
             When True polygons are parsed and rasterized on demand; when False only bounding-box coordinates are stored.
+        include_keypoints: Whether to load Ultralytics YOLO pose keypoints.
+        num_keypoints_per_class: Optional keypoint schema used by RF-DETR.
     """
 
     def __init__(
@@ -612,15 +1167,43 @@ class YoloDetection(VisionDataset):
         img_folder: str,
         lb_folder: str,
         data_file: str,
-        transforms=None,
+        transforms: Compose | None = None,
         include_masks: bool = False,
+        include_keypoints: bool = False,
+        num_keypoints_per_class: list[int] | None = None,
     ):
-        super(YoloDetection, self).__init__(img_folder)
+        if include_masks and include_keypoints:
+            raise ValueError("YOLO segmentation masks and keypoints cannot be loaded at the same time.")
+        super().__init__(img_folder)
         self._transforms = transforms
         self.include_masks = include_masks
-        self.prepare = ConvertYolo(include_masks=include_masks)
-
-        if include_masks:
+        self.include_keypoints = include_keypoints
+        self.keypoint_schema: YoloKeypointSchema | None
+        if include_keypoints:
+            try:
+                self.keypoint_schema = infer_yolo_keypoint_schema(data_file)
+            except (FileNotFoundError, ValueError, OSError) as exc:
+                raise ValueError(f"Invalid YOLO pose data file {data_file!r}: {exc}") from exc
+        else:
+            self.keypoint_schema = None
+        self.num_keypoints = max(num_keypoints_per_class or [], default=0)
+        if self.keypoint_schema is not None:
+            self.num_keypoints = max(self.keypoint_schema.num_keypoints_per_class, default=self.num_keypoints)
+        self.prepare = ConvertYolo(
+            include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints=self.num_keypoints,
+        )
+        # Equivalent to `include_keypoints` (the schema is set exactly on that path, and a failed
+        # inference re-raises), stated this way so the non-None schema below is provable.
+        if self.keypoint_schema is not None:
+            self.sv_dataset = _build_lazy_yolo_keypoint_dataset(
+                img_folder,
+                lb_folder,
+                data_file,
+                self.keypoint_schema,
+            )
+        elif include_masks:
             self.sv_dataset = _build_lazy_yolo_segmentation_dataset(img_folder, lb_folder, data_file)
         else:
             self.sv_dataset = _build_lazy_yolo_detection_dataset(img_folder, lb_folder, data_file)
@@ -629,70 +1212,95 @@ class YoloDetection(VisionDataset):
         self.ids = list(range(len(self.sv_dataset)))
 
         # Create COCO-compatible API for evaluation
-        self.coco = _build_coco_api_from_samples(self.classes, self.sv_dataset)
+        self.coco = _build_coco_api_from_samples(self.classes, self.sv_dataset, self.keypoint_schema)
 
     def __len__(self) -> int:
         return len(self.sv_dataset)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx: int) -> tuple[Image.Image | torch.Tensor, dict[str, Any] | None]:
         image_id = self.ids[idx]
-        image_path, cv2_image, detections = self.sv_dataset[idx]
+        image_path, rgb_image, detections = self.sv_dataset[idx]
 
-        # Convert BGR (OpenCV) to RGB (PIL)
-        rgb_image = cv2_image[:, :, ::-1]
         img = Image.fromarray(rgb_image)
 
-        target = {"image_id": image_id, "detections": detections}
-        img, target = self.prepare(img, target)
+        target: dict[str, Any] = {"image_id": image_id, "detections": detections}
+        if self.include_keypoints:
+            target["keypoints"] = self.sv_dataset.get_image_info(idx).keypoints
+        prepared_image, prepared_target = self.prepare(img, target)
 
         if self._transforms is not None:
-            img, target = self._transforms(img, target)
+            return self._transforms(prepared_image, prepared_target)
 
-        return img, target
+        return prepared_image, prepared_target
 
 
 def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> YoloDetection:
-    """Build a Roboflow YOLO-format dataset.
+    """Build a YOLO-format dataset from Roboflow or Ultralytics directory layouts.
 
-    This uses Roboflow's standard YOLO directory structure (train/valid/test folders with images/ and labels/
-    subdirectories).
+    Supports both Roboflow (``train/valid/test``) and Ultralytics (``train/val/test``,
+    with ``data.yaml`` path keys) directory structures.  Split directories are resolved
+    via :func:`_resolve_yolo_split_dirs`.
 
     Args:
         image_set: Dataset split to load. One of ``"train"``, ``"val"``, or
             ``"test"``.
         args: Argument namespace. The following attributes are consumed:
-            ``dataset_dir``, ``square_resize_div_64``, ``aug_config``, ``segmentation_head``, ``multi_scale``,
-            ``expanded_scales``, ``do_random_resize_via_padding``, ``patch_size``, ``num_windows``. ``aug_config`` is
-            forwarded to the transform builder; when ``None`` the builder falls back to the default
-            :data:`~rfdetr.datasets.aug_config.AUG_CONFIG`.
+            ``dataset_dir``, ``square_resize_div_64``, ``segmentation_head``,
+            ``multi_scale``, ``expanded_scales``,
+            ``patch_size``, and ``num_windows`` are required. ``aug_config``,
+            ``scale_jitter``, keypoint fields, and ``augmentation_backend`` are
+            optional and retain documented safe defaults.
         resolution: Target square resolution in pixels.
 
     Returns:
         A :class:`YoloDetection` dataset instance ready for use with a DataLoader.
+
+    Raises:
+        AttributeError: If a required dataset or transform option is absent.
+        FileNotFoundError: If the configured dataset root does not exist.
+        ValueError: If keypoint training lacks a valid keypoint schema.
     """
     root = Path(args.dataset_dir)
-    assert root.exists(), f"provided Roboflow path {root} does not exist"
-
-    # YOLO format uses images/ and labels/ subdirectories
-    PATHS = {  # noqa: N806
-        "train": (root / "train" / "images", root / "train" / "labels"),
-        "val": (root / "valid" / "images", root / "valid" / "labels"),
-        "test": (root / "test" / "images", root / "test" / "labels"),
-    }
+    if not root.exists():
+        raise FileNotFoundError(f"YOLO dataset root not found: {root}")
 
     # Prefer data.yaml; fall back to data.yml if present; default to data.yaml for error reporting
-    data_file = next((root / f for f in REQUIRED_YOLO_YAML_FILES if (root / f).exists()), root / "data.yaml")
-    img_folder, lb_folder = PATHS[image_set.split("_")[0]]
-    square_resize_div_64 = getattr(args, "square_resize_div_64", False)
-    include_masks = getattr(args, "segmentation_head", False)
-    multi_scale = getattr(args, "multi_scale", False)
-    expanded_scales = getattr(args, "expanded_scales", None)
-    do_random_resize_via_padding = getattr(args, "do_random_resize_via_padding", False)
-    patch_size = getattr(args, "patch_size", None)
-    num_windows = getattr(args, "num_windows", None)
+    data_file = find_yolo_data_file(root, default=root / "data.yaml")
+    assert data_file is not None
+    split_key = image_set.split("_")[0]
+    (img_folder, lb_folder), resolution_notes = _resolve_yolo_split_dirs_with_notes(root, data_file, split_key)
+    # The builder is the only caller that acts on the resolved directories, so it reports the
+    # fallbacks; the detection and validity gates resolve the same split without repeating them.
+    for note_level, note_message in resolution_notes:
+        logger.log(note_level, note_message)
+    for split_dir in (img_folder, lb_folder):
+        # Containment applies wherever the directory came from, including the Roboflow
+        # convention: reaching outside the root through a symlinked split is refused here
+        # rather than silently read, matching what the gates already report.
+        if split_dir.is_dir() and not _within_root(split_dir, root):
+            raise ValueError(f"YOLO split directory resolves outside the dataset root {root}: {split_dir}")
+    if split_key == "test":
+        _validate_yolo_test_split(img_folder, lb_folder)
+    # Model-dependent pipeline options are mandatory for direct builder calls.
+    square_resize_div_64 = args.square_resize_div_64
+    include_masks = args.segmentation_head
+    multi_scale = MultiScale.from_value(args.multi_scale)
+    expanded_scales = args.expanded_scales
+    patch_size = args.patch_size
+    num_windows = args.num_windows
     aug_config = getattr(args, "aug_config", None)
-    resolved_augmentation_backend = _resolve_runtime_augmentation_backend(getattr(args, "augmentation_backend", "cpu"))
-    gpu_postprocess = resolved_augmentation_backend != "cpu"
+    scale_jitter = getattr(args, "scale_jitter", True)
+    include_keypoints = getattr(args, "use_grouppose_keypoints", False)
+    num_keypoints_per_class = getattr(args, "num_keypoints_per_class", [])
+    keypoint_flip_pairs = resolve_keypoint_flip_pairs(args, include_keypoints=include_keypoints)
+    resolved_augmentation_backend = resolve_backend_for_build(getattr(args, "augmentation_backend", "cpu"))
+    gpu_postprocess = is_gpu_postprocess(resolved_augmentation_backend)
+
+    if include_keypoints:
+        try:
+            infer_yolo_keypoint_schema(data_file)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise ValueError(f"Invalid YOLO pose data file {data_file!r}: {exc}") from exc
 
     if square_resize_div_64:
         dataset = YoloDetection(
@@ -702,15 +1310,19 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
             transforms=make_coco_transforms_square_div_64(
                 image_set,
                 resolution,
-                multi_scale=multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=expanded_scales,
-                skip_random_resize=not do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
         )
     else:
         dataset = YoloDetection(
@@ -720,14 +1332,18 @@ def build_roboflow_from_yolo(image_set: str, args: Any, resolution: int) -> Yolo
             transforms=make_coco_transforms(
                 image_set,
                 resolution,
-                multi_scale=multi_scale,
+                multi_scale=multi_scale is not MultiScale.OFF,
                 expanded_scales=expanded_scales,
-                skip_random_resize=not do_random_resize_via_padding,
+                skip_random_resize=multi_scale is not MultiScale.PER_SAMPLE,
                 patch_size=patch_size,
                 num_windows=num_windows,
                 aug_config=aug_config,
+                scale_jitter=scale_jitter,
                 gpu_postprocess=gpu_postprocess,
+                keypoint_flip_pairs=keypoint_flip_pairs,
             ),
             include_masks=include_masks,
+            include_keypoints=include_keypoints,
+            num_keypoints_per_class=num_keypoints_per_class,
         )
     return dataset

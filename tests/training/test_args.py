@@ -8,6 +8,7 @@
 import pytest
 
 from rfdetr._namespace import _namespace_from_configs
+from rfdetr.config import MultiScale
 
 
 class TestNamespaceFromConfigs:
@@ -70,6 +71,14 @@ class TestNamespaceFromConfigs:
         assert args.sync_bn is True
         assert args.fp16_eval is True
 
+    def test_optimizer_fields_not_forwarded_to_namespace(self, base_model_config, base_train_config):
+        """Optimizer config is PTL-only and must not leak into the legacy namespace."""
+        tc = base_train_config(optimizer="sgd", optimizer_kwargs={"momentum": 0.9})
+        args = _namespace_from_configs(base_model_config(), tc)
+
+        assert not hasattr(args, "optimizer")
+        assert not hasattr(args, "optimizer_kwargs")
+
     def test_seed_falls_back_to_legacy_default_when_unset(self, base_model_config, base_train_config):
         """Seed defaults to 42 in the namespace when TrainConfig.seed is None."""
         tc = base_train_config(seed=None)
@@ -81,7 +90,7 @@ class TestNamespaceFromConfigs:
         tc = base_train_config(multi_scale=True, expanded_scales=True, dataset_file="coco")
         args = _namespace_from_configs(base_model_config(), tc)
 
-        assert args.multi_scale is True
+        assert args.multi_scale == MultiScale.PER_BATCH  # model_dump serializes the mode to its string value
         assert args.expanded_scales is True
         assert args.dataset_file == "coco"
 
@@ -107,16 +116,19 @@ class TestNamespaceFromConfigs:
         assert args.mask_ce_loss_coef == pytest.approx(5.0)
         assert args.mask_dice_loss_coef == pytest.approx(5.0)
 
-    def test_segmentation_num_select_none_falls_back_to_model_config(self, base_model_config, seg_train_config) -> None:
-        """SegmentationTrainConfig(num_select=None) must not overwrite ModelConfig.num_select."""
-        mc = base_model_config(segmentation_head=True, num_select=200)
-        # Explicitly passing num_select=None triggers the deprecation warning (Item #3).
-        with pytest.warns(DeprecationWarning, match="TrainConfig.num_select is deprecated"):
-            tc = seg_train_config(num_select=None)
+    @pytest.mark.parametrize(
+        ("train_overrides", "expected"),
+        [
+            pytest.param({}, 1.0, id="default-keeps-pre-1.7-effective-weight"),
+            pytest.param({"cls_loss_coef": 5.0}, 5.0, id="explicit-override-forwarded"),
+        ],
+    )
+    def test_segmentation_cls_loss_coef(self, base_model_config, seg_train_config, train_overrides, expected):
+        """Segmentation classification loss weight keeps its pre-1.7 default and honors an explicit override."""
+        mc = base_model_config(segmentation_head=True)
+        args = _namespace_from_configs(mc, seg_train_config(**train_overrides))
 
-        args = _namespace_from_configs(mc, tc)
-
-        assert args.num_select == 200
+        assert args.cls_loss_coef == pytest.approx(expected)
 
     def test_segmentation_extras_default_for_plain_config(self, base_model_config, base_train_config):
         """mask_* attributes default to 5.0 for a plain TrainConfig (not segmentation)."""
@@ -129,12 +141,3 @@ class TestNamespaceFromConfigs:
         mc = base_model_config(segmentation_head=True)
         args = _namespace_from_configs(mc, base_train_config())
         assert args.segmentation_head is True
-
-    def test_build_namespace_emits_deprecation_warning(
-        self, base_model_config, base_train_config, reset_build_namespace_warning_state
-    ):
-        """build_namespace() must emit a DeprecationWarning on every call."""
-        from rfdetr._namespace import build_namespace
-
-        with pytest.warns(FutureWarning, match="build_namespace"):
-            build_namespace(base_model_config(), base_train_config())

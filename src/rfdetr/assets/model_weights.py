@@ -21,10 +21,11 @@ Download Priority Order:
     3. PLATFORM_MODELS dict - legacy fallback for backward compatibility
 """
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 from rfdetr.platform import _IS_RFDETR_PLUS_AVAILABLE
 from rfdetr.utilities.files import _download_file, _validate_file_md5
@@ -33,6 +34,7 @@ from rfdetr.utilities.logger import get_logger
 logger = get_logger()
 
 _RF_HOME_ENV_VAR = "RF_HOME"
+_ROBOFLOW_HOME_ENV_VAR = "ROBOFLOW_HOME"
 _DEFAULT_CACHE_DIR = "~/.roboflow/models"
 
 
@@ -51,14 +53,14 @@ class ModelWeightAsset:
     Example:
         >>> asset = ModelWeightAsset(
         ...     filename='rf-detr-base.pth',
-        ...     url='https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth',
+        ...     url='https://repo.roboflow.com/rfdetr/rf-detr-base-coco.pth',
         ...     md5_hash='b4d3ce46099eaed50626ede388caf979'
         ... )
     """
 
     filename: str
     url: str
-    md5_hash: Optional[str] = None
+    md5_hash: str | None = None
 
 
 class ModelWeightsBase(Enum):
@@ -84,10 +86,12 @@ class ModelWeightsBase(Enum):
         >>> asset.filename
         'rf-detr-base.pth'
         >>> asset.url  # doctest: +SKIP
-        'https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth'
+        'https://repo.roboflow.com/rfdetr/rf-detr-base-coco.pth'
     """
 
-    def __new__(cls, asset: ModelWeightAsset) -> "ModelWeightsBase":
+    _value_: ModelWeightAsset
+
+    def __new__(cls, asset: ModelWeightAsset) -> ModelWeightsBase:
         obj = object.__new__(cls)
         obj._value_ = asset
         return obj
@@ -96,20 +100,20 @@ class ModelWeightsBase(Enum):
     @property
     def filename(self) -> str:
         """Get the filename from the underlying ModelWeightAsset."""
-        return self.value.filename
+        return self._value_.filename
 
     @property
     def url(self) -> str:
         """Get the URL from the underlying ModelWeightAsset."""
-        return self.value.url
+        return self._value_.url
 
     @property
-    def md5_hash(self) -> Optional[str]:
+    def md5_hash(self) -> str | None:
         """Get the MD5 hash from the underlying ModelWeightAsset."""
-        return self.value.md5_hash
+        return self._value_.md5_hash
 
     @classmethod
-    def from_filename(cls, filename: str) -> Optional[ModelWeightAsset]:
+    def from_filename(cls, filename: str) -> ModelWeightAsset | None:
         """Get ModelWeightAsset by filename.
 
         Args:
@@ -121,15 +125,15 @@ class ModelWeightsBase(Enum):
         Example:
             >>> asset = ModelWeights.from_filename('rf-detr-base.pth')
             >>> asset.url
-            'https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth'
+            'https://repo.roboflow.com/rfdetr/rf-detr-base-coco.pth'
         """
         for member in cls:
-            if member.value.filename == filename:
-                return member.value  # Return the ModelWeightAsset directly
+            if member._value_.filename == filename:
+                return member._value_  # Return the ModelWeightAsset directly
         return None
 
     @classmethod
-    def get_url(cls, filename: str) -> Optional[str]:
+    def get_url(cls, filename: str) -> str | None:
         """Get download URL for a model by filename.
 
         Args:
@@ -142,7 +146,7 @@ class ModelWeightsBase(Enum):
         return asset.url if asset else None
 
     @classmethod
-    def get_md5(cls, filename: str) -> Optional[str]:
+    def get_md5(cls, filename: str) -> str | None:
         """Get expected MD5 hash for a model by filename.
 
         Args:
@@ -161,7 +165,7 @@ class ModelWeightsBase(Enum):
         Returns:
             List of model filenames
         """
-        return [member.value.filename for member in cls]
+        return [member._value_.filename for member in cls]
 
 
 class ModelWeights(ModelWeightsBase):
@@ -179,85 +183,90 @@ class ModelWeights(ModelWeightsBase):
         >>> asset.filename
         'rf-detr-base.pth'
         >>> asset.url
-        'https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth'
+        'https://repo.roboflow.com/rfdetr/rf-detr-base-coco.pth'
     """
 
     # Detection Models
     RF_DETR_BASE = ModelWeightAsset(
         "rf-detr-base.pth",
-        "https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-base-coco.pth",
         "b4d3ce46099eaed50626ede388caf979",
     )
     RF_DETR_BASE_O365 = ModelWeightAsset(
         "rf-detr-base-o365.pth",
-        "https://storage.googleapis.com/rfdetr/top-secret-1234/lwdetr_dinov2_small_o365_checkpoint.pth",
+        "https://repo.roboflow.com/rfdetr/top-secret-1234/lwdetr_dinov2_small_o365_checkpoint.pth",
         "d93f4921ccbb0f0a2e4364bed290892b",
     )
     RF_DETR_BASE_2 = ModelWeightAsset(
         "rf-detr-base-2.pth",
-        "https://storage.googleapis.com/rfdetr/rf-detr-base-2.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-base-2.pth",
         "462f4d9df407ddc1812f42614040e913",
     )
     RF_DETR_LARGE = ModelWeightAsset(
         "rf-detr-large.pth",
-        "https://storage.googleapis.com/rfdetr/rf-detr-large.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-large.pth",
         "992c8e862aa733a7bb2777e45d49f1a0",
     )
     RF_DETR_LARGE_2026 = ModelWeightAsset(
         "rf-detr-large-2026.pth",
-        "https://storage.googleapis.com/rfdetr/rf-detr-large-2026.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-large-2026.pth",
         "5cb72153541cbcb9aa6efa26222acc75",
     )
     RF_DETR_NANO = ModelWeightAsset(
         "rf-detr-nano.pth",
-        "https://storage.googleapis.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
+        "https://repo.roboflow.com/rfdetr/nano_coco/checkpoint_best_regular.pth",
         "fb6504cce7fbdc783f7a46991f07639f",
     )
     RF_DETR_SMALL = ModelWeightAsset(
         "rf-detr-small.pth",
-        "https://storage.googleapis.com/rfdetr/small_coco/checkpoint_best_regular.pth",
+        "https://repo.roboflow.com/rfdetr/small_coco/checkpoint_best_regular.pth",
         "fb37061c1af7bace359c91b723a8d5c1",
     )
     RF_DETR_MEDIUM = ModelWeightAsset(
         "rf-detr-medium.pth",
-        "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
+        "https://repo.roboflow.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
         "7223f764a87b863f02eb8d52bf0ce2ee",
+    )
+    RF_DETR_KEYPOINT_PREVIEW = ModelWeightAsset(
+        "rf-detr-keypoint-preview-xlarge.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-keypoint-preview-xlarge.pth",
+        "6de511943ee85a547d4c5cb527daf0eb",
     )
 
     # Segmentation Models
     RF_DETR_SEG_PREVIEW = ModelWeightAsset(
         "rf-detr-seg-preview.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-preview.pt",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-preview.pt",
         "e35820c28fb86080558123e47a5e49ca",
     )
     RF_DETR_SEG_NANO = ModelWeightAsset(
         "rf-detr-seg-nano.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-n-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-n-ft.pth",
         "9995497791d0ff1664a1d9ddee9cfd20",
     )
     RF_DETR_SEG_SMALL = ModelWeightAsset(
         "rf-detr-seg-small.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-s-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-s-ft.pth",
         "0a2a3006381d0c42853907e700eadd08",
     )
     RF_DETR_SEG_MEDIUM = ModelWeightAsset(
         "rf-detr-seg-medium.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-m-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-m-ft.pth",
         "a49af1562c3719227ad43d0ca53b4c7a",
     )
     RF_DETR_SEG_LARGE = ModelWeightAsset(
         "rf-detr-seg-large.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-l-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-l-ft.pth",
         "275f7b094909544ed2841c94a677d07e",
     )
     RF_DETR_SEG_XLARGE = ModelWeightAsset(
         "rf-detr-seg-xlarge.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-xl-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-xl-ft.pth",
         "3693b35d0eea86ebb3e0444f4a611fba",
     )
     RF_DETR_SEG_XXLARGE = ModelWeightAsset(
         "rf-detr-seg-xxlarge.pt",
-        "https://storage.googleapis.com/rfdetr/rf-detr-seg-2xl-ft.pth",
+        "https://repo.roboflow.com/rfdetr/rf-detr-seg-2xl-ft.pth",
         "040bc3412af840fa8a47e0ff69b552ba",
     )
     # All methods inherited from ModelWeightsBase
@@ -266,13 +275,16 @@ class ModelWeights(ModelWeightsBase):
 def get_model_cache_dir() -> str:
     """Return the directory where RF-DETR caches downloaded model weights.
 
-    Reads the ``RF_HOME`` environment variable; defaults to ``~/.roboflow/models`` when the variable is not set.
+    Reads the ``RF_HOME`` environment variable, falling back to its alias ``ROBOFLOW_HOME``; defaults to
+    ``~/.roboflow/models`` when neither is set.  ``RF_HOME`` is canonical — when both variables are set it wins, so
+    existing configurations keep their behavior.  An empty value is treated as unset.
 
-    Set ``RF_HOME`` to override the cache location for all RF-DETR models:
+    Set either variable to override the cache location for all RF-DETR models:
 
     .. code-block:: bash
 
-        export RF_HOME=/mnt/shared/models
+        export RF_HOME=/mnt/shared/models       # canonical
+        export ROBOFLOW_HOME=/mnt/shared/models  # accepted alias
 
     Args: None
 
@@ -283,6 +295,7 @@ def get_model_cache_dir() -> str:
     Examples:
         >>> import os
         >>> _ = os.environ.pop("RF_HOME", None)  # ensure default
+        >>> _ = os.environ.pop("ROBOFLOW_HOME", None)
         >>> expected = os.path.normpath(os.path.expanduser("~/.roboflow/models"))
         >>> get_model_cache_dir() == expected
         True
@@ -291,8 +304,15 @@ def get_model_cache_dir() -> str:
         >>> get_model_cache_dir() == expected
         True
         >>> del os.environ["RF_HOME"]
+        >>> os.environ["ROBOFLOW_HOME"] = "~/roboflow_cache"
+        >>> expected = os.path.normpath(os.path.expanduser("~/roboflow_cache"))
+        >>> get_model_cache_dir() == expected
+        True
+        >>> del os.environ["ROBOFLOW_HOME"]
     """
-    cache_dir = os.environ.get(_RF_HOME_ENV_VAR, _DEFAULT_CACHE_DIR)
+    # `RF_HOME` is canonical; `ROBOFLOW_HOME` is an accepted alias. An empty value is
+    # treated as unset so it falls through to the alias and then the default.
+    cache_dir = os.environ.get(_RF_HOME_ENV_VAR) or os.environ.get(_ROBOFLOW_HOME_ENV_VAR) or _DEFAULT_CACHE_DIR
     return os.path.abspath(os.path.expanduser(cache_dir))
 
 
@@ -330,7 +350,7 @@ def download_pretrain_weights(
         >>> download_pretrain_weights('rf-detr-base.pth')  # doctest: +SKIP
         Downloading pretrained weights for rf-detr-base.pth
     """
-    asset: Optional[ModelWeightAsset] = None
+    asset: ModelWeightAsset | None = None
 
     # Use basename for registry lookup so absolute paths (e.g.
     # "/content/rf-detr-base.pth") match the registered short name.

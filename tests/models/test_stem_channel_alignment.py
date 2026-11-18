@@ -176,3 +176,64 @@ class TestAlignStemToCheckpoint:
 
         assert not incompatible.unexpected_keys
         assert torch.equal(model.stem.weight.detach(), source.stem.weight.detach())
+
+
+class TestAdaptInputChannelsEncoderChecks:
+    """Channel adaptation rewrites DINOv2's patch embedding and must reject other encoders."""
+
+    def test_non_dinov2_encoder_name_raises(self) -> None:
+        model = _FakeModel(3)
+        with pytest.raises(ValueError, match="num_channels=4 is supported for DINOv2 encoders only, not encoder='toy'"):
+            adapt_input_channels(model, 4, encoder_name="toy")
+        assert _stem_channels(model) == 3
+
+    def test_encoder_without_patch_embedding_raises(self) -> None:
+        """Without an encoder name the stem is checked structurally."""
+        model = torch.nn.Module()
+        outer = torch.nn.Module()
+        outer.encoder = torch.nn.Linear(2, 2)
+        model.backbone = torch.nn.ModuleList([outer])
+
+        with pytest.raises(ValueError, match="supported for DINOv2 encoders only, not encoder='Linear'"):
+            adapt_input_channels(model, 4)
+
+    def test_three_channels_skips_the_encoder_check(self) -> None:
+        adapt_input_channels(_FakeModel(3), 3, encoder_name="toy")
+
+    def test_dinov2_encoder_name_adapts(self) -> None:
+        model = _FakeModel(3)
+        adapt_input_channels(model, 5, encoder_name="dinov2_windowed_small")
+        assert _stem_channels(model) == 5
+        assert model.backbone[0].encoder.encoder.embeddings.patch_embeddings.num_channels == 5
+
+
+class TestFourChannelCheckpointRoundTrip:
+    """A real 4-channel model reloads its own checkpoint through the inference context builder."""
+
+    def test_four_channel_checkpoint_reloads_unscaled(self, tmp_path) -> None:
+        from rfdetr.config import RFDETRNanoConfig
+        from rfdetr.inference import _build_model_context
+
+        source = _build_model_context(RFDETRNanoConfig(pretrain_weights=None, num_channels=4, device="cpu")).model
+        key = "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight"
+        source_state = source.state_dict()
+        assert source_state[key].shape[1] == 4
+        checkpoint_path = tmp_path / "four_channel.pth"
+        torch.save({"model": source_state}, checkpoint_path)
+
+        reloaded = _build_model_context(
+            RFDETRNanoConfig(pretrain_weights=str(checkpoint_path), num_channels=4, device="cpu")
+        ).model
+
+        assert torch.equal(reloaded.state_dict()[key], source_state[key])
+
+    def test_four_channel_checkpoint_into_rgb_model_raises(self, tmp_path) -> None:
+        from rfdetr.config import RFDETRNanoConfig
+        from rfdetr.inference import _build_model_context
+
+        source = _build_model_context(RFDETRNanoConfig(pretrain_weights=None, num_channels=4, device="cpu")).model
+        checkpoint_path = tmp_path / "four_channel.pth"
+        torch.save({"model": source.state_dict()}, checkpoint_path)
+
+        with pytest.raises(ValueError, match="4-channel input stem"):
+            _build_model_context(RFDETRNanoConfig(pretrain_weights=str(checkpoint_path), device="cpu"))

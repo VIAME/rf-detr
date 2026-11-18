@@ -1,0 +1,270 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+
+import logging
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+import torch.nn as nn
+
+import rfdetr.models.backbone.dinov2 as dinov2_module
+import rfdetr.models.lwdetr as lwdetr_module
+from rfdetr._namespace import _namespace_from_configs
+from rfdetr.config import RFDETRNanoConfig, TrainConfig
+from rfdetr.models import build_model
+from rfdetr.models.backbone.dinov2 import DinoV2
+from rfdetr.models.backbone.dinov2_with_windowed_attn import (
+    Dinov2WithRegistersDropPath,
+    WindowedDinov2WithRegistersBackbone,
+)
+from rfdetr.models.lwdetr import LWDETR
+
+
+def _nano_args(drop_path: float) -> SimpleNamespace:
+    """Build the RF-DETR Nano model arguments with the given ``drop_path`` rate.
+
+    Examples:
+        >>> _nano_args(0.1).drop_path
+        0.1
+    """
+    mc = RFDETRNanoConfig(num_classes=3, pretrain_weights=None)
+    tc = TrainConfig(dataset_dir=".", output_dir=".", drop_path=drop_path)
+    return _namespace_from_configs(mc, tc)
+
+
+@pytest.fixture
+def offline_backbone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build windowed DINOv2 backbones from their config instead of downloading pretrained weights."""
+    monkeypatch.setattr(
+        WindowedDinov2WithRegistersBackbone, "from_pretrained", classmethod(lambda cls, name, config: cls(config))
+    )
+
+
+@pytest.fixture
+def model_with_drop_path(offline_backbone: None) -> LWDETR:
+    """Create RF-DETR Nano LWDETR with drop_path enabled."""
+    return build_model(_nano_args(0.1))
+
+
+@pytest.fixture
+def model_without_drop_path(offline_backbone: None) -> LWDETR:
+    """Create RF-DETR Nano LWDETR without drop_path."""
+    return build_model(_nano_args(0.0))
+
+
+def test_get_backbone_encoder_layers_dinov2(model_with_drop_path: LWDETR) -> None:
+    """Verify _get_backbone_encoder_layers() returns encoder.encoder.layer for DinoV2."""
+    model = model_with_drop_path
+
+    layers = model._get_backbone_encoder_layers()
+    assert layers is not None
+
+    enc = model.backbone[0].encoder
+    assert hasattr(enc, "encoder"), "DinoV2 encoder should have encoder attribute"
+    assert hasattr(enc.encoder, "encoder"), "DinoV2 encoder.encoder should have encoder attribute"
+    assert hasattr(enc.encoder.encoder, "layer"), "DinoV2 encoder.encoder.encoder should have layer attribute"
+    assert layers is enc.encoder.encoder.layer, "Should return encoder.encoder.encoder.layer"
+
+    assert len(layers) > 0, "Should have at least one layer"
+    for layer in layers:
+        assert hasattr(layer, "drop_path"), "Each layer should have drop_path attribute"
+
+
+def test_update_drop_path_dinov2(model_with_drop_path: LWDETR) -> None:
+    """Verify update_drop_path() sets drop_prob values correctly with linear schedule."""
+    model = model_with_drop_path
+
+    layers = model._get_backbone_encoder_layers()
+    assert layers is not None
+
+    num_layers = len(layers)
+    drop_path_rate = 0.1
+
+    model.update_drop_path(drop_path_rate, num_layers)
+
+    # All layers must be Dinov2WithRegistersDropPath (drop_path_rate=0.1 > 0 at model build time).
+    expected_rates = [x.item() for x in torch.linspace(0, drop_path_rate, num_layers)]
+    for i, layer in enumerate(layers):
+        assert isinstance(layer.drop_path, Dinov2WithRegistersDropPath), (
+            f"Layer {i} drop_path should be Dinov2WithRegistersDropPath, got {type(layer.drop_path)}"
+        )
+        actual_prob = layer.drop_path.drop_prob
+        assert abs(actual_prob - expected_rates[i]) < 1e-6, (
+            f"Layer {i} drop_prob should be {expected_rates[i]}, got {actual_prob}"
+        )
+
+    assert abs(layers[0].drop_path.drop_prob - 0.0) < 1e-6, "First layer should have drop_prob = 0"
+    assert abs(layers[-1].drop_path.drop_prob - drop_path_rate) < 1e-6, (
+        f"Last layer should have drop_prob = {drop_path_rate}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_near_one_drop_path_remains_finite(model_with_drop_path: LWDETR, dtype: torch.dtype) -> None:
+    """An accepted near-one rate stays below one and produces finite output."""
+    layers = model_with_drop_path._get_backbone_encoder_layers()
+    assert layers is not None
+    rate = TrainConfig(dataset_dir=".", output_dir=".", drop_path=0.999999999).drop_path
+    model_with_drop_path.update_drop_path(rate, len(layers))
+    assert layers[-1].drop_path.drop_prob == rate
+    inputs = torch.ones(8, 4, dtype=dtype, requires_grad=True)
+    output = layers[-1].drop_path(inputs)
+    output.sum().backward()
+    assert torch.isfinite(output).all()
+    assert torch.isfinite(inputs.grad).all()
+
+
+def test_drop_path_module_is_identity_only_for_zero_rate(
+    model_with_drop_path: LWDETR, model_without_drop_path: LWDETR
+) -> None:
+    """Verify drop_path initialization: Dinov2WithRegistersDropPath vs Identity based on rate."""
+    layers_with_dp = model_with_drop_path._get_backbone_encoder_layers()
+    layers_without_dp = model_without_drop_path._get_backbone_encoder_layers()
+
+    assert layers_with_dp is not None
+    assert layers_without_dp is not None
+
+    # drop_path_rate=0.1 -> every layer initialised as Dinov2WithRegistersDropPath
+    for i, layer in enumerate(layers_with_dp):
+        assert hasattr(layer, "drop_path"), "Layer should have drop_path attribute"
+        assert isinstance(layer.drop_path, Dinov2WithRegistersDropPath), (
+            f"Layer {i}: expected Dinov2WithRegistersDropPath, got {type(layer.drop_path)}"
+        )
+
+    # drop_path_rate=0.0 -> every layer initialised as nn.Identity
+    for i, layer in enumerate(layers_without_dp):
+        assert hasattr(layer, "drop_path"), "Layer should have drop_path attribute"
+        assert isinstance(layer.drop_path, torch.nn.Identity), (
+            f"Layer {i}: expected nn.Identity for zero drop_path, got {type(layer.drop_path)}"
+        )
+
+
+def test_update_drop_path_without_layers_returns_early(
+    model_with_drop_path: LWDETR, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify update_drop_path() handles models without recognizable layer structure gracefully."""
+    model = model_with_drop_path
+
+    monkeypatch.setattr(model, "_get_backbone_encoder_layers", lambda: None)
+
+    # Should not raise an error, just return early
+    model.update_drop_path(0.1, 12)
+
+
+class TestUpdateDropPathMissingLayersWarning:
+    """``update_drop_path`` warns, once, when a positive rate cannot be applied for lack of encoder layers."""
+
+    @staticmethod
+    def _unrecognised_layout_model() -> SimpleNamespace:
+        """Stand-in for an LWDETR whose encoder layer layout is not recognised.
+
+        Examples:
+            >>> TestUpdateDropPathMissingLayersWarning._unrecognised_layout_model()._drop_path_layers_warned
+            False
+        """
+        return SimpleNamespace(_get_backbone_encoder_layers=lambda: None, _drop_path_layers_warned=False)
+
+    @staticmethod
+    def _capture_warnings(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+        """Collect messages passed to the module logger's ``warning`` (the rf-detr logger does not propagate)."""
+        messages: list[str] = []
+        monkeypatch.setattr(lwdetr_module.logger, "warning", lambda msg, *args, **kwargs: messages.append(msg % args))
+        return messages
+
+    def test_positive_rate_warns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A positive drop-path rate with no recognised layers logs a warning naming the skipped schedule."""
+        model = self._unrecognised_layout_model()
+        messages = self._capture_warnings(monkeypatch)
+
+        LWDETR.update_drop_path(model, 0.1, 12)  # type: ignore[arg-type]
+
+        assert len(messages) == 1
+        assert "drop_path_rate=0.1" in messages[0]
+        assert "skipped" in messages[0]
+
+    def test_warns_only_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The per-step schedule callback calls ``update_drop_path`` repeatedly, so the warning is not repeated."""
+        model = self._unrecognised_layout_model()
+        messages = self._capture_warnings(monkeypatch)
+
+        LWDETR.update_drop_path(model, 0.1, 12)  # type: ignore[arg-type]
+        LWDETR.update_drop_path(model, 0.1, 12)  # type: ignore[arg-type]
+
+        assert len(messages) == 1
+
+    def test_zero_rate_does_not_warn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A zero rate has nothing to apply, so a missing layer layout is not worth a warning."""
+        model = self._unrecognised_layout_model()
+        messages = self._capture_warnings(monkeypatch)
+
+        LWDETR.update_drop_path(model, 0.0, 12)  # type: ignore[arg-type]
+
+        assert messages == []
+
+
+def test_update_drop_path_caps_schedule_at_available_layers(model_with_drop_path: LWDETR) -> None:
+    """Verify min() guard prevents IndexError when vit_encoder_num_layers > len(layers)."""
+    model = model_with_drop_path
+
+    layers = model._get_backbone_encoder_layers()
+    assert layers is not None
+    actual_num_layers = len(layers)
+
+    # Request more layers than exist in the backbone
+    requested_num_layers = actual_num_layers + 4
+    drop_path_rate = 0.2
+
+    # Should not raise IndexError
+    model.update_drop_path(drop_path_rate, requested_num_layers)
+
+    # Each updated layer gets a rate from 0 to drop_path_rate (shorter, capped linspace)
+    expected_rates = [x.item() for x in torch.linspace(0, drop_path_rate, actual_num_layers)]
+    for i in range(actual_num_layers):
+        actual_prob = layers[i].drop_path.drop_prob
+        assert abs(actual_prob - expected_rates[i]) < 1e-6, (
+            f"Layer {i} drop_prob should be {expected_rates[i]}, got {actual_prob}"
+        )
+
+
+def test_non_windowed_backbone_warns_drop_path_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify a warning is emitted when drop_path_rate > 0 with non-windowed backbone."""
+    mock_backbone = MagicMock()
+    monkeypatch.setattr(dinov2_module, "AutoBackbone", MagicMock(from_pretrained=MagicMock(return_value=mock_backbone)))
+
+    # The rf-detr logger sets propagate=False, so intercept warning() directly.
+    warning_messages: list[str] = []
+    rf_detr_logger = logging.getLogger("rf-detr")
+    monkeypatch.setattr(rf_detr_logger, "warning", lambda msg, *args, **kwargs: warning_messages.append(msg))
+
+    DinoV2(size="base", use_windowed_attn=False, drop_path_rate=0.1)
+
+    assert any("drop_path_rate" in msg and "ignored" in msg for msg in warning_messages), (
+        "Expected warning about drop_path_rate being ignored for non-windowed backbone"
+    )
+
+
+@pytest.mark.parametrize(
+    "make_encoder",
+    [
+        # Standard ViT backbones keep their layers in ``encoder.blocks``.
+        pytest.param(lambda blocks: SimpleNamespace(blocks=blocks), id="vit-blocks"),
+        # aimv2 backbones nest them under ``encoder.trunk.blocks`` and have no top-level ``blocks``.
+        pytest.param(lambda blocks: SimpleNamespace(trunk=SimpleNamespace(blocks=blocks)), id="aimv2-trunk-blocks"),
+    ],
+)
+def test_get_backbone_encoder_layers_finds_blocks_of_non_dinov2_backbones(make_encoder: Callable[..., Any]) -> None:
+    """Verify _get_backbone_encoder_layers() returns the block list of standard ViT and aimv2 backbones."""
+    mock_blocks = nn.ModuleList([nn.Linear(1, 1) for _ in range(3)])
+    # SimpleNamespace gives only the attributes we define, so hasattr checks work correctly.
+    mock_self = SimpleNamespace(backbone=[SimpleNamespace(encoder=make_encoder(mock_blocks))])
+
+    result = LWDETR._get_backbone_encoder_layers(mock_self)  # type: ignore[arg-type]
+
+    assert result is mock_blocks, "Should return the backbone's block list"

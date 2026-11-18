@@ -18,64 +18,113 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Sequence
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import cache
+from itertools import cycle, islice
+from typing import Any
 
 try:
     import albumentations as alb
 except ImportError:
-    alb = None  # type: ignore[assignment]
+    alb = None
 import numpy as np
 import PIL
 import torch
+from numpy.typing import NDArray
 from PIL import Image
+from torch import Tensor
 from torchvision.transforms import Normalize as _TVNormalize
 
-from rfdetr.util.box_ops import box_xyxy_to_cxcywh
-from rfdetr.util.logger import get_logger
+from rfdetr.datasets._aug_utils import (
+    CONTAINER_TRANSFORM_NAMES,
+    D4_ALIAS_NAMES,
+    HFLIP_TRANSFORM_NAMES,
+    HORIZONTAL_FLIP_ALIAS_NAMES,
+    IMAGE_LEVEL_TARGET_FIELDS,
+    filter_keypoint_hflip_augmentations,
+)
+from rfdetr.utilities.box_ops import box_xyxy_to_cxcywh
+from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
 
 
-def image_wh(image: Any) -> Tuple[int, int]:
-    """Return ``(width, height)`` for a PIL image or an HWC array."""
+def image_wh(image: Any) -> tuple[int, int]:
+    """Return ``(width, height)`` for a PIL image or an HWC array.
+
+    Examples:
+        >>> image_wh(np.zeros((4, 6, 9), dtype=np.uint8))
+        (6, 4)
+        >>> image_wh(Image.new("RGB", (6, 4)))
+        (6, 4)
+    """
     if isinstance(image, np.ndarray):
         return int(image.shape[1]), int(image.shape[0])
-    return image.size
+    width, height = image.size
+    return int(width), int(height)
 
 
-def array_to_image(array: np.ndarray) -> Any:
-    """Wrap an HWC array as a PIL image, or pass it through when PIL cannot hold it (more than 4 channels)."""
+def array_to_image(array: NDArray[Any]) -> Any:
+    """Wrap an HWC array as a PIL image, or pass it through when PIL cannot hold it (more than 4 channels).
+
+    Examples:
+        >>> array_to_image(np.zeros((4, 6, 3), dtype=np.uint8)).size
+        (6, 4)
+        >>> array_to_image(np.zeros((4, 6, 9), dtype=np.uint8)).shape
+        (4, 6, 9)
+    """
     if array.ndim == 3 and array.shape[2] > 4:
         return array
     return Image.fromarray(array)
 
 
-class Normalize(object):
+class Normalize:
     def __init__(
         self,
-        mean: Tuple[float, ...] = (0.485, 0.456, 0.406),
-        std: Tuple[float, ...] = (0.229, 0.224, 0.225),
+        mean: tuple[float, ...] = (0.485, 0.456, 0.406),
+        std: tuple[float, ...] = (0.229, 0.224, 0.225),
     ) -> None:
         self._mean = tuple(mean)
         self._std = tuple(std)
-        # Built lazily per channel count so that >3-channel inputs (e.g. RGB
-        # plus an appended motion/flow channel) reuse the RGB statistics by
-        # cycling, matching how RFDETR extends means/stds for inference.
-        self._normalizers: Dict[int, Any] = {}
+        # Built per channel count: inputs with more channels than statistics (RGB + motion, stacked video
+        # frames) reuse the statistics by cycling, matching how RFDETR extends means/stds for inference.
+        self._normalizers: dict[int, _TVNormalize] = {}
 
-    def _normalizer_for(self, channels: int) -> Any:
+    def _normalizer_for(self, channels: int) -> _TVNormalize:
+        """Return the normalizer for a ``channels``-channel image, cycling the configured statistics."""
         if channels not in self._normalizers:
-            from itertools import cycle, islice
-
             mean = list(islice(cycle(self._mean), channels))
             std = list(islice(cycle(self._std), channels))
             self._normalizers[channels] = _TVNormalize(mean, std)
         return self._normalizers[channels]
 
-    def __call__(
-        self, image: torch.Tensor, target: Optional[Dict[str, Any]] = None
-    ) -> Tuple[torch.Tensor, Optional[Dict[str, Any]]]:
+    def __call__(self, image: Tensor, target: dict[str, Any] | None = None) -> tuple[Tensor, dict[str, Any] | None]:
+        """Normalize image and convert target coordinates to relative format.
+
+        Applies ImageNet-style channel normalization to the image, then converts
+        bounding boxes from absolute xyxy pixel coordinates to normalized cxcywh
+        format (divided by ``[w, h, w, h]``) and scales keypoint x/y by image
+        width/height respectively.
+
+        Args:
+            image: CHW float tensor to normalize.
+            target: Optional dict with keys ``"boxes"`` (xyxy pixel coords,
+                shape ``[N, 4]``) and/or ``"keypoints"`` (shape ``[N, K, 3]``
+                where the third channel is visibility). Mutated copy returned;
+                original is not modified.
+
+        Returns:
+            Tuple of ``(normalized_image, target)`` where ``target`` has boxes
+            in normalized cxcywh format and keypoints scaled to ``[0, 1]``, or
+            ``(normalized_image, None)`` when ``target`` is ``None``.
+
+        Examples:
+            >>> import torch
+            >>> normalize = Normalize()
+            >>> img = torch.zeros(3, 64, 64)
+            >>> out_img, out_tgt = normalize(img, None)
+            >>> out_tgt is None
+            True
+        """
         image = self._normalizer_for(image.shape[-3])(image)
         if target is None:
             return image, None
@@ -87,11 +136,9 @@ class Normalize(object):
             boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
             target["boxes"] = boxes
         if "keypoints" in target:
-            # keypoints are [N, K, 3] as (x, y, visibility); normalise x, y to [0, 1] and leave visibility untouched.
-            keypoints = target["keypoints"].clone().float()
-            if keypoints.numel() > 0:
-                keypoints[..., 0] = keypoints[..., 0] / w
-                keypoints[..., 1] = keypoints[..., 1] / h
+            keypoints = target["keypoints"].clone()  # shape: (N, K, 3) — x, y, visibility
+            keypoints[..., 0] = keypoints[..., 0] / w
+            keypoints[..., 1] = keypoints[..., 1] / h
             target["keypoints"] = keypoints
         return image, target
 
@@ -102,12 +149,9 @@ class Normalize(object):
 # These transforms modify spatial coordinates, so bounding boxes must be transformed accordingly.
 # For custom geometric transforms, add the class name to this set.
 GEOMETRIC_TRANSFORMS = {
-    # Flips and transpositions
-    "HorizontalFlip",
+    # Flips and transpositions not covered by HFLIP_TRANSFORM_NAMES
     "VerticalFlip",
-    "Flip",
     "Transpose",
-    "D4",
     # Rotations and affine transforms
     "Rotate",
     "RandomRotate90",
@@ -140,51 +184,72 @@ GEOMETRIC_TRANSFORMS = {
     "Resize",
     "SmallestMaxSize",
     "LongestMaxSize",
+    "CappedLongestMaxSize",
     "RandomScale",
     "Downscale",
     # Padding and symmetry
     "PadIfNeeded",
     "Pad",
-    "SquareSymmetry",
-}
+} | HFLIP_TRANSFORM_NAMES
 
 # Albumentations container/meta transforms that hold nested transforms
 ALBUMENTATIONS_CONTAINERS = frozenset({"OneOf", "SomeOf", "Sequential"})
 
-#: Container transforms defined here rather than by albumentations.
+# Container transforms defined here rather than by albumentations.
 CUSTOM_CONTAINERS = frozenset({"ChannelSubset"})
 
-#: Everything that takes a nested ``transforms`` list.
+# Everything that takes a nested ``transforms`` list.
 CONTAINER_TRANSFORMS = ALBUMENTATIONS_CONTAINERS | CUSTOM_CONTAINERS
 
-_CHANNEL_SUBSET_CLS = None
+# Config name for the conditional-cap resize transform built by _capped_longest_max_size_cls().
+_CAPPED_LONGEST_MAX_SIZE_NAME = "CappedLongestMaxSize"
 
 
-def _channel_subset_cls() -> type:
-    """Return the ``ChannelSubset`` transform class, building it on first use.
+@cache
+def _capped_longest_max_size_cls() -> type:
+    """Build a ``LongestMaxSize`` subclass that only shrinks, never upscales.
 
-    ``albumentations`` is an optional import, so its ``ImageOnlyTransform`` base class may not exist when this module is
-    imported.  Defining the subclass lazily keeps the module importable without it, matching the rest of the file.
+    Standard ``alb.LongestMaxSize`` always forces the longest side to exactly ``max_size``, scaling the image up
+    when its current longest side is smaller than the target. Chained after ``SmallestMaxSize`` (as in RF-DETR's
+    non-square training resize), this silently inflates every image whose aspect ratio keeps the long side below
+    ``max_size`` — the common case, since ``max_size`` defaults to the DETR-style 1333 cap while typical training
+    resolutions are far smaller.
+
+    This subclass clamps the resolved scale factor to ``<= 1.0``, giving it torchvision
+    ``RandomResize``-style conditional-cap semantics: a no-op when the image already fits within ``max_size``, a
+    shrink when it doesn't. Lazily defined (not at module scope) so importing this module never requires
+    Albumentations to be installed.
+
+    Returns:
+        A ``LongestMaxSize`` subclass with capped (never-upscale) resize behaviour.
     """
-    global _CHANNEL_SUBSET_CLS
-    if _CHANNEL_SUBSET_CLS is not None:
-        return _CHANNEL_SUBSET_CLS
 
-    _require_albumentations()
+    class CappedLongestMaxSize(alb.LongestMaxSize):  # type: ignore[misc]
+        def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+            resolved: dict[str, Any] = super().get_params_dependent_on_data(params, data)
+            resolved["scale"] = min(resolved["scale"], 1.0)
+            return resolved
 
-    class ChannelSubset(alb.ImageOnlyTransform):
+    return CappedLongestMaxSize
+
+
+@cache
+def _channel_subset_cls() -> type:
+    """Build the ``ChannelSubset`` transform class.
+
+    Lazily defined (not at module scope) so importing this module never requires Albumentations to be installed.
+
+    Returns:
+        An ``ImageOnlyTransform`` subclass applying nested transforms to a subset of the image's channels.
+    """
+
+    class ChannelSubset(alb.ImageOnlyTransform):  # type: ignore[misc]
         """Apply nested transforms to a subset of the image's channels, leaving the rest untouched.
 
-        Photometric augmentation assumes its input is an intensity image: brightness and contrast add and scale pixel
-        values, and saturation and hue mix channels together as colour.  None of that is meaningful on a channel that
-        encodes motion rather than appearance -- a brightness offset applied to an optical-flow magnitude invents motion
-        in stationary background, and a hue rotation blends unrelated motion operators into each other.  Albumentations
-        applies a transform to every channel it is given, so on a motion-infused image the only way to augment the
-        appearance channels is to hand the transform nothing else.
-
-        This splits the image, runs the nested transforms on the selected channels alone, and writes the result back.
-        Each nested transform keeps its own probability.  It is deliberately not registered as a geometric transform:
-        it never moves a pixel, so bounding boxes are unaffected.
+        Photometric augmentation assumes an intensity image; on a channel that encodes motion a brightness offset
+        invents motion in stationary background and a hue rotation blends unrelated channels. This splits the image,
+        runs the nested transforms (each with its own probability) on the selected channels alone and writes the
+        result back. It never moves a pixel, so it is not geometric and bounding boxes are unaffected.
 
         Args:
             channels: Channel indices to augment, e.g. ``[0, 1, 2]`` for the RGB planes of an RGB+flow image.
@@ -192,7 +257,7 @@ def _channel_subset_cls() -> type:
             p: Probability of applying this wrapper at all.
         """
 
-        def __init__(self, channels: Sequence[int], transforms: Sequence[Any], p: float = 1.0):
+        def __init__(self, channels: Sequence[int], transforms: Sequence[Any], p: float = 1.0) -> None:
             super().__init__(p=p)
             if not channels:
                 raise ValueError("'ChannelSubset.channels' must be a non-empty list of channel indices")
@@ -201,7 +266,7 @@ def _channel_subset_cls() -> type:
             self.channels = [int(c) for c in channels]
             self.transforms = list(transforms)
 
-        def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        def apply(self, img: NDArray[Any], **params: Any) -> NDArray[Any]:
             if img.ndim != 3:
                 raise ValueError(f"ChannelSubset expects an HxWxC image, got shape {img.shape}")
 
@@ -221,10 +286,9 @@ def _channel_subset_cls() -> type:
             augmented[:, :, self.channels] = subset
             return augmented
 
-        def get_transform_init_args_names(self) -> Tuple[str, ...]:
+        def get_transform_init_args_names(self) -> tuple[str, ...]:
             return ("channels", "transforms")
 
-    _CHANNEL_SUBSET_CLS = ChannelSubset
     return ChannelSubset
 
 
@@ -257,30 +321,17 @@ def _is_geometric_transform(transform: alb.BasicTransform) -> bool:
     return False
 
 
-def _require_albumentations() -> None:
-    """Raise if ``albumentations`` is unavailable.
-
-    The resize to the model's training resolution is built through the same Albumentations config path as the
-    optional augmentations, so a missing install silently produces zero transforms: images then reach the model at
-    their native size while boxes are normalised against it, and the resulting geometry no longer matches what
-    inference feeds the network. Fail loudly instead.
-    """
-    if alb is None:
-        raise ImportError(
-            "albumentations is required to build the transform pipeline (it provides the resize to the model's "
-            "training resolution, not just augmentation). Install it with `pip install albumentations`."
-        )
-
-
-def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransform:
+def _build_albu_transform(name: str, params: dict[str, Any]) -> alb.BasicTransform:
     """Build a single Albumentations transform from its name and parameter dict.
 
-    Handles container transforms (``OneOf``, ``SomeOf``, ``Sequential``) by recursively building the nested
-    ``transforms`` list.  Leaf transforms are instantiated directly from the ``albumentations`` namespace.
+    Handles container transforms (``OneOf``, ``SomeOf``, ``Sequential``, ``ChannelSubset``) by recursively building the
+    nested ``transforms`` list.  Leaf transforms are instantiated directly from the ``albumentations`` namespace.
 
-    Both ``OneOf`` and ``Sequential`` always fire (``p=1.0`` is forced, ignoring any user-supplied ``p``).  For
-    ``OneOf``, which child is applied is determined by the children's own ``p`` values; at least one nested transform is
-    required.  ``Sequential`` runs all transforms in order.
+    For ``OneOf`` and ``Sequential``, the container-level ``p`` is respected when
+    explicitly provided. When omitted, RF-DETR defaults it to ``1.0`` to preserve
+    existing behavior. For ``OneOf``, which child is applied (when the container fires)
+    is determined by the children's own ``p`` values; at least one nested transform is required.
+    ``Sequential`` runs all transforms in order when the container fires.
 
     Args:
         name: Transform name (e.g. ``"HorizontalFlip"``, ``"OneOf"``).
@@ -291,6 +342,7 @@ def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransfo
         Instantiated Albumentations transform.
 
     Raises:
+        ImportError: If Albumentations is not installed.
         ValueError: If ``name`` is unknown or ``params`` is malformed.
 
     Examples:
@@ -305,11 +357,17 @@ def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransfo
         >>> isinstance(container, OneOf)
         True
     """
+    if alb is None:
+        raise ImportError(
+            "Custom Albumentations augmentations require the optional augmentation extra. "
+            "Install with: pip install 'rfdetr[augment]'"
+        )
+
     if name in CONTAINER_TRANSFORMS:
         raw_nested = params.get("transforms", [])
         if not isinstance(raw_nested, list):
             raise ValueError(f"'{name}.transforms' must be a list, got {type(raw_nested).__name__}")
-        nested_transforms: List[alb.BasicTransform] = []
+        nested_transforms: list[alb.BasicTransform] = []
         for entry in raw_nested:
             if not isinstance(entry, dict) or len(entry) != 1:
                 raise ValueError(f"Each nested transform entry must be a single-key dict, got {entry!r}")
@@ -324,29 +382,26 @@ def _build_albu_transform(name: str, params: Dict[str, Any]) -> alb.BasicTransfo
         if name == "OneOf":
             if not nested_transforms:
                 raise ValueError("'OneOf' requires at least one transform")
-            other_params = {k: v for k, v in params.items() if k not in ("transforms", "p")}
-            other_params["p"] = 1.0  # OneOf always fires; selection is via per-child p
+            other_params = {k: v for k, v in params.items() if k != "transforms"}
+            other_params.setdefault("p", 1.0)
         elif name == "Sequential":
-            other_params = {k: v for k, v in params.items() if k not in ("transforms", "p")}
-            other_params["p"] = 1.0  # Sequential always runs all transforms
+            other_params = {k: v for k, v in params.items() if k != "transforms"}
+            other_params.setdefault("p", 1.0)
         else:
             other_params = {k: v for k, v in params.items() if k != "transforms"}
 
-        if name in CUSTOM_CONTAINERS:
-            container_cls = _channel_subset_cls()
-        else:
-            container_cls = getattr(alb, name, None)
+        container_cls = _channel_subset_cls() if name in CUSTOM_CONTAINERS else getattr(alb, name, None)
         if container_cls is None:
             raise ValueError(f"Unknown Albumentations container: {name!r}")
         return container_cls(transforms=nested_transforms, **other_params)
 
-    aug_cls = getattr(alb, name, None)
+    aug_cls = _capped_longest_max_size_cls() if name == _CAPPED_LONGEST_MAX_SIZE_NAME else getattr(alb, name, None)
     if aug_cls is None:
         raise ValueError(f"Unknown Albumentations transform: {name!r}")
     return aug_cls(**_normalize_albu_params(name, params, aug_cls))
 
 
-@lru_cache(maxsize=None)
+@cache
 def _random_sized_crop_uses_size_param(aug_cls: type) -> bool:
     """Return whether ``RandomSizedCrop`` expects a ``size`` keyword.
 
@@ -360,12 +415,11 @@ def _random_sized_crop_uses_size_param(aug_cls: type) -> bool:
     Returns:
         ``True`` when the class accepts a ``size`` keyword argument; otherwise ``False``.
     """
-
-    signature = inspect.signature(aug_cls.__init__)
+    signature = inspect.signature(aug_cls)
     return "size" in signature.parameters
 
 
-def _normalize_albu_params(name: str, params: Dict[str, Any], aug_cls: type) -> Dict[str, Any]:
+def _normalize_albu_params(name: str, params: dict[str, Any], aug_cls: type) -> dict[str, Any]:
     """Normalize transform params across Albumentations API variations.
 
     Currently this adapts ``RandomSizedCrop`` arguments so a config using ``height``/``width`` works on Albumentations
@@ -389,7 +443,6 @@ def _normalize_albu_params(name: str, params: Dict[str, Any], aug_cls: type) -> 
         ... )
         {'min_max_height': [384, 600], 'size': (640, 640)}
     """
-
     normalized_params = dict(params)
     if name != "RandomSizedCrop":
         return normalized_params
@@ -467,8 +520,18 @@ class AlbumentationsWrapper:
     transforms (for example ``OneOf`` and ``Sequential``). For geometric transforms, bbox_params are automatically
     configured to handle coordinate transformations, clip boxes to image boundaries, and remove invalid boxes.
 
+    Note:
+        When masks are present, a geometric transform re-derives each box from its transformed mask (exclusive end,
+        pixel-snapped) and drops instances whose non-empty mask became empty. Box-only instances (empty input mask)
+        keep the Albumentations box.
+
     Args:
         transform: Albumentations transform to apply (e.g., alb.HorizontalFlip, alb.GaussianBlur).
+        keypoint_flip_pairs: Joint index pairs for left/right swapping after a horizontal flip.
+            ``None`` (default) means a detection pipeline -- no keypoint handling.
+            An empty list ``[]`` marks a keypoint pipeline without semantic flip
+            pairs, so horizontal-flip transforms should have been stripped from
+            config before this point.
 
     Examples:
         >>> from albumentations import GaussianBlur, HorizontalFlip
@@ -484,16 +547,44 @@ class AlbumentationsWrapper:
 
     Note:
         For custom geometric transforms, add the transform class name to the GEOMETRIC_TRANSFORMS set at module level.
+
+    Raises:
+        ImportError: If Albumentations is not installed.
     """
 
-    def __init__(self, transform: alb.BasicTransform) -> None:
+    def __init__(self, transform: alb.BasicTransform, keypoint_flip_pairs: list[int] | None = None) -> None:
+        if alb is None:
+            raise ImportError(
+                "Custom Albumentations augmentations require the optional augmentation extra. "
+                "Install with: pip install 'rfdetr[augment]'"
+            )
+
         # Auto-detect if transform is geometric (recursively for containers)
         self._is_geometric = _is_geometric_transform(transform)
+        self._keypoint_flip_pairs = list(keypoint_flip_pairs or [])
+        self._uses_execution_log = False
 
         if self._is_geometric:
             # Wrap geometric transform with bbox handling capabilities
             # bbox_params configure how Albumentations should transform bounding boxes:
-            self.transform = alb.Compose(
+            needs_swap = bool(self._keypoint_flip_pairs)
+            # Log entries exist only because Albumentations' update_params_shape injects a
+            # "shape" key into params; a param-less custom transform without that injection
+            # would silently drop out of parity tracking.
+            self._uses_execution_log = needs_swap and self._records_each_applied_transform(transform)
+            if self._uses_execution_log:
+                # ReplayCompose deep-copies params per step; pointless once the log decides the swap.
+                compose_cls = alb.Compose
+            elif needs_swap and hasattr(alb, "ReplayCompose"):
+                compose_cls = alb.ReplayCompose
+            else:
+                if needs_swap:
+                    logger.warning(
+                        "albumentations.ReplayCompose not available; horizontal-flip keypoint "
+                        "slot swapping is disabled. Upgrade albumentations to >=1.3."
+                    )
+                compose_cls = alb.Compose
+            self.transform = compose_cls(
                 [transform],
                 bbox_params=alb.BboxParams(
                     format="pascal_voc",  # Boxes are in (x1, y1, x2, y2) format
@@ -501,14 +592,15 @@ class AlbumentationsWrapper:
                     min_visibility=0.0,  # Remove boxes with zero visibility/area after transformation
                     clip=True,  # Clip box coordinates to image boundaries after transformation
                 ),
-                # remove_invisible=False keeps every keypoint in place so the flat list stays 1:1 with its source
-                # instance/slot; keypoints pushed out of frame are marked absent afterwards rather than dropped here.
                 keypoint_params=alb.KeypointParams(
                     format="xy",
-                    label_fields=["keypoint_idxs"],
+                    label_fields=["keypoint_instance_ids", "keypoint_point_ids", "keypoint_visibility"],
                     remove_invisible=False,
                 ),
             )
+            self.transform.save_applied_params = self._uses_execution_log
+            if needs_swap and not self._uses_execution_log:
+                self._warn_unlogged_repeating_container(transform)
         else:
             # Wrap non-geometric transform without bbox handling
             # Simpler composition since boxes don't need transformation
@@ -536,7 +628,7 @@ class AlbumentationsWrapper:
         return f"{self.__class__.__name__}(transform={transform}, type={transform_type})"
 
     @staticmethod
-    def _boxes_to_numpy(boxes: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+    def _boxes_to_numpy(boxes: Tensor | NDArray[Any]) -> NDArray[Any]:
         """Convert boxes to numpy array and validate shape.
 
         >>> import torch
@@ -550,7 +642,276 @@ class AlbumentationsWrapper:
         return boxes_np
 
     @staticmethod
-    def _clear_per_instance_fields(target: Dict[str, Any], num_boxes: int) -> Dict[str, Any]:
+    def _keypoints_to_numpy(keypoints: Tensor | NDArray[Any], num_boxes: int) -> NDArray[Any]:
+        """Convert keypoints to numpy array and validate shape.
+
+        >>> import torch
+        >>> keypoints = torch.tensor([[[10.0, 20.0, 2.0]]])
+        >>> AlbumentationsWrapper._keypoints_to_numpy(keypoints, 1).shape
+        (1, 1, 3)
+        """
+        keypoints_np = keypoints.cpu().numpy() if torch.is_tensor(keypoints) else np.array(keypoints)
+        if len(keypoints_np.shape) != 3 or keypoints_np.shape[2] != 3:
+            raise ValueError(f"keypoints must have shape (N, K, 3), got {keypoints_np.shape}")
+        if keypoints_np.shape[0] != num_boxes:
+            raise ValueError(
+                f"keypoints first dimension must match number of boxes ({num_boxes}), got {keypoints_np.shape[0]}"
+            )
+        return keypoints_np
+
+    @staticmethod
+    def _build_albu_keypoints(
+        keypoints_np: NDArray[Any],
+        idxs: list[int],
+    ) -> dict[str, Any]:
+        """Flatten per-instance keypoints into Albumentations keypoint fields.
+
+        >>> keypoints = np.array([[[10.0, 20.0, 2.0], [0.0, 0.0, 0.0]]], dtype=np.float32)
+        >>> fields = AlbumentationsWrapper._build_albu_keypoints(keypoints, [0])
+        >>> fields["keypoints"]
+        [(10.0, 20.0), (0.0, 0.0)]
+        """
+        albu_keypoints: list[tuple[float, float]] = []
+        instance_ids: list[float] = []
+        point_ids: list[float] = []
+        visibility: list[float] = []
+        for original_idx in idxs:
+            for point_idx, point in enumerate(keypoints_np[original_idx]):
+                x, y, visible = point.tolist()
+                albu_keypoints.append((float(x), float(y)))
+                instance_ids.append(float(original_idx))
+                point_ids.append(float(point_idx))
+                visibility.append(float(visible))
+        return {
+            "keypoints": albu_keypoints,
+            "keypoint_instance_ids": instance_ids,
+            "keypoint_point_ids": point_ids,
+            "keypoint_visibility": visibility,
+        }
+
+    @staticmethod
+    def _records_each_applied_transform(transform: alb.BasicTransform) -> bool:
+        """Return whether every container records each applied child occurrence.
+
+        Programmatic containers such as ``OneOrOther`` omit execution records, so their pipelines must retain replay-
+        based flip handling.
+
+        Args:
+            transform: Albumentations transform or container to inspect.
+
+        Returns:
+            ``True`` when execution logging covers every nested transform.
+        """
+        return AlbumentationsWrapper._first_unlogged_container(transform) is None
+
+    @staticmethod
+    def _first_unlogged_container(transform: alb.BasicTransform) -> str | None:
+        """Return the class name of the first container that disables execution logging.
+
+        Any container type outside the exact-name allowlist -- including a subclass of an
+        allowlisted class -- blocks execution logging for the whole tree.
+
+        Args:
+            transform: Albumentations transform or container to inspect.
+
+        Returns:
+            Class name of the offending container, or ``None`` when the tree is fully logged.
+        """
+        if not hasattr(transform, "transforms"):
+            return None
+        if type(transform).__name__ not in CONTAINER_TRANSFORM_NAMES | {"Compose", "ReplayCompose", "RandomOrder"}:
+            return type(transform).__name__
+        for child in transform.transforms:
+            offender = AlbumentationsWrapper._first_unlogged_container(child)
+            if offender is not None:
+                return offender
+        return None
+
+    @staticmethod
+    def _has_repeating_some_of(transform: alb.BasicTransform) -> bool:
+        """Return whether the tree contains a ``SomeOf`` drawing the same child more than once.
+
+        Args:
+            transform: Albumentations transform or container to inspect.
+
+        Returns:
+            ``True`` when a ``SomeOf(replace=True)`` node -- or a subclass of one -- with
+            ``n > 1`` is present.
+        """
+        # isinstance, not an exact name check: a SomeOf subclass repeats draws just the same.
+        if isinstance(transform, alb.SomeOf) and getattr(transform, "replace", False):
+            if int(getattr(transform, "n", 1) or 1) > 1:
+                return True
+        children = getattr(transform, "transforms", None)
+        if not children:
+            return False
+        return any(AlbumentationsWrapper._has_repeating_some_of(child) for child in children)
+
+    @staticmethod
+    def _warn_unlogged_repeating_container(transform: alb.BasicTransform) -> None:
+        """Warn once when replay fallback can mislabel repeated ``SomeOf(replace=True)`` draws.
+
+        Replay metadata stores each transform once, so a child drawn twice by
+        ``SomeOf(replace=True)`` collapses into a single entry and the horizontal-flip parity
+        derived from it can be wrong. Only fires for keypoint pipelines, which are the only
+        consumers of that parity.
+
+        Args:
+            transform: Albumentations transform or container wrapped by this instance.
+        """
+        if not AlbumentationsWrapper._has_repeating_some_of(transform):
+            return
+        offender = AlbumentationsWrapper._first_unlogged_container(transform)
+        logger.warning(
+            "Albumentations container %r is not recognised for execution logging, so keypoint "
+            "horizontal-flip parity falls back to replay metadata. Repeated draws from "
+            "SomeOf(replace=True) collapse into a single replay entry and the paired-joint swap "
+            "may be applied incorrectly.",
+            offender or "unknown",
+        )
+
+    @staticmethod
+    def _replay_horizontal_flip_parity(replay: Any) -> bool:
+        """Return whether Albumentations replay metadata applied an odd number of horizontal flips.
+
+        Only horizontal mirrors are counted; vertical flips, transposes and non-``h`` ``D4``
+        elements never toggle the keypoint-slot swap.
+
+        Args:
+            replay: ``ReplayCompose`` metadata from an Albumentations call.
+
+        Returns:
+            ``True`` only when the applied horizontal mirrors require a keypoint-slot swap.
+        """
+        if not isinstance(replay, dict):
+            return False
+
+        transforms = replay.get("transforms")
+        if isinstance(transforms, list):
+            return (
+                sum(AlbumentationsWrapper._replay_horizontal_flip_parity(transform) for transform in transforms) % 2
+                == 1
+            )
+
+        if not replay.get("applied", False):
+            return False
+
+        transform_name = str(replay.get("__class_fullname__", "")).rsplit(".", 1)[-1]
+        if transform_name in HORIZONTAL_FLIP_ALIAS_NAMES:
+            return True
+        if transform_name == "Flip":
+            params = replay.get("params") or {}
+            return int(params.get("axis", params.get("d", -1))) == 1
+        if transform_name in D4_ALIAS_NAMES:
+            params = replay.get("params") or {}
+            return str(params.get("group_element")) == "h"
+        return False
+
+    @staticmethod
+    def _rebuild_keypoints_from_albu(
+        augmented: dict[str, Any],
+        kept_idxs: list[int],
+        keypoints_np: NDArray[Any],
+        flip_pairs: list[int] | None = None,
+        did_flip: bool = False,
+    ) -> Tensor:
+        """Rebuild transformed keypoints and keep them synchronized with kept boxes.
+
+        Args:
+            augmented: Augmented output dict from Albumentations.
+            kept_idxs: Original instance indices of surviving boxes.
+            keypoints_np: Original keypoint array, shape (N_orig, K, 3).
+            flip_pairs: Flat list of paired joint indices ``[a0, b0, a1, b1, ...]``
+                to swap when a horizontal flip is detected.  Each consecutive pair
+                ``(flip_pairs[i], flip_pairs[i+1])`` names two joints that are
+                left/right mirrors of each other (e.g., left_eye, right_eye).
+            did_flip: Whether a horizontal flip was applied this step.
+
+        Returns:
+            Keypoint tensor of shape ``(len(kept_idxs), K, 3)``.
+        """
+        num_keypoints = keypoints_np.shape[1]
+        keypoints_out = np.zeros((len(kept_idxs), num_keypoints, 3), dtype=np.float32)
+        kept_position_by_idx = {int(original_idx): position for position, original_idx in enumerate(kept_idxs)}
+        height, width = augmented["image"].shape[:2]
+
+        albu_kps = augmented.get("keypoints", [])
+        if albu_kps:
+            inst_ids = augmented.get("keypoint_instance_ids", [])
+            pt_ids = augmented.get("keypoint_point_ids", [])
+            visible = augmented.get("keypoint_visibility", [])
+            xy = np.asarray([(float(p[0]), float(p[1])) for p in albu_kps], dtype=np.float32)
+            inst = np.array([kept_position_by_idx.get(int(ii), -1) for ii in inst_ids], dtype=np.intp)
+            ptid = np.array([int(p) for p in pt_ids], dtype=np.intp)
+            vis = np.asarray([float(v) for v in visible], dtype=np.float32)
+            valid = (
+                (inst >= 0)
+                & (ptid >= 0)
+                & (ptid < num_keypoints)
+                & (vis > 0)
+                & (xy[:, 0] >= 0)
+                & (xy[:, 0] < width)
+                & (xy[:, 1] >= 0)
+                & (xy[:, 1] < height)
+            )
+            valid_idx = np.where(valid)[0]
+            if len(valid_idx) > 0:
+                keypoints_out[inst[valid_idx], ptid[valid_idx]] = np.column_stack([xy[valid_idx], vis[valid_idx]])
+
+        result = torch.as_tensor(keypoints_out, dtype=torch.float32)
+
+        if did_flip and flip_pairs:
+            # Build permutation index and apply in a single indexed gather (O(1) dispatch vs O(K) clones)
+            num_kpts = result.shape[1]
+            perm = torch.arange(num_kpts)
+            for i in range(0, len(flip_pairs) - 1, 2):
+                ai, bi = flip_pairs[i], flip_pairs[i + 1]
+                if ai < num_kpts and bi < num_kpts:
+                    perm[ai] = bi
+                    perm[bi] = ai
+            result = result[:, perm, :]
+
+        return result
+
+    def _resolve_keypoint_swap(
+        self,
+        augmented: dict[str, Any],
+        kept_idxs: list[int],
+        keypoints_np: NDArray[Any],
+    ) -> Tensor:
+        """Rebuild keypoints, swapping paired joints when horizontal-flip parity is odd.
+
+        Prefers the execution log, which records every applied child occurrence, and falls back
+        to ``ReplayCompose`` metadata otherwise. The log entries are reshaped into replay-shaped
+        dicts so a single parity predicate serves both sources.
+
+        Args:
+            augmented: Augmented output dict from Albumentations.
+            kept_idxs: Original instance indices of surviving boxes.
+            keypoints_np: Original keypoint array, shape (N_orig, K, 3).
+
+        Returns:
+            Keypoint tensor of shape ``(len(kept_idxs), K, 3)``.
+        """
+        replay = augmented.get("replay")
+        if self._uses_execution_log and "applied_transforms" in augmented:
+            replay = {
+                "transforms": [
+                    {"__class_fullname__": name, "params": params, "applied": True}
+                    for name, params in augmented["applied_transforms"]
+                ]
+            }
+        did_flip = self._replay_horizontal_flip_parity(replay) if self._keypoint_flip_pairs else False
+        return self._rebuild_keypoints_from_albu(
+            augmented,
+            kept_idxs,
+            keypoints_np,
+            flip_pairs=self._keypoint_flip_pairs,
+            did_flip=did_flip,
+        )
+
+    @staticmethod
+    def _clear_per_instance_fields(target: dict[str, Any], num_boxes: int) -> dict[str, Any]:
         """Clear all per-instance fields when no boxes remain.
 
         >>> import torch
@@ -559,10 +920,14 @@ class AlbumentationsWrapper:
         >>> cleared["area"].shape
         torch.Size([0])
         """
-        # Fields that are global properties, not per-instance
-        global_fields = {"boxes", "labels", "orig_size", "size", "image_id"}
+        # Image-level fields shared with the torchvision backend (IMAGE_LEVEL_TARGET_FIELDS),
+        # plus ``boxes``/``labels`` which are handled separately. ``labels`` stays global here
+        # because the Albumentations pipeline re-syncs it from ``category_ids`` (its label_field)
+        # after the transform, so it must NOT be sliced by this per-instance filter — unlike the
+        # torchvision path in ``_torchvision.py``, which filters ``labels`` directly with its keep mask.
+        global_fields = {"boxes", "labels"} | IMAGE_LEVEL_TARGET_FIELDS
 
-        result = {}
+        result: dict[str, Any] = {}
         for key, value in target.items():
             if key in global_fields:
                 continue
@@ -575,7 +940,7 @@ class AlbumentationsWrapper:
         return result
 
     @staticmethod
-    def _filter_per_instance_fields(target: Dict[str, Any], num_boxes: int, kept_idxs: List[int]) -> Dict[str, Any]:
+    def _filter_per_instance_fields(target: dict[str, Any], num_boxes: int, kept_idxs: list[int]) -> dict[str, Any]:
         """Filter per-instance fields to match kept box indices.
 
         >>> import torch
@@ -584,10 +949,14 @@ class AlbumentationsWrapper:
         >>> filtered["area"].tolist()
         [100, 300]
         """
-        # Fields that are global properties, not per-instance
-        global_fields = {"boxes", "labels", "orig_size", "size", "image_id"}
+        # Image-level fields shared with the torchvision backend (IMAGE_LEVEL_TARGET_FIELDS),
+        # plus ``boxes``/``labels`` which are handled separately. ``labels`` stays global here
+        # because the Albumentations pipeline re-syncs it from ``category_ids`` (its label_field)
+        # after the transform, so it must NOT be sliced by this per-instance filter — unlike the
+        # torchvision path in ``_torchvision.py``, which filters ``labels`` directly with its keep mask.
+        global_fields = {"boxes", "labels"} | IMAGE_LEVEL_TARGET_FIELDS
 
-        result = {}
+        result: dict[str, Any] = {}
         kept_idxs_tensor = torch.as_tensor(kept_idxs, dtype=torch.long)
         for key, value in target.items():
             if key in global_fields:
@@ -600,13 +969,76 @@ class AlbumentationsWrapper:
                     result[key] = [value[i] for i in kept_idxs]
         return result
 
+    @staticmethod
+    def _sync_boxes_with_masks(
+        masks_aug: list[NDArray[Any]],
+        bboxes_aug: Any,
+        kept_idxs: list[int],
+        category_ids: list[int],
+        input_has_mask: NDArray[np.bool_],
+    ) -> tuple[NDArray[np.bool_], NDArray[np.float32], list[int], list[int]]:
+        """Re-derive boxes from transformed masks and drop instances whose mask left the canvas.
+
+        Albumentations moves a box by its four corners only, so after a rotation or warp the box drifts from the
+        mask, and an object pushed off the canvas can keep a partly visible box around an empty mask. For every
+        instance that had foreground before the transform: drop it when its transformed mask is empty, otherwise
+        replace its box by the mask's tight extent (exclusive end, as in ``pascal_voc``). Box-only instances (empty
+        input mask, e.g. COCO annotations without a polygon) and source instances that appear more than once
+        (reflecting border modes, whose copies share one composite mask) keep the Albumentations box.
+
+        Args:
+            masks_aug: Transformed masks, one per entry of ``kept_idxs``.
+            bboxes_aug: Albumentations boxes aligned with ``kept_idxs``, shape ``(K, 4)``.
+            kept_idxs: Original instance indices that survived the transform.
+            category_ids: Category ids aligned with ``kept_idxs``.
+            input_has_mask: Per original instance, whether its input mask had foreground.
+
+        Returns:
+            Tuple of stacked boolean masks ``(M, H, W)``, boxes ``(M, 4)``, ``kept_idxs`` and ``category_ids`` after
+            pruning.
+
+        >>> masks = [np.zeros((10, 10), dtype=np.uint8), np.zeros((10, 10), dtype=np.uint8)]
+        >>> masks[1][2:5, 3:8] = 1
+        >>> boxes = np.array([[0, 0, 4, 4], [0, 0, 9, 9]], dtype=np.float32)
+        >>> out = AlbumentationsWrapper._sync_boxes_with_masks(masks, boxes, [0, 1], [7, 8], np.array([True, True]))
+        >>> out[1].tolist(), out[2], out[3]
+        ([[3.0, 2.0, 8.0, 5.0]], [1], [8])
+        """
+        if len(masks_aug) == 0:
+            return np.zeros((0, 0, 0), dtype=bool), np.zeros((0, 4), dtype=np.float32), [], []
+        stack: NDArray[np.bool_] = np.stack(masks_aug) > 0
+        height, width = stack.shape[1:]
+        rows: NDArray[np.bool_] = np.asarray(stack.any(axis=2))
+        cols: NDArray[np.bool_] = np.asarray(stack.any(axis=1))
+        has_foreground = rows.any(axis=1)
+        y_min = rows.argmax(axis=1)
+        y_max = height - rows[:, ::-1].argmax(axis=1)
+        x_min = cols.argmax(axis=1)
+        x_max = width - cols[:, ::-1].argmax(axis=1)
+        mask_boxes = np.stack([x_min, y_min, x_max, y_max], axis=1).astype(np.float32)
+
+        original = np.asarray(kept_idxs, dtype=np.int64)
+        repeated = np.array([kept_idxs.count(i) > 1 for i in kept_idxs], dtype=bool)
+        had_mask = input_has_mask[original]
+        keep = ~had_mask | has_foreground
+        use_mask_box = had_mask & has_foreground & ~repeated
+        boxes = np.where(use_mask_box[:, None], mask_boxes, np.asarray(bboxes_aug, dtype=np.float32).reshape(-1, 4))
+        keep_positions = np.flatnonzero(keep).tolist()
+        return (
+            stack[keep],
+            boxes[keep].astype(np.float32),
+            [kept_idxs[i] for i in keep_positions],
+            [category_ids[i] for i in keep_positions],
+        )
+
     def _apply_geometric_transform(
-        self, image_np: np.ndarray, target: Dict[str, Any], labels: List[int]
-    ) -> Tuple[Image.Image, Dict[str, Any]]:
+        self, image_np: NDArray[np.uint8], target: dict[str, Any], labels: list[int]
+    ) -> tuple[Image.Image, dict[str, Any]]:
         """Apply geometric transform to image with boxes and optionally masks.
 
         Converts data to Albumentations format, applies the transform, and converts back to RF-DETR format. Handles box
-        removal and per-instance field filtering.
+        removal and per-instance field filtering. With masks, boxes are re-derived from the transformed masks and
+        instances whose mask became empty are dropped (see ``_sync_boxes_with_masks``).
 
         Args:
             image_np: Numpy array of image in HWC format.
@@ -614,7 +1046,8 @@ class AlbumentationsWrapper:
             labels: List of category labels.
 
         Returns:
-            Tuple of (transformed PIL Image, transformed target dict).
+            Tuple of (transformed PIL Image, transformed target dict). The image is an HWC array instead when it has
+            more than 4 channels (stacked video frames), which PIL cannot hold.
 
         >>> import torch
         >>> from albumentations import HorizontalFlip
@@ -637,23 +1070,9 @@ class AlbumentationsWrapper:
                 raise ValueError(f"masks must have shape (N, H, W), got {masks_np.shape}")
             masks_np = masks_np.astype(np.uint8, copy=False)
             masks_list = [mask for mask in masks_np]
-        # Flatten per-instance keypoints [N, K, 3] into a single (x, y) list for Albumentations, tracking which
-        # instance/slot each came from (and its original visibility) so they can be reassembled after the transform.
         keypoints_np = None
-        num_keypoint_slots = 0
-        flat_kp_xy: List[Tuple[float, float]] = []
-        flat_kp_meta: List[Tuple[int, int, float]] = []
         if "keypoints" in target:
-            keypoints = target["keypoints"]
-            keypoints_np = keypoints.cpu().numpy() if torch.is_tensor(keypoints) else np.array(keypoints)
-            if keypoints_np.ndim != 3 or keypoints_np.shape[-1] != 3:
-                raise ValueError(f"keypoints must have shape (N, K, 3), got {keypoints_np.shape}")
-            num_keypoint_slots = keypoints_np.shape[1]
-            for inst in range(keypoints_np.shape[0]):
-                for slot in range(num_keypoint_slots):
-                    x, y, v = keypoints_np[inst, slot]
-                    flat_kp_xy.append((float(x), float(y)))
-                    flat_kp_meta.append((inst, slot, float(v)))
+            keypoints_np = self._keypoints_to_numpy(target["keypoints"], num_boxes)
         # Filter out degenerate boxes (zero-width or zero-height) before passing to
         # Albumentations. Such boxes arise when an annotation sits exactly on or beyond
         # the image boundary so that x_min == x_max (or y_min == y_max) after clipping.
@@ -671,14 +1090,31 @@ class AlbumentationsWrapper:
         transform_kwargs = {"image": image_np, "bboxes": boxes_np, "category_ids": labels, "idxs": idxs}
         if masks_list is not None and len(masks_list) > 0:
             transform_kwargs["masks"] = masks_list
-        # keypoint_params is always configured on the geometric Compose, so keypoints/keypoint_idxs must always be
-        # supplied (empty when the target carries none).
-        transform_kwargs["keypoints"] = flat_kp_xy
-        transform_kwargs["keypoint_idxs"] = list(range(len(flat_kp_xy)))
+        if keypoints_np is not None:
+            transform_kwargs.update(self._build_albu_keypoints(keypoints_np, idxs))
+        else:
+            transform_kwargs.update(
+                {
+                    "keypoints": [],
+                    "keypoint_instance_ids": [],
+                    "keypoint_point_ids": [],
+                    "keypoint_visibility": [],
+                }
+            )
         augmented = self.transform(**transform_kwargs)
-        target_out: Dict[str, Any] = target.copy()
+        target_out: dict[str, Any] = target.copy()
         bboxes_aug = augmented["bboxes"]
-        kept_idxs = augmented.get("idxs", idxs)
+        category_ids = augmented["category_ids"]
+        kept_idxs = [int(idx) for idx in augmented.get("idxs", idxs)]
+
+        masks_stack = None
+        if masks_list is not None and "masks" in augmented:
+            input_has_mask = np.asarray(masks_np.reshape(num_boxes, -1).any(axis=1))
+            masks_aug = [augmented["masks"][int(i)] for i in kept_idxs]
+            masks_stack, bboxes_aug, kept_idxs, category_ids = self._sync_boxes_with_masks(
+                masks_aug, bboxes_aug, kept_idxs, category_ids, input_has_mask
+            )
+
         # Update target with transformed boxes and labels
         if len(bboxes_aug) == 0:
             target_out["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
@@ -690,48 +1126,23 @@ class AlbumentationsWrapper:
                 target_out["masks"] = torch.zeros((0, aug_height, aug_width), dtype=torch.bool)
         else:
             target_out["boxes"] = torch.as_tensor(bboxes_aug, dtype=torch.float32).reshape(-1, 4)
-            target_out["labels"] = torch.tensor(augmented["category_ids"], dtype=torch.long)
+            target_out["labels"] = torch.tensor(category_ids, dtype=torch.long)
             target_out.update(self._filter_per_instance_fields(target, num_boxes, kept_idxs))
             # Recompute area from the transformed box coordinates so it stays consistent with
             # the new image scale (e.g. after resize the original COCO area values are stale).
             if "area" in target_out:
                 boxes = target_out["boxes"]
                 target_out["area"] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            if keypoints_np is not None:
+                target_out["keypoints"] = self._resolve_keypoint_swap(augmented, kept_idxs, keypoints_np)
+            if masks_list is not None and "masks" in augmented:
+                target_out["masks"] = torch.as_tensor(masks_stack, dtype=torch.bool)
         image_out = array_to_image(augmented["image"])
-        if masks_list is not None and "masks" in augmented:
-            height, width = augmented["image"].shape[:2]
-            masks_aug = augmented["masks"]
-            masks_aug = [masks_aug[int(i)] for i in kept_idxs]
-            if len(masks_aug) == 0:
-                target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
-            else:
-                target_out["masks"] = torch.as_tensor(np.stack(masks_aug), dtype=torch.bool)
-        elif masks_list is not None:
-            # Zero-instance mask tensors bypass Albumentations, so resync their
-            # spatial dims to the transformed image.
-            height, width = augmented["image"].shape[:2]
-            target_out["masks"] = torch.zeros((0, height, width), dtype=torch.bool)
-        if keypoints_np is not None:
-            # Reassemble keypoints for the kept instances in their new order. A keypoint stays present only if it was
-            # visible in the source and still lands inside the transformed image; otherwise it is marked absent.
-            height, width = augmented["image"].shape[:2]
-            aug_kpts = augmented.get("keypoints", [])
-            aug_kidx = augmented.get("keypoint_idxs", list(range(len(aug_kpts))))
-            orig_to_new = {orig: new for new, orig in enumerate(kept_idxs)}
-            out_kpts = np.zeros((len(kept_idxs), num_keypoint_slots, 3), dtype=np.float32)
-            for (x, y), kidx in zip(aug_kpts, aug_kidx):
-                inst, slot, orig_v = flat_kp_meta[int(kidx)]
-                new_i = orig_to_new.get(inst)
-                if new_i is None:
-                    continue
-                if orig_v > 0 and 0.0 <= x <= width and 0.0 <= y <= height:
-                    out_kpts[new_i, slot] = (x, y, orig_v)
-            target_out["keypoints"] = torch.from_numpy(out_kpts)
         return image_out, target_out
 
     def __call__(
-        self, image: PIL.Image.Image, target: Optional[Dict[str, Any]]
-    ) -> Tuple[PIL.Image.Image, Optional[Dict[str, Any]]]:
+        self, image: PIL.Image.Image, target: dict[str, Any] | None
+    ) -> tuple[PIL.Image.Image, dict[str, Any] | None]:
         """Apply the Albumentations transform to image and target.
 
         This method handles the data format conversion between RF-DETR and Albumentations:
@@ -747,7 +1158,7 @@ class AlbumentationsWrapper:
         - Transforms masks when present to stay aligned with the image
 
         Args:
-            image: Input PIL Image in RGB format.
+            image: Input PIL Image, or an HWC array for images of more than 4 channels (stacked video frames).
             target: Target dictionary containing:
                 - 'labels': PyTorch tensor of shape (N,) with class labels
                 - 'boxes' (optional): PyTorch tensor of shape (N, 4) in (x1, y1, x2, y2) format
@@ -778,9 +1189,16 @@ class AlbumentationsWrapper:
         if target is None:
             image_np = np.array(image)
             if self._is_geometric:
-                # Geometric A.Compose requires label_fields even when there are no boxes/keypoints
+                # Geometric A.Compose requires label_fields even when there are no boxes
                 augmented = self.transform(
-                    image=image_np, bboxes=[], category_ids=[], idxs=[], keypoints=[], keypoint_idxs=[]
+                    image=image_np,
+                    bboxes=[],
+                    category_ids=[],
+                    idxs=[],
+                    keypoints=[],
+                    keypoint_instance_ids=[],
+                    keypoint_point_ids=[],
+                    keypoint_visibility=[],
                 )
             else:
                 augmented = self.transform(image=image_np)
@@ -823,8 +1241,10 @@ class AlbumentationsWrapper:
 
     @staticmethod
     def from_config(
-        config_dict: Union[Dict[str, Any], List[Dict[str, Any]]],
-    ) -> List["AlbumentationsWrapper"]:
+        config_dict: dict[str, Any] | list[dict[str, Any]],
+        keypoint_flip_pairs: list[int] | None = None,
+        strict: bool = False,
+    ) -> list[AlbumentationsWrapper]:
         """Build a list of :class:`AlbumentationsWrapper` instances from a config.
 
         Supports both a flat dictionary format (backward-compatible) and a list format that allows duplicate transform
@@ -864,12 +1284,23 @@ class AlbumentationsWrapper:
         Args:
             config_dict: Augmentation configuration -- either a ``dict`` mapping
                 transform names to parameter dicts, or a ``list`` of single-key dicts ``{name: params}``.
+            keypoint_flip_pairs: Joint index pairs for swapping left/right keypoints after a horizontal
+                flip (e.g. ``[0, 1, 2, 3]`` swaps joint 0↔1 and 2↔3). Pass ``None`` (default) for
+                detection pipelines where horizontal flips are always permitted. Pass an empty list
+                ``[]`` to mark a keypoint pipeline without any defined flip pairs -- horizontal-flip
+                augmentations are then disabled until flip-pair swapping is implemented.
+            strict: When ``True``, a transform that fails to build raises :class:`RuntimeError`
+                instead of being logged and skipped. Use for internally-generated pipelines (e.g. the
+                required resize stack) where a silently dropped transform would corrupt the output shape.
+                Defaults to ``False`` for user augmentation configs, which stay lenient.
 
         Returns:
             List of :class:`AlbumentationsWrapper` instances in config order.
 
         Raises:
+            ImportError: If Albumentations is not installed.
             TypeError: If *config_dict* is neither a ``dict`` nor a ``list``.
+            RuntimeError: If ``strict=True`` and a transform fails to build.
 
         Examples:
             >>> config = {
@@ -877,13 +1308,20 @@ class AlbumentationsWrapper:
             ...     "Rotate": {"limit": 45, "p": 0.3},
             ...     "GaussianBlur": {"p": 0.2}
             ... }
-            >>> transforms = AlbumentationsWrapper.from_config(config)
+            >>> transforms = AlbumentationsWrapper.from_config(config)  # doctest: +ELLIPSIS
+            [...] [INFO] rf-detr - Built 3 Albumentations transforms from config
             >>> [t.transform.transforms[0].__class__.__name__ for t in transforms]
             ['HorizontalFlip', 'Rotate', 'GaussianBlur']
 
         Note:
             Invalid transforms or invalid parameters are logged and skipped gracefully.
         """
+        original_config_empty = isinstance(config_dict, (dict, list)) and len(config_dict) == 0
+        config_dict = filter_keypoint_hflip_augmentations(
+            config_dict,
+            include_keypoints=keypoint_flip_pairs is not None and not keypoint_flip_pairs,
+            warn=logger.warning,
+        )
         if isinstance(config_dict, list):
             entries = config_dict
         elif isinstance(config_dict, dict):
@@ -892,10 +1330,16 @@ class AlbumentationsWrapper:
             raise TypeError(f"config_dict must be a dictionary or list, got {type(config_dict)}")
 
         if not entries:
+            if not original_config_empty:
+                return []
             logger.warning("Empty augmentation config provided, no transforms will be applied")
             return []
 
-        _require_albumentations()
+        if alb is None:
+            raise ImportError(
+                "Custom Albumentations augmentations require the optional augmentation extra. "
+                "Install with: pip install 'rfdetr[augment]'"
+            )
 
         transforms = []
         for entry in entries:
@@ -921,8 +1365,10 @@ class AlbumentationsWrapper:
 
             try:
                 transform = _build_albu_transform(aug_name, params)
-                transforms.append(AlbumentationsWrapper(transform))
+                transforms.append(AlbumentationsWrapper(transform, keypoint_flip_pairs=keypoint_flip_pairs))
             except Exception as e:
+                if strict:
+                    raise RuntimeError(f"Failed to build required transform {aug_name!r}: {e}") from e
                 logger.warning(
                     "Failed to initialize %s with params %r: %s. Skipping.",
                     aug_name,

@@ -14,8 +14,13 @@
 # ------------------------------------------------------------------------
 """Backbone modules."""
 
+from __future__ import annotations
+
+from typing import Any, cast
+
 import torch
 import torch.nn.functional as F  # noqa: N812
+from torch import Tensor, nn
 
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
@@ -29,18 +34,56 @@ logger = get_logger()
 __all__ = ["Backbone"]
 
 
+def _encode(backbone: Any, tensors: Tensor) -> tuple[list[Tensor], Any]:
+    """Run encoder + projector. Returns the projected maps and the reference frame's raw encoder maps.
+
+    A plain function so duck-typed backbones work. With a ``TemporalFusion`` module the frames stacked on
+    the channel axis share encoder and projector, and their projected maps are fused.
+    """
+    fusion = getattr(backbone, "temporal_fusion", None)
+    if not isinstance(fusion, TemporalFusion):
+        raw_feats = backbone.encoder(tensors)
+        return backbone.projector(raw_feats), raw_feats
+
+    frames_per_sample = fusion.num_frames
+    batch, stacked_channels, height, width = tensors.shape
+    if stacked_channels % frames_per_sample != 0:
+        raise ValueError(
+            f"Input has {stacked_channels} channels, which does not split into "
+            f"{frames_per_sample} frames. Stack the frames along the channel axis, reference first."
+        )
+    frames = tensors.reshape(batch, frames_per_sample, -1, height, width)
+
+    if backbone.temporal_context_grad or not torch.is_grad_enabled():
+        raw_all = backbone.encoder(frames.flatten(0, 1))
+        feats = [f.reshape(batch, frames_per_sample, *f.shape[1:]) for f in backbone.projector(raw_all)]
+        raw_feats = [r.reshape(batch, frames_per_sample, *r.shape[1:])[:, 0] for r in raw_all]
+    else:
+        # Context frames skip autograd: the encoder still trains through the reference
+        # frame, and activation memory stays near the single-frame cost.
+        raw_feats = backbone.encoder(frames[:, 0])
+        ref = backbone.projector(raw_feats)
+        with torch.no_grad():
+            ctx = backbone.projector(backbone.encoder(frames[:, 1:].flatten(0, 1)))
+        feats = [
+            torch.cat([r.unsqueeze(1), c.reshape(batch, frames_per_sample - 1, *c.shape[1:])], dim=1)
+            for r, c in zip(ref, ctx)
+        ]
+    return fusion(feats), raw_feats
+
+
 class Backbone(BackboneBase):
     """backbone."""
 
     def __init__(
         self,
         name: str,
-        pretrained_encoder: str = None,
-        window_block_indexes: list = None,
-        drop_path=0.0,
-        out_channels=256,
-        out_feature_indexes: list = None,
-        projector_scale: list = None,
+        pretrained_encoder: str | None = None,
+        window_block_indexes: list[int] | None = None,
+        drop_path: float = 0.0,
+        out_channels: int = 256,
+        out_feature_indexes: list[int] | None = None,
+        projector_scale: list[str] | None = None,
         use_cls_token: bool = False,
         freeze_encoder: bool = False,
         layer_norm: bool = False,
@@ -52,17 +95,125 @@ class Backbone(BackboneBase):
         patch_size: int = 14,
         num_windows: int = 4,
         positional_encoding_size: int = 0,
+        dual_projector: bool = False,
         temporal_frames: int = 1,
         temporal_context_grad: bool = False,
-    ):
+    ) -> None:
         super().__init__()
+        self.encoder = self._build_encoder(
+            name,
+            out_feature_indexes=out_feature_indexes,
+            target_shape=target_shape,
+            gradient_checkpointing=gradient_checkpointing,
+            load_pretrained_weights=load_dinov2_weights,
+            patch_size=patch_size,
+            num_windows=num_windows,
+            positional_encoding_size=positional_encoding_size,
+            drop_path=drop_path,
+            window_block_indexes=window_block_indexes,
+        )
+        # build encoder + projector as backbone module
+        if freeze_encoder:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+
+        self.projector_scale = projector_scale
+        assert self.projector_scale is not None and len(self.projector_scale) > 0
+        # x[0]
+        assert sorted(self.projector_scale) == self.projector_scale, (
+            "only support projector scale P3/P4/P5 in ascending order."
+        )
+        level2scalefactor = dict(P3=2.0, P4=1.0, P5=0.5)
+        scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
+
+        # DinoV2 and every registered encoder expose their per-level channels (see _build_encoder).
+        encoder_channels = cast("list[int]", self.encoder._out_feature_channels)
+        self.projector = MultiScaleProjector(
+            in_channels=encoder_channels,
+            out_channels=out_channels,
+            scale_factors=scale_factors,
+            layer_norm=layer_norm,
+            rms_norm=rms_norm,
+        )
+        self.cross_attn_projector = (
+            MultiScaleProjector(
+                in_channels=encoder_channels,
+                out_channels=out_channels,
+                scale_factors=scale_factors,
+                layer_norm=layer_norm,
+                rms_norm=rms_norm,
+            )
+            if dual_projector
+            else None
+        )
+
+        # Video input: each sample stacks temporal_frames frames along the channel axis, reference first.
+        self.temporal_frames = int(temporal_frames)
+        self.temporal_context_grad = bool(temporal_context_grad)
+        self.temporal_fusion = None
+        if self.temporal_frames > 1:
+            self.temporal_fusion = TemporalFusion(out_channels, self.temporal_frames, len(scale_factors))
+
+        self._export = False
+
+    def _build_encoder(
+        self,
+        name: str,
+        *,
+        out_feature_indexes: list[int] | None,
+        target_shape: tuple[int, int],
+        gradient_checkpointing: bool,
+        load_pretrained_weights: bool,
+        patch_size: int,
+        num_windows: int,
+        positional_encoding_size: int,
+        drop_path: float,
+        window_block_indexes: list[int] | None,
+    ) -> nn.Module:
+        """Build the vision encoder whose feature maps feed the projector.
+
+        Subclasses registered with :func:`rfdetr.models.backbone.register_backbone` override this to supply a
+        non-DINOv2 encoder. The returned module must map an image batch ``(B, 3, H, W)`` to a list of
+        ``(B, C, H / patch_size, W / patch_size)`` feature maps, one per entry of ``out_feature_indexes``, and expose
+        their channel counts as ``_out_feature_channels``. An encoder whose forward resamples position embeddings for
+        inputs other than ``target_shape`` should define ``set_export_shape(shape)``, which export preparation calls
+        before tracing so the resampling happens once, outside the traced graph. Export preparation may call
+        ``set_export_shape`` more than once, possibly with different shapes, so it must re-bake for the given shape
+        each time.
+
+        The set of keyword arguments passed to this hook may grow in future releases, so an override must declare
+        ``**kwargs`` and read only the arguments it needs.
+
+        Args:
+            name: Encoder identifier (``ModelConfig.encoder``).
+            out_feature_indexes: Encoder layers whose outputs are returned.
+            target_shape: Native ``(height, width)`` input resolution.
+            gradient_checkpointing: Whether to checkpoint encoder activations.
+            load_pretrained_weights: Whether to initialize the encoder from its upstream pretrained weights (set
+                when the detector itself has no ``pretrain_weights``).
+            patch_size: Patch size of the encoder's patch embedding.
+            num_windows: Windows per side for windowed attention.
+            positional_encoding_size: Side length, in patches, of the encoder's position-embedding grid.
+            drop_path: Stochastic-depth rate.
+            window_block_indexes: Layers using windowed attention, or ``None`` to derive them.
+
+        Returns:
+            The encoder module.
+        """
         # an example name here would be "dinov2_base" or "dinov2_registers_windowed_base"
         # if "registers" is in the name, then use_registers is set to True, otherwise it is set to False
         # similarly, if "windowed" is in the name, then use_windowed_attn is set to True, otherwise it is set to False
         # the last part of the name should be the size
         # and the start should be dinov2
         name_parts = name.split("_")
-        assert name_parts[0] == "dinov2"
+        if name_parts[0] != "dinov2":
+            from rfdetr.models.backbone import _BACKBONE_REGISTRY
+
+            registered = ", ".join(sorted(_BACKBONE_REGISTRY)) or "none"
+            raise ValueError(
+                f"Unknown encoder {name!r}: expected a DINOv2 encoder name or a registered encoder "
+                f"(registered: {registered}). Import the package that registers it (e.g. rfdetr_plus) first."
+            )
         # name_parts[-1]
         use_registers = False
         if "registers" in name_parts:
@@ -75,83 +226,25 @@ class Backbone(BackboneBase):
         assert len(name_parts) == 2, (
             "name should be dinov2, then either registers, windowed, both, or none, then the size"
         )
-        self.encoder = DinoV2(
+        return DinoV2(
             size=name_parts[-1],
             out_feature_indexes=out_feature_indexes,
             shape=target_shape,
             use_registers=use_registers,
             use_windowed_attn=use_windowed_attn,
             gradient_checkpointing=gradient_checkpointing,
-            load_dinov2_weights=load_dinov2_weights,
+            load_dinov2_weights=load_pretrained_weights,
             patch_size=patch_size,
             num_windows=num_windows,
             positional_encoding_size=positional_encoding_size,
             drop_path_rate=drop_path,
-        )
-        # build encoder + projector as backbone module
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-
-        self.projector_scale = projector_scale
-        assert len(self.projector_scale) > 0
-        # x[0]
-        assert sorted(self.projector_scale) == self.projector_scale, (
-            "only support projector scale P3/P4/P5/P6 in ascending order."
-        )
-        level2scalefactor = dict(P3=2.0, P4=1.0, P5=0.5, P6=0.25)
-        scale_factors = [level2scalefactor[lvl] for lvl in self.projector_scale]
-
-        self.projector = MultiScaleProjector(
-            in_channels=self.encoder._out_feature_channels,
-            out_channels=out_channels,
-            scale_factors=scale_factors,
-            layer_norm=layer_norm,
-            rms_norm=rms_norm,
+            window_block_indexes=window_block_indexes,
         )
 
-        # Video input: each sample stacks temporal_frames frames along the channel axis, reference first.
-        self.temporal_frames = int(temporal_frames)
-        self.temporal_context_grad = bool(temporal_context_grad)
-        self.temporal_fusion = None
-        if self.temporal_frames > 1:
-            self.temporal_fusion = TemporalFusion(out_channels, self.temporal_frames, len(scale_factors))
-
-        self._export = False
-
-    def _encode(self, tensors: torch.Tensor):
-        """Encoder + projector; with temporal_frames > 1 the frames share both and are fused after."""
-        if self.temporal_fusion is None:
-            return self.projector(self.encoder(tensors))
-
-        frames_per_sample = self.temporal_frames
-        batch, stacked_channels, height, width = tensors.shape
-        if stacked_channels % frames_per_sample != 0:
-            raise ValueError(
-                f"Input has {stacked_channels} channels, which does not split into "
-                f"{frames_per_sample} frames. Stack the frames along the channel axis, reference first."
-            )
-        frames = tensors.reshape(batch, frames_per_sample, -1, height, width)
-
-        if self.temporal_context_grad or not torch.is_grad_enabled():
-            feats = self.projector(self.encoder(frames.flatten(0, 1)))
-            feats = [f.reshape(batch, frames_per_sample, *f.shape[1:]) for f in feats]
-        else:
-            # Context frames skip autograd: the encoder still trains through the reference
-            # frame, and activation memory stays near the single-frame cost.
-            ref = self.projector(self.encoder(frames[:, 0]))
-            with torch.no_grad():
-                ctx = self.projector(self.encoder(frames[:, 1:].flatten(0, 1)))
-            feats = [
-                torch.cat([r.unsqueeze(1), c.reshape(batch, frames_per_sample - 1, *c.shape[1:])], dim=1)
-                for r, c in zip(ref, ctx)
-            ]
-        return self.temporal_fusion(feats)
-
-    def export(self):
+    def export(self) -> None:
         self._export = True
         self._forward_origin = self.forward
-        self.forward = self.forward_export
+        self.forward = self.forward_export  # type: ignore[method-assign,assignment]
 
         if not hasattr(self.encoder, "merge_and_unload"):
             return
@@ -169,21 +262,48 @@ class Backbone(BackboneBase):
             logger.info("Merging and unloading LoRA weights")
             self.encoder = self.encoder.merge_and_unload()
 
-    def forward(self, tensor_list: NestedTensor):
+    @staticmethod
+    def _level_mask(tensor_list: NestedTensor, feat: Tensor) -> Tensor:
+        """Downsample the batch padding mask onto *feat*'s spatial grid.
+
+        Args:
+            tensor_list: Batch whose ``mask`` marks padded input pixels.
+            feat: Feature map (B, C, H, W) whose grid the mask is resampled onto.
+
+        Returns:
+            Boolean mask of shape (B, H, W), True on padded positions.
+        """
+        if tensor_list.no_padding:
+            # Nearest-neighbour resampling of an all-False mask is all-False at every output
+            # size, so the interpolation below is a constant of ``feat``'s shape here. Same
+            # substitution ``forward_export`` already makes under its no-padding assumption.
+            batch, _, height, width = feat.shape
+            return torch.zeros((batch, height, width), dtype=torch.bool, device=feat.device)
+        m = tensor_list.mask
+        assert m is not None
+        return F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
+
+    def forward(self, tensor_list: NestedTensor) -> tuple[list[NestedTensor], list[NestedTensor] | None]:
         """"""
         # (H, W, B, C)
-        feats = self._encode(tensor_list.tensors)
+        feats, raw_feats = _encode(self, tensor_list.tensors)
         # x: [(B, C, H, W)]
+        no_padding = tensor_list.no_padding
         out = []
         for feat in feats:
-            m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[0]
-            out.append(NestedTensor(feat, mask))
-        return out
+            out.append(NestedTensor(feat, self._level_mask(tensor_list, feat), no_padding))
 
-    def forward_export(self, tensors: torch.Tensor):
-        feats = self._encode(tensors)
+        cross_attn_out = None
+        if self.cross_attn_projector is not None:
+            cross_attn_out = []
+            cross_attn_feats = self.cross_attn_projector(raw_feats)
+            for feat in cross_attn_feats:
+                cross_attn_out.append(NestedTensor(feat, self._level_mask(tensor_list, feat), no_padding))
+
+        return out, cross_attn_out
+
+    def forward_export(self, tensors: Tensor) -> tuple[list[Tensor], list[Tensor], list[Tensor] | None]:
+        feats, raw_feats = _encode(self, tensors)
         out_feats = []
         out_masks = []
         for feat in feats:
@@ -191,9 +311,14 @@ class Backbone(BackboneBase):
             b, _, h, w = feat.shape
             out_masks.append(torch.zeros((b, h, w), dtype=torch.bool, device=feat.device))
             out_feats.append(feat)
-        return out_feats, out_masks
 
-    def get_named_param_lr_pairs(self, args, prefix: str = "backbone.0"):
+        cross_attn_feats = None
+        if self.cross_attn_projector is not None:
+            cross_attn_feats = list(self.cross_attn_projector(raw_feats))
+
+        return out_feats, out_masks, cross_attn_feats
+
+    def get_named_param_lr_pairs(self, args: Any, prefix: str = "backbone.0") -> dict[str, dict[str, Any]]:
         num_layers = args.out_feature_indexes[-1] + 1
         backbone_key = "backbone.0.encoder"
         named_param_lr_pairs = {}
@@ -229,6 +354,9 @@ def get_dinov2_lr_decay_rate(name: str, lr_decay_rate: float = 1.0, num_layers: 
     Returns:
         Lr decay rate for the given parameter.
     """
+    # NOTE: near-duplicate of get_vit_lr_decay_rate in training/param_groups.py (same formula,
+    # different layer-key pattern: this matches ".layer.", that matches ".blocks.").
+    # If updating this formula, update the sibling too.
     layer_id = num_layers + 1
     if name.startswith("backbone"):
         if "embeddings" in name:
@@ -238,7 +366,7 @@ def get_dinov2_lr_decay_rate(name: str, lr_decay_rate: float = 1.0, num_layers: 
     return lr_decay_rate ** (num_layers + 1 - layer_id)
 
 
-def get_dinov2_weight_decay_rate(name, weight_decay_rate=1.0):
+def get_dinov2_weight_decay_rate(name: str, weight_decay_rate: float = 1.0) -> float:
     if (
         ("gamma" in name)
         or ("pos_embed" in name)

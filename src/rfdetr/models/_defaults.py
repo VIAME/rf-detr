@@ -13,7 +13,6 @@ touching config validation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,8 +39,10 @@ class ModelDefaults:
         window_block_indexes: Indices of encoder layers using window attention.
         position_embedding: Type of positional embedding (``'sine'``).
         rms_norm: Whether to use RMSNorm instead of LayerNorm.
-        force_no_pretrain: Force-disable pretrain weight loading.
-        dim_feedforward: FFN hidden dimension in decoder layers.
+        force_no_pretrain: Skip the upstream encoder-weight download (``load_encoder_weights`` is forced off). Does not
+            affect ``pretrain_weights``, which is handled separately.
+        dim_feedforward: FFN hidden dimension in decoder layers. Superseded by ``ModelConfig.dim_feedforward``, which
+            takes precedence in ``_namespace_from_configs``; kept for callers that build a namespace without a config.
         decoder_norm: Normalization type in decoder (``'LN'``).
         freeze_batch_norm: Whether to freeze batch-norm layers.
         use_cls_token: Whether to prepend a CLS token to the encoder.
@@ -52,7 +53,6 @@ class ModelDefaults:
         set_cost_class: Classification cost weight for the matcher.
         set_cost_bbox: L1 bbox cost weight for the matcher.
         set_cost_giou: GIoU cost weight for the matcher.
-        set_cost_keypoint: L1 keypoint cost weight for the matcher (0 disables the keypoint term in matching).
         bbox_loss_coef: Bbox regression loss coefficient.
         giou_loss_coef: GIoU loss coefficient.
         sum_group_losses: Whether to sum (vs. average) group-DETR losses.
@@ -75,12 +75,12 @@ class ModelDefaults:
     drop_mode: str = "standard"
     drop_schedule: str = "constant"
     cutoff_epoch: int = 0
-    pretrained_encoder: Optional[str] = None
-    pretrain_exclude_keys: Optional[List[str]] = None
-    pretrain_keys_modify_to_load: Optional[Dict[str, str]] = None
-    pretrained_distiller: Optional[str] = None
+    pretrained_encoder: str | None = None
+    pretrain_exclude_keys: list[str] | None = None
+    pretrain_keys_modify_to_load: dict[str, str] | None = None
+    pretrained_distiller: str | None = None
     vit_encoder_num_layers: int = 12
-    window_block_indexes: Optional[List[int]] = None
+    window_block_indexes: list[int] | None = None
     position_embedding: str = "sine"
     rms_norm: bool = False
     force_no_pretrain: bool = False
@@ -95,7 +95,6 @@ class ModelDefaults:
     set_cost_class: float = 2.0
     set_cost_bbox: float = 5.0
     set_cost_giou: float = 2.0
-    set_cost_keypoint: float = 4.0
     bbox_loss_coef: float = 5.0
     giou_loss_coef: float = 2.0
     sum_group_losses: bool = False
@@ -104,7 +103,7 @@ class ModelDefaults:
     print_freq: int = 10
     do_benchmark: bool = False
     dropout: float = 0.0
-    coco_path: Optional[str] = None
+    coco_path: str | None = None
     dont_save_weights: bool = False
     start_epoch: int = 0
     eval: bool = False
@@ -112,7 +111,7 @@ class ModelDefaults:
     dist_url: str = "env://"
     lr_scheduler: str = "step"
     lr_min_factor: float = 0.0
-    subcommand: Optional[str] = None
+    subcommand: str | None = None
 
 
 MODEL_DEFAULTS = ModelDefaults()

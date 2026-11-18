@@ -19,14 +19,17 @@ replaced the two prior separate implementations (``detr.py:_load_pretrain_weight
 ``module_model.py:RFDETRModelModule._load_pretrain_weights``).
 """
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
 import torch
 
+from rfdetr import RFDETRNano, RFDETRSegNano
 from rfdetr.config import (
     RFDETRBaseConfig,
+    RFDETRKeypointPreviewConfig,
     RFDETRLargeConfig,
     RFDETRMediumConfig,
     RFDETRNanoConfig,
@@ -41,6 +44,7 @@ from rfdetr.config import (
     TrainConfig,
 )
 from rfdetr.models.weights import interpolate_position_embeddings, load_pretrain_weights
+from rfdetr.utilities.state_dict import validate_checkpoint_compatibility
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -54,6 +58,13 @@ def _make_checkpoint(num_classes=91, num_queries=300, group_detr=13):
         num_classes: Total classes including background (bias shape).
         num_queries: Number of object queries per group.
         group_detr: Number of groups.
+
+    Examples:
+        >>> checkpoint = _make_checkpoint(num_classes=3, num_queries=2, group_detr=4)
+        >>> checkpoint["model"]["class_embed.bias"].shape
+        torch.Size([3])
+        >>> checkpoint["model"]["query_feat.weight"].shape
+        torch.Size([8, 256])
     """
     total_queries = num_queries * group_detr
     state = {
@@ -71,32 +82,8 @@ def _make_checkpoint(num_classes=91, num_queries=300, group_detr=13):
     return {"model": state, "args": ckpt_args}
 
 
-def _make_train_config():
-    """Return a minimal TrainConfig for use in load_pretrain_weights.
-
-    Returns:
-        Minimal TrainConfig with placeholder dataset and output dirs.
-    """
-    return TrainConfig(
-        dataset_dir="/nonexistent/dataset",
-        output_dir="/nonexistent/output",
-        epochs=10,
-        lr=1e-4,
-        lr_encoder=1.5e-4,
-        batch_size=2,
-        weight_decay=1e-4,
-        lr_drop=8,
-        warmup_epochs=1.0,
-        drop_path=0.0,
-        multi_scale=False,
-        expanded_scales=False,
-        do_random_resize_via_padding=False,
-        grad_accum_steps=1,
-        tensorboard=False,
-    )
-
-
-def _suppress_pretrain_io(monkeypatch) -> None:
+@pytest.fixture
+def suppress_pretrain_io(monkeypatch) -> None:
     """Suppress download/validate/file-existence side effects on the canonical load path."""
     monkeypatch.setattr("rfdetr.models.weights.download_pretrain_weights", lambda *a, **kw: None)
     monkeypatch.setattr("rfdetr.models.weights.validate_pretrain_weights", lambda *a, **kw: None)
@@ -109,6 +96,7 @@ def _suppress_pretrain_io(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("suppress_pretrain_io")
 class TestLoadPretrainWeightsSecondReinit:
     """Regression tests for ``load_pretrain_weights`` in ``rfdetr.models.weights``.
 
@@ -116,95 +104,62 @@ class TestLoadPretrainWeightsSecondReinit:
     configured (backbone pretrain scenario), not when it has fewer (fine-tuned checkpoint scenario).
     """
 
-    @pytest.fixture(autouse=True)
-    def _patch_download(self, monkeypatch):
-        """Suppress all download and file-existence side effects."""
-        _suppress_pretrain_io(monkeypatch)
+    @pytest.mark.parametrize(
+        ("config_kwargs", "checkpoint_classes", "expected_reinit_sizes", "expected_num_classes"),
+        [
+            pytest.param({}, 3, [3], 2, id="finetune-fewer-classes-single-reinit"),
+            pytest.param({"num_classes": 90}, 91, [], 90, id="matching-class-count-no-reinit"),
+            pytest.param({"num_classes": 2}, 91, [91, 3], 2, id="backbone-pretrain-expands-then-trims"),
+            pytest.param({"num_classes": 93}, 91, [91, 94], 93, id="explicit-larger-num-classes-reexpands"),
+        ],
+    )
+    def test_head_reinit_sequence_and_num_classes(
+        self, monkeypatch, config_kwargs, checkpoint_classes, expected_reinit_sizes, expected_num_classes
+    ):
+        """The loader resizes the head only as needed and auto-aligns ``num_classes`` only when the user left it unset.
 
-    def test_finetune_checkpoint_preserves_weights(self, monkeypatch):
-        """Fine-tuned checkpoint (fewer classes) must NOT trigger second reinit.
-
-        Scenario: 2-class fine-tuned checkpoint (bias shape [3]) loaded with
-        default num_classes=90. The first reinit correctly resizes the head to 3 so load_state_dict works. The second
-        reinit must NOT resize to 91 — that would destroy the loaded fine-tuned weights.
+        Fine-tuned checkpoint (3 logits, default ``num_classes``): one reinit to the checkpoint size and ``num_classes``
+        becomes 2; a second reinit to 91 would destroy the loaded weights. COCO checkpoint (91 logits) with a matching
+        ``num_classes=90``: no reinit. COCO checkpoint with ``num_classes=2``: expand to 91 for ``load_state_dict``,
+        then trim to 3. COCO checkpoint with an explicit ``num_classes=93``: expand to 91, then to 94, keeping
+        ``num_classes``.
         """
-        from rfdetr.models.weights import load_pretrain_weights
-
-        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu")
-        checkpoint = _make_checkpoint(num_classes=3)
+        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu", **config_kwargs)
+        checkpoint = _make_checkpoint(num_classes=checkpoint_classes)
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
-
         fake_model = MagicMock()
+
         load_pretrain_weights(fake_model, mc)
 
-        calls = fake_model.reinitialize_detection_head.call_args_list
-        assert calls[0] == call(3), f"First reinit should resize to checkpoint size 3, got {calls[0]}"
-        assert len(calls) == 1, (
-            f"Expected exactly 1 reinit call (to checkpoint size), but got {len(calls)}: "
-            f"{calls}. The second reinit to 91 destroys loaded weights."
+        assert fake_model.reinitialize_detection_head.call_args_list == [call(size) for size in expected_reinit_sizes]
+        assert mc.num_classes == expected_num_classes
+
+    def test_keep_and_resize_warning_agrees_with_loader_behaviour(self, monkeypatch, caplog):
+        """The real validator's "Keeping num_classes" warning matches the head the loader leaves behind.
+
+        Every other loader test stubs the validator, so the message and the loader's keep-and-resize decision are
+        otherwise pinned only separately. Here a 91-row checkpoint is loaded with an explicit ``num_classes=93`` through
+        the real validator: if the loader's decision ever changes without the message, one of the two assertions fails.
+        """
+        mc = RFDETRNanoConfig(pretrain_weights="/fake/weights.pth", device="cpu", num_classes=93)
+        checkpoint = _make_checkpoint(num_classes=91)
+        checkpoint["args"].patch_size = mc.patch_size
+        monkeypatch.setattr(
+            "rfdetr.models.weights.validate_checkpoint_compatibility", validate_checkpoint_compatibility
         )
-        assert mc.num_classes == 2, (
-            f"mc.num_classes must be auto-aligned to 2 (checkpoint_logits - 1), got {mc.num_classes}"
-        )
-
-    def test_no_mismatch_no_reinit(self, monkeypatch):
-        """Checkpoint class count matches config — no reinit at all.
-
-        Scenario: COCO checkpoint (91 classes) with num_classes=90. 91 == 90 + 1, so no reinit should fire.
-        """
-        from rfdetr.models.weights import load_pretrain_weights
-
-        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu", num_classes=90)
-        checkpoint = _make_checkpoint(num_classes=91)
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
-
+        monkeypatch.setattr(logging.getLogger("rf-detr"), "propagate", True)
         fake_model = MagicMock()
-        load_pretrain_weights(fake_model, mc)
 
-        fake_model.reinitialize_detection_head.assert_not_called()
+        with caplog.at_level(logging.WARNING, logger="rf-detr"):
+            load_pretrain_weights(fake_model, mc)
 
-    def test_backbone_pretrain_still_reinits(self, monkeypatch):
-        """Backbone pretrain (more classes in checkpoint) must still reinit.
+        warning_msgs = [r.getMessage() for r in caplog.records if r.name == "rf-detr"]
+        assert any("Keeping num_classes=93" in msg for msg in warning_msgs), warning_msgs
+        assert fake_model.reinitialize_detection_head.call_args_list == [call(91), call(94)]
+        assert mc.num_classes == 93
 
-        Scenario: COCO 91-class checkpoint loaded for 2-class fine-tuning
-        (num_classes=2). Both reinits are correct here: first to 91 for load_state_dict, second to 3 for the configured
-        class count.
-        """
-        from rfdetr.models.weights import load_pretrain_weights
-
-        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu", num_classes=2)
-        checkpoint = _make_checkpoint(num_classes=91)
-        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
-
-        fake_model = MagicMock()
-        load_pretrain_weights(fake_model, mc)
-
-        calls = fake_model.reinitialize_detection_head.call_args_list
-        assert calls == [call(91), call(3)], f"Expected reinit to [91, 3] (expand then trim), got {calls}"
-
-    def test_user_override_larger_than_checkpoint_reexpands_head(self, monkeypatch):
-        """Explicit larger num_classes must be restored after checkpoint load.
-
-        Scenario: 91-class checkpoint loaded with explicit num_classes=93.
-        Loader must temporarily match checkpoint size for load_state_dict, then expand to 94 logits and keep
-        args.num_classes unchanged.
-        """
-        from rfdetr.models.weights import load_pretrain_weights
-
-        mc = RFDETRBaseConfig(pretrain_weights="/fake/weights.pth", device="cpu", num_classes=93)
-        checkpoint = _make_checkpoint(num_classes=91)
-        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
-
-        fake_model = MagicMock()
-        load_pretrain_weights(fake_model, mc)
-
-        calls = fake_model.reinitialize_detection_head.call_args_list
-        assert calls == [call(91), call(94)], f"Expected reinit to [91, 94] (load then expand), got {calls}"
-        assert mc.num_classes == 93, "Explicitly configured num_classes must not be overwritten."
-
-    # All non-deprecated model configs (RFDETRLargeDeprecatedConfig and
-    # RFDETRBaseConfig are excluded; the former is deprecated, the latter
-    # serves as the base class for the concrete variants below).
+    # Every non-deprecated model config except RFDETRBaseConfig, which is the base class of the variants below.
     @pytest.mark.parametrize(
         "config_cls",
         [
@@ -223,15 +178,12 @@ class TestLoadPretrainWeightsSecondReinit:
     def test_eight_class_finetune_checkpoint_auto_aligns_num_classes_and_reinits_once(self, monkeypatch, config_cls):
         """Auto-align ``mc.num_classes`` and avoid a second reinit for 8-class checkpoints.
 
-        Scenario (from user bug report): user trains on 8 categories (IDs 0–7).
-        The checkpoint stores ``class_embed.bias`` with shape [9] (8 user classes + 1 background). Loading without
-        specifying ``num_classes`` must NOT trigger a second reinit to 91 after temporarily matching the checkpoint size
-        for ``load_state_dict``.
-
-        This test asserts the loader auto-aligns ``mc.num_classes`` to 8 (9 - 1) and fires exactly one reinit call — to
-        9 (the checkpoint size).
+        Scenario (from user bug report): user trains on 8 categories (IDs 0-7), so the checkpoint stores
+        ``class_embed.bias`` with shape [9] (8 classes + 1 background). Loading without ``num_classes`` must NOT trigger
+        a second reinit to 91 after temporarily matching the checkpoint size for ``load_state_dict``, which would
+        produce out-of-bounds class IDs like 73.
+        The loader must auto-align ``mc.num_classes`` to 8 (9 - 1) with exactly one reinit call, to 9.
         """
-        # 8 dataset categories → training builds a model with 8+1=9 logits.
         checkpoint = _make_checkpoint(num_classes=9)
         mc = config_cls(pretrain_weights="/fake/weights.pth", device="cpu")
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
@@ -239,15 +191,8 @@ class TestLoadPretrainWeightsSecondReinit:
         fake_model = MagicMock()
         load_pretrain_weights(fake_model, mc)
 
-        calls = fake_model.reinitialize_detection_head.call_args_list
-        assert len(calls) == 1, (
-            f"Expected exactly 1 reinit call (to checkpoint size 9), but got {len(calls)}: "
-            f"{calls}. A second reinit to 91 would produce OOB class IDs like 73."
-        )
-        assert calls[0] == call(9), f"Reinit must resize to checkpoint's 9 logits, got {calls[0]}"
-        assert mc.num_classes == 8, (
-            f"mc.num_classes must be auto-aligned to 8 (checkpoint_logits - 1), got {mc.num_classes}"
-        )
+        assert fake_model.reinitialize_detection_head.call_args_list == [call(9)]
+        assert mc.num_classes == 8
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +202,7 @@ class TestLoadPretrainWeightsSecondReinit:
 PE_KEY = "backbone.0.encoder.encoder.embeddings.position_embeddings"
 
 
+@pytest.mark.usefixtures("suppress_pretrain_io")
 class TestLoadPretrainWeightsPEInterpolation:
     """Regression tests for #960 — PE must be interpolated when resolution changes.
 
@@ -264,11 +210,6 @@ class TestLoadPretrainWeightsPEInterpolation:
     model's ``positional_encoding_size`` before calling ``load_state_dict``.  Without this, any custom ``resolution``
     that changes the PE grid size causes a ``RuntimeError: size mismatch``.
     """
-
-    @pytest.fixture(autouse=True)
-    def _patch_download(self, monkeypatch):
-        """Suppress all download and file-existence side effects."""
-        _suppress_pretrain_io(monkeypatch)
 
     @pytest.mark.parametrize(
         "src_pe_size, tgt_resolution, patch_size, expected_tgt_pe_size",
@@ -409,165 +350,62 @@ class TestLoadPretrainWeightsPEInterpolation:
 
 
 class TestL1FacadePEInterpolationEndToEnd:
-    """Regression for instantiating an RF-DETR L1 facade variant with a custom ``resolution`` and a checkpoint trained
-    at the variant's default resolution must not raise ``RuntimeError`` from a PE shape mismatch.
+    """An L1 facade variant built at a custom ``resolution`` loads a checkpoint trained at its default resolution.
 
-    In v1.6.5 the L1 facade (``RFDETRLarge``, ``RFDETRNano``, ...) used a private ``_load_pretrain_weights_into`` helper
-    in ``detr.py`` that bypassed the PE bicubic-interpolation added to ``models.weights.load_pretrain_weights`` Code
-    that wired the L1 facade through the unified loader landed later (``inference._build_model_context`` calling
-    ``load_pretrain_weights`` from ``models.weights``).  This test pins that wiring so a future refactor cannot
-    reintroduce a divergent loader path that silently skips PE interpolation.
-
-    Current coverage: ``RFDETRNano`` (detection) and ``RFDETRSegNano`` (segmentation), upward-interpolation only.  When
-    a third L1 facade variant is added, collapse both methods to a single ``@pytest.mark.parametrize`` over
-    ``(variant_class, default_pe_grid, patch_size, new_resolution)``. Downward-interpolation (high-res checkpoint →
-    lower-res model) is not currently exercised; add a reverse-direction parametrize row when refactoring.
+    In v1.6.5 the facades (``RFDETRNano``, ``RFDETRSegNano``, ...) used a private ``_load_pretrain_weights_into`` helper
+    in ``detr.py`` that bypassed the PE bicubic interpolation of ``models.weights.load_pretrain_weights``. This pins the
+    wiring through the unified loader (``inference._build_model_context``) so a divergent loader path cannot silently
+    skip PE interpolation. Only upward interpolation is covered; add a downward row (high-res checkpoint into a lower-
+    res model) when extending.
     """
 
-    def test_rfdetr_nano_loads_default_pe_checkpoint_at_custom_resolution(self, tmp_path):
-        """Saving an RFDETRNano state_dict at default resolution and loading at a higher resolution must succeed via PE
-        interpolation in the L1 facade.
+    @pytest.mark.parametrize(
+        ("model_cls", "source_num_classes", "ckpt_args", "default_pe_grid", "patch_size", "new_resolution"),
+        [
+            pytest.param(RFDETRNano, 2, {"class_names": ["a", "b"]}, 24, 16, 640, id="nano-detection"),
+            pytest.param(
+                RFDETRSegNano,
+                90,
+                {"class_names": [], "segmentation_head": True},
+                26,
+                12,
+                624,
+                id="seg-nano-segmentation",
+            ),
+        ],
+    )
+    def test_default_pe_checkpoint_loads_at_custom_resolution(
+        self, tmp_path, model_cls, source_num_classes, ckpt_args, default_pe_grid, patch_size, new_resolution
+    ):
+        """A state_dict saved at the default resolution loads at a higher resolution via PE interpolation in the L1
+        facade.
 
-        Mirrors the user-reported scenario in https://github.com/roboflow/rf-detr/issues/990 (PE size mismatch ``[1,
-        1937, 384]`` vs ``[1, 6401, 384]`` raised from ``LWDETR.load_state_dict``), reduced to RFDETRNano for test
-        speed.
+        Detection mirrors issue 990 (a PE size mismatch raised from ``LWDETR.load_state_dict``), reduced to RFDETRNano
+        for speed. Segmentation is the regression for issue 1023, where the same ``RuntimeError`` hit ``RFDETRSegNano``;
+        its source model has 90 classes like an official COCO checkpoint, so loading with 2 classes exercises head
+        reinit and PE interpolation together. The 84x84 PE grid reported in 1023 is deferred to a follow-up row.
         """
-        from rfdetr import RFDETRNano
-
-        # 1. Build a default-resolution RFDETRNano (no pretrain, on CPU) so that
-        #    it produces a state_dict with the variant's native PE grid.
-        default_model = RFDETRNano(pretrain_weights=None, num_classes=2, device="cpu")
-        default_pe_grid = default_model.model_config.positional_encoding_size
-        assert default_pe_grid == 24, "RFDETRNano default PE grid must be 24×24"
-        patch_size = default_model.model_config.patch_size
+        default_model = model_cls(pretrain_weights=None, num_classes=source_num_classes, device="cpu")
+        assert default_model.model_config.positional_encoding_size == default_pe_grid
+        assert default_model.model_config.patch_size == patch_size
         default_state = default_model.model.model.state_dict()
-        default_pe = default_state[PE_KEY]
-        pe_dim = default_pe.shape[-1]
-        assert default_pe.shape == torch.Size([1, default_pe_grid * default_pe_grid + 1, pe_dim])
-
-        # 2. Persist as a checkpoint that mimics what `model.train()` saves —
-        #    a top-level "model" key plus a SimpleNamespace "args" block.
-        ckpt_path = tmp_path / "user_finetuned.pth"
+        pe_dim = default_state[PE_KEY].shape[-1]
+        assert default_state[PE_KEY].shape == torch.Size([1, default_pe_grid * default_pe_grid + 1, pe_dim])
+        # Saved as .pth (not .pt) so the tmp_path does not trigger the ModelWeights registry / MD5 lookup.
+        ckpt_path = tmp_path / "finetuned.pth"
         torch.save(
-            {
-                "model": dict(default_state),
-                "args": SimpleNamespace(class_names=["a", "b"], patch_size=patch_size),
-            },
-            ckpt_path,
+            {"model": dict(default_state), "args": SimpleNamespace(patch_size=patch_size, **ckpt_args)}, ckpt_path
         )
 
-        # 3. Re-instantiate at a NEW resolution.  Without PE interpolation in
-        #    the L1 facade path this raises ``RuntimeError: size mismatch for
-        #    backbone.0.encoder.encoder.embeddings.position_embeddings`` from
-        #    LWDETR.load_state_dict — exactly the user-reported failure.
-        new_resolution = 640
-        loaded = RFDETRNano(
-            pretrain_weights=str(ckpt_path),
-            resolution=new_resolution,
-            num_classes=2,
-            device="cpu",
-        )
+        loaded = model_cls(pretrain_weights=str(ckpt_path), resolution=new_resolution, num_classes=2, device="cpu")
 
-        # 4. The model_config validator must update PE proportionally to the
-        #    new resolution, and the loaded backbone PE parameter must have the
-        #    interpolated target shape (40 × 40 + 1 = 1601 tokens).
         expected_pe_grid = new_resolution // patch_size
-        assert expected_pe_grid == 40
         assert loaded.model_config.positional_encoding_size == expected_pe_grid
         loaded_pe = loaded.model.model.state_dict()[PE_KEY]
         assert loaded_pe.shape == torch.Size([1, expected_pe_grid * expected_pe_grid + 1, pe_dim]), (
-            f"Backbone PE was not interpolated to the requested resolution; "
-            f"got shape {tuple(loaded_pe.shape)}, expected [1, {expected_pe_grid**2 + 1}, {pe_dim}]."
+            f"Backbone PE was not interpolated to the requested resolution; got shape {tuple(loaded_pe.shape)}, "
+            f"expected [1, {expected_pe_grid**2 + 1}, {pe_dim}]."
         )
-
-    def test_rfdetr_seg_nano_loads_default_pe_checkpoint_at_custom_resolution(self, tmp_path):
-        """Saving an RFDETRSegNano state_dict at default resolution and loading at a higher resolution must succeed via
-        PE interpolation in the L1 facade.
-
-        Regression for https://github.com/roboflow/rf-detr/issues/1023 — the segmentation model variant
-        (``RFDETRSegNano``) raised ``RuntimeError: size mismatch for
-        backbone.0.encoder.encoder.embeddings.position_embeddings`` when instantiated with a non-default ``resolution``
-        because the L1 facade's checkpoint-loading path did not interpolate positional embeddings for segmentation
-        models.
-        """
-        from rfdetr import RFDETRSegNano
-
-        # 1. Build a default-resolution RFDETRSegNano (no pretrain, on CPU).
-        #    Uses 90 classes to mimic an official COCO-pretrained checkpoint so
-        #    the load path at step 3 exercises both head-reinit (90 → 2 classes)
-        #    and PE interpolation simultaneously.
-        default_model = RFDETRSegNano(pretrain_weights=None, num_classes=90, device="cpu")
-        default_pe_grid = default_model.model_config.positional_encoding_size
-        assert default_pe_grid == 26, "RFDETRSegNano default PE grid must be 26×26 (312 // 12)"
-        patch_size = default_model.model_config.patch_size
-        assert patch_size == 12, "RFDETRSegNano patch_size must be 12"
-        default_state = default_model.model.model.state_dict()
-        default_pe = default_state[PE_KEY]
-        pe_dim = default_pe.shape[-1]
-        assert default_pe.shape == torch.Size([1, default_pe_grid * default_pe_grid + 1, pe_dim])
-
-        # 2. Persist as a checkpoint that mimics the official pretrain weights
-        #    format.  Saved as .pth (not .pt) so the tmp_path fixture path does
-        #    not trigger ModelWeights registry / MD5 lookup.  Top-level keys
-        #    match the real checkpoint: "model" (state_dict) and "args" with
-        #    segmentation_head=True and patch_size=12.
-        ckpt_path = tmp_path / "rf-detr-seg-nano.pth"
-        torch.save(
-            {
-                "model": dict(default_state),
-                "args": SimpleNamespace(
-                    class_names=[],
-                    patch_size=patch_size,
-                    segmentation_head=True,
-                ),
-            },
-            ckpt_path,
-        )
-
-        # 3. Re-instantiate at a custom resolution with fewer classes.  Without
-        #    PE interpolation this raises
-        #    ``RuntimeError: size mismatch for
-        #    backbone.0.encoder.encoder.embeddings.position_embeddings``
-        #    from LWDETR.load_state_dict — exactly the user-reported failure.
-        # resolution=1008 (user-reported in #1023, 84×84=7057 tokens) is deferred to follow-up parametrization.
-        new_resolution = 624  # 2× the default 312; divisible by patch_size=12
-        loaded = RFDETRSegNano(
-            pretrain_weights=str(ckpt_path),
-            resolution=new_resolution,
-            num_classes=2,
-            device="cpu",
-        )
-
-        # 4. The model_config validator must update PE proportionally to the
-        #    new resolution, and the loaded backbone PE parameter must have the
-        #    interpolated target shape (52 × 52 + 1 = 2705 tokens).
-        expected_pe_grid = new_resolution // patch_size
-        assert expected_pe_grid == 52
-        assert loaded.model_config.positional_encoding_size == expected_pe_grid
-        loaded_pe = loaded.model.model.state_dict()[PE_KEY]
-        assert loaded_pe.shape == torch.Size([1, expected_pe_grid * expected_pe_grid + 1, pe_dim]), (
-            f"Backbone PE was not interpolated to the requested resolution; "
-            f"got shape {tuple(loaded_pe.shape)}, expected [1, {expected_pe_grid**2 + 1}, {pe_dim}]."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Deprecation: train_config argument
-# ---------------------------------------------------------------------------
-
-
-class TestLoadPretrainWeightsDeprecation:
-    """Passing train_config must emit a DeprecationWarning."""
-
-    def test_emits_deprecation_warning_when_train_config_passed(self, monkeypatch):
-        """Any non-None train_config triggers a DeprecationWarning."""
-        from rfdetr.models.weights import load_pretrain_weights
-
-        mc = RFDETRBaseConfig(pretrain_weights=None, device="cpu")
-        tc = _make_train_config()
-
-        with pytest.warns(FutureWarning, match="train_config.*deprecated"):
-            load_pretrain_weights(MagicMock(), mc, tc)
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +413,7 @@ class TestLoadPretrainWeightsDeprecation:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("suppress_pretrain_io")
 class TestModuleLoadPretrainWeightsPEInterpolationCustomResolution:
     """Regression for #1038 — PE interpolation must fire through ``RFDETRModelModule.__init__``.
 
@@ -592,22 +431,22 @@ class TestModuleLoadPretrainWeightsPEInterpolationCustomResolution:
     ``load_pretrain_weights`` is removed.
     """
 
-    @pytest.fixture(autouse=True)
-    def _patch_download(self, monkeypatch):
-        """Suppress download/validate side effects on the canonical load path."""
-        _suppress_pretrain_io(monkeypatch)
-
     def _construct_module(self, mc, checkpoint, monkeypatch, tmp_path):
         """Construct an RFDETRModelModule with all heavy work mocked.
 
         Returns the constructed module and the fake nn_model whose ``load_state_dict`` receives the (now-interpolated)
         state dict.
+
+        Examples:
+            Needs pytest's ``monkeypatch`` and ``tmp_path`` fixtures, so tests cover the live call.
+
+            >>> cls = TestModuleLoadPretrainWeightsPEInterpolationCustomResolution
+            >>> callable(cls._construct_module)  # doctest: +SKIP
+            True
         """
         monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
         fake_model = MagicMock()
-        # Pretend the head was already aligned so the canonical loader does not
-        # try to introspect the MagicMock's internals.
-        fake_model.num_classes = mc.num_classes
+        fake_model.num_classes = mc.num_classes  # head already aligned, so the loader need not introspect the mock
         monkeypatch.setattr(
             "rfdetr.training.module_model.build_model_from_config",
             lambda *a, **kw: fake_model,
@@ -625,12 +464,11 @@ class TestModuleLoadPretrainWeightsPEInterpolationCustomResolution:
             lr_encoder=1.5e-4,
             batch_size=2,
             weight_decay=1e-4,
-            lr_drop=1,
+            lr_scheduler_kwargs={"lr_drop": 1},
             warmup_epochs=0.0,
             drop_path=0.0,
             multi_scale=False,
             expanded_scales=False,
-            do_random_resize_via_padding=False,
             grad_accum_steps=1,
             tensorboard=False,
         )
@@ -702,3 +540,190 @@ class TestModuleLoadPretrainWeightsPEInterpolationCustomResolution:
         pe = checkpoint["model"][PE_KEY]
         assert pe.shape == torch.Size([1, pe_size * pe_size + 1, dim]), "Matching PE must not be modified."
         assert torch.equal(pe, original_pe), "Matching PE values must not be modified."
+
+
+# ---------------------------------------------------------------------------
+# Regression: keypoint schema auto-align from checkpoint _kp_active_mask
+# ---------------------------------------------------------------------------
+
+
+def _make_kp_checkpoint(kp_schema: list[int], num_queries: int = 300, group_detr: int = 13) -> dict:
+    """Build a minimal keypoint checkpoint encoding *kp_schema* via ``_kp_active_mask``.
+
+    Args:
+        kp_schema: Keypoints-per-class list, e.g. ``[0, 17]`` for bg-first or ``[17]`` for active-first.
+        num_queries: Number of queries per group.
+        group_detr: Number of decoder groups.
+
+    Returns:
+        Checkpoint dict with ``model``, ``args``, and schema-derived ``_kp_active_mask``.
+
+    Examples:
+        >>> mask = _make_kp_checkpoint([0, 17], num_queries=2, group_detr=2)["model"]["_kp_active_mask"]
+        >>> mask.shape, mask.sum(dim=1).tolist()
+        (torch.Size([2, 17]), [0, 17])
+    """
+    num_classes = len(kp_schema)
+    total_queries = num_queries * group_detr
+    max_kp = max(kp_schema) if kp_schema else 0
+    mask = torch.zeros(num_classes, max_kp, dtype=torch.bool)
+    for idx, n_kp in enumerate(kp_schema):
+        mask[idx, :n_kp] = True
+    state = {
+        "class_embed.weight": torch.randn(num_classes + 1, 256),
+        "class_embed.bias": torch.randn(num_classes + 1),
+        "refpoint_embed.weight": torch.randn(total_queries, 4),
+        "query_feat.weight": torch.randn(total_queries, 256),
+        "_kp_active_mask": mask,
+    }
+    ckpt_args = SimpleNamespace(segmentation_head=False, patch_size=14, class_names=[])
+    return {"model": state, "args": ckpt_args}
+
+
+def _make_kp_fake_model(initial_schema: list[int]) -> MagicMock:
+    """Build a fake nn_model mock that mimics the GroupPose keypoint model interface.
+
+    Args:
+        initial_schema: Keypoints-per-class schema the model was built with.
+
+    Returns:
+        Configured MagicMock with keypoint schema methods and ``_kp_active_mask`` state.
+
+    Examples:
+        >>> model = _make_kp_fake_model([17])
+        >>> model.reinitialize_keypoint_head([0, 17])
+        >>> model.get_num_keypoints_per_class(), model.state_dict()["_kp_active_mask"].shape
+        ([0, 17], torch.Size([2, 17]))
+    """
+    max_kp = max(initial_schema) if initial_schema else 0
+    current_schema = list(initial_schema)
+    mask = torch.zeros(len(initial_schema), max_kp, dtype=torch.bool)
+    for idx, n in enumerate(initial_schema):
+        mask[idx, :n] = True
+
+    fake_model = MagicMock()
+    fake_model.state_dict.return_value = {"_kp_active_mask": mask.clone()}
+
+    def _reinit_kp(schema):
+        current_schema[:] = schema
+        new_max = max(schema) if schema else 0
+        new_mask = torch.zeros(len(schema), new_max, dtype=torch.bool)
+        for i, n in enumerate(schema):
+            new_mask[i, :n] = True
+        fake_model.state_dict.return_value = {"_kp_active_mask": new_mask}
+        fake_model.get_num_keypoints_per_class.return_value = list(schema)
+
+    fake_model.reinitialize_keypoint_head.side_effect = _reinit_kp
+    fake_model.get_num_keypoints_per_class.return_value = list(initial_schema)
+    fake_model.get_num_keypoints_per_class_from_checkpoint = lambda sd: (
+        [int(n) for n in sd["_kp_active_mask"].sum(dim=1).tolist()] if "_kp_active_mask" in sd else None
+    )
+    return fake_model
+
+
+@pytest.mark.usefixtures("suppress_pretrain_io")
+class TestLoadPretrainWeightsKeypointSchemaAutoAlign:
+    """Regression for AP=0 when loading bg-first checkpoint into active-first default config.
+
+    Before the fix, ``load_pretrain_weights`` would restore ``mc.num_keypoints_per_class`` to the config default
+    ``[17]`` after loading a ``[0, 17]`` pretrained checkpoint.  The detection-head trimming kept rows 0 (background)
+    and 1 (person) from the checkpoint but the active-first schema treats row 0 as person, producing AP≈0.
+
+    The fix auto-aligns ``mc.num_keypoints_per_class`` from the checkpoint ``_kp_active_mask`` when the user did not
+    explicitly set the field, mirroring the existing ``num_classes`` auto-align pattern.
+    """
+
+    def test_bg_first_checkpoint_auto_aligns_active_first_config(self, monkeypatch):
+        """Loading bg-first [0,17] checkpoint into active-first [17] config auto-aligns schema."""
+        mc = RFDETRKeypointPreviewConfig(pretrain_weights="/fake/kp.pth", device="cpu")
+        assert mc.num_keypoints_per_class == [17], "Precondition: config default is active-first [17]."
+
+        checkpoint = _make_kp_checkpoint([0, 17])
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+        fake_model = _make_kp_fake_model([17])
+
+        load_pretrain_weights(fake_model, mc)
+
+        assert mc.num_keypoints_per_class == [0, 17], (
+            f"expected auto-align to [0, 17], got {mc.num_keypoints_per_class}"
+        )
+        assert mc.num_classes == 2, (
+            f"mc.num_classes must be auto-aligned to 2 (checkpoint has 3 logit slots), got {mc.num_classes}"
+        )
+
+    def test_matching_schema_no_change(self, monkeypatch):
+        """Config and checkpoint with same schema leaves mc.num_keypoints_per_class unchanged."""
+        mc = RFDETRKeypointPreviewConfig(pretrain_weights="/fake/kp.pth", device="cpu")
+        mc.num_keypoints_per_class = [17]
+
+        checkpoint = _make_kp_checkpoint([17])
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+        fake_model = _make_kp_fake_model([17])
+
+        load_pretrain_weights(fake_model, mc)
+
+        assert mc.num_keypoints_per_class == [17]
+
+    def test_user_explicit_schema_not_overridden(self, monkeypatch):
+        """Explicit num_keypoints_per_class from user survives even when checkpoint differs."""
+        mc = RFDETRKeypointPreviewConfig(pretrain_weights="/fake/kp.pth", device="cpu")
+        mc.num_keypoints_per_class = [0, 33]
+        mc.model_fields_set.add("num_keypoints_per_class")
+
+        checkpoint = _make_kp_checkpoint([0, 17])
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+        fake_model = _make_kp_fake_model([0, 33])
+
+        load_pretrain_weights(fake_model, mc)
+
+        assert mc.num_keypoints_per_class == [0, 33], (
+            "Explicit user schema must not be overridden by checkpoint auto-align."
+        )
+
+    def test_1d_kp_active_mask_skips_auto_align_with_warning(self, monkeypatch):
+        """Malformed 1-D _kp_active_mask skips auto-align and emits a logger.warning."""
+        mc = RFDETRKeypointPreviewConfig(pretrain_weights="/fake/kp.pth", device="cpu")
+        assert mc.num_keypoints_per_class == [17], "Precondition: config default is active-first [17]."
+
+        checkpoint = _make_kp_checkpoint([0, 17])
+        # Replace the 2-D mask with a malformed 1-D tensor.
+        checkpoint["model"]["_kp_active_mask"] = torch.ones(17, dtype=torch.bool)
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+        fake_model = _make_kp_fake_model([17])
+        # The fake's get_num_keypoints_per_class_from_checkpoint sums over dim=1 (IndexError on 1-D): return None.
+        fake_model.get_num_keypoints_per_class_from_checkpoint = lambda sd: None
+
+        warned: list[str] = []
+        monkeypatch.setattr("rfdetr.models.weights.logger.warning", lambda msg, *args: warned.append(msg % args))
+
+        load_pretrain_weights(fake_model, mc)
+
+        assert mc.num_keypoints_per_class == [17], (
+            "Auto-align must not fire for a 1-D _kp_active_mask; config default should be unchanged."
+        )
+        assert any("unexpected shape" in msg for msg in warned), (
+            f"Expected a warning mentioning 'unexpected shape'; got: {warned}"
+        )
+
+    def test_all_zero_kp_active_mask_skips_auto_align_with_warning(self, monkeypatch):
+        """All-zero 2-D _kp_active_mask (degenerate) skips auto-align and emits a logger.warning."""
+        mc = RFDETRKeypointPreviewConfig(pretrain_weights="/fake/kp.pth", device="cpu")
+        assert mc.num_keypoints_per_class == [17], "Precondition: config default is active-first [17]."
+
+        checkpoint = _make_kp_checkpoint([0, 17])
+        # Replace mask with a valid 2-D shape but all zeros (no active slots).
+        checkpoint["model"]["_kp_active_mask"] = torch.zeros(2, 17, dtype=torch.bool)
+        monkeypatch.setattr("rfdetr.models.weights.torch.load", lambda *a, **kw: checkpoint)
+        fake_model = _make_kp_fake_model([17])
+
+        warned: list[str] = []
+        monkeypatch.setattr("rfdetr.models.weights.logger.warning", lambda msg, *args: warned.append(msg % args))
+
+        load_pretrain_weights(fake_model, mc)
+
+        assert mc.num_keypoints_per_class == [17], (
+            "Auto-align must not fire for an all-zero _kp_active_mask; config default should be unchanged."
+        )
+        assert any("no active slots" in msg for msg in warned), (
+            f"Expected a warning mentioning 'no active slots'; got: {warned}"
+        )

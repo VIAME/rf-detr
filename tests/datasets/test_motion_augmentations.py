@@ -16,7 +16,7 @@ from typing import Any, Dict, List
 import numpy as np
 import pytest
 
-from rfdetr.datasets.aug_config import (
+from rfdetr.datasets.aug_configs import (
     AUG_MOTION_GREY,
     AUG_MOTION_ONLY,
     AUG_MOTION_RGB,

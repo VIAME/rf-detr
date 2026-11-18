@@ -5,33 +5,203 @@
 # ------------------------------------------------------------------------
 """ONNX Runtime inference helpers for RF-DETR exported models.
 
-These functions handle session creation, image preprocessing, and detection decoding without requiring PyTorch or
-the RF-DETR training stack — only ``onnxruntime``, ``numpy``, ``supervision``, and ``Pillow`` are needed at inference
-time.
+These functions handle session creation, image preprocessing, and detection decoding using ``onnxruntime``, ``numpy``,
+``supervision``, and ``Pillow``, alongside the RF-DETR package dependencies. Loading a ``.onnx`` artifact through
+``RFDETRInference`` also reads its embedded inference metadata with the ``onnx`` package, so that path needs
+``rfdetr[onnx]``, which installs both ``onnx`` and ``onnxruntime``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
-import supervision as sv
+import torch
 from PIL import Image as PILImage
+from supervision import Detections
 
+from rfdetr.export._runtime.adapters import (
+    ExportRuntime,
+    _check_input_interface,
+    _check_output_interface,
+    _input_array,
+    _input_tensor,
+    _runtime_options,
+    _single_input,
+)
+from rfdetr.export._runtime.decode import decode_detections
+from rfdetr.export._runtime.metadata import ExportMetadata
+from rfdetr.export._runtime.preprocess import preprocess_to_nchw
 from rfdetr.utilities.logger import get_logger
+
+if TYPE_CHECKING:
+    from rfdetr.export._runtime.adapters import ExportRuntime
 
 logger = get_logger()
 
 
-def _create_onnx_session(model_path: str | Path) -> Any:
+def _run_onnx_raw(session: Any, input_name: str, array: Any) -> list[Any]:
+    """Execute one ONNX batch through the shared session path."""
+    return cast(list[Any], session.run(None, {input_name: array}))
+
+
+def _onnx_dtype(type_name: str) -> np.dtype[Any]:
+    """Return the NumPy dtype of an ONNX tensor type name such as ``"tensor(float)"``.
+
+    Examples:
+        >>> _onnx_dtype("tensor(float)"), _onnx_dtype("tensor(float16)")
+        (dtype('float32'), dtype('float16'))
+    """
+    # ONNX names element types "tensor(<type>)"; only "float" differs from the NumPy name, where it means float64.
+    element_type = type_name.removeprefix("tensor(").removesuffix(")")
+    return np.dtype("float32" if element_type == "float" else element_type)
+
+
+def _run_onnx_bound(session: Any, input_name: str, batch: torch.Tensor, outputs: Sequence[Any]) -> list[torch.Tensor]:
+    """Run one batch through IO binding on the batch's own device and return the outputs as new tensors there.
+
+    ONNX Runtime reads the input and writes every output in place, so a CUDA batch never goes through host memory.
+    Each output takes the batch size for its first axis; the other axes must be static in the graph.
+
+    Args:
+        session: The ONNX Runtime session.
+        input_name: Name of the graph's single input.
+        batch: The input, already in the graph's layout and dtype and contiguous.
+        outputs: The session's output descriptions, in graph order.
+
+    Returns:
+        One tensor per output, in graph order, on the batch's device.
+
+    Examples:
+        Needs an exported ONNX model.
+
+        >>> import onnxruntime  # doctest: +SKIP
+        >>> session = onnxruntime.InferenceSession("model.onnx")  # doctest: +SKIP
+        >>> batch = torch.zeros(1, 3, 384, 384)  # doctest: +SKIP
+        >>> boxes, logits = _run_onnx_bound(session, "input", batch, session.get_outputs())  # doctest: +SKIP
+    """
+    device = batch.device
+    device_id = 0 if device.index is None else device.index
+    binding = session.io_binding()
+    # Allocate on the CPU: a process-wide default device such as CUDA would make ``.numpy()`` raise.
+    input_dtype = torch.empty(0, dtype=batch.dtype, device="cpu").numpy().dtype
+    binding.bind_input(input_name, device.type, device_id, input_dtype, tuple(batch.shape), batch.data_ptr())
+    results = []
+    for output in outputs:
+        dtype = _onnx_dtype(output.type)
+        tensor = torch.empty(
+            (batch.shape[0], *output.shape[1:]), dtype=torch.from_numpy(np.empty(0, dtype=dtype)).dtype, device=device
+        )
+        binding.bind_output(output.name, device.type, device_id, dtype, tuple(tensor.shape), tensor.data_ptr())
+        results.append(tensor)
+    if device.type == "cuda":
+        # ONNX Runtime runs on its own CUDA stream, and the batch was written on torch's current stream.
+        torch.cuda.current_stream(device).synchronize()
+    session.run_with_iobinding(binding)
+    binding.synchronize_outputs()
+    return results
+
+
+def load_export_runtime(path: Path, metadata: ExportMetadata, device: str, options: Mapping[str, Any]) -> ExportRuntime:
+    """Load an ONNX artifact with explicit provider and interface checks; it reads no runtime options."""
+    _runtime_options("ONNX", options, ())
+    try:
+        import onnxruntime as ort
+    except ImportError as exc:
+        raise ImportError("ONNX inference requires onnxruntime or onnxruntime-gpu.") from exc
+
+    providers = ort.get_available_providers()
+    if device == "cpu":
+        provider = "CPUExecutionProvider"
+    elif device == "auto":
+        provider = "CUDAExecutionProvider" if "CUDAExecutionProvider" in providers else "CPUExecutionProvider"
+    elif device == "cuda" or (device.startswith("cuda:") and device[5:].isdigit()):
+        provider = "CUDAExecutionProvider"
+    else:
+        raise ValueError(f"ONNX device {device!r} is unsupported. Use cpu, cuda:N, or auto.")
+    if provider not in providers:
+        raise RuntimeError(f"ONNX provider {provider} is unavailable. Installed providers: {providers}.")
+
+    device_id = int(device[5:]) if device.startswith("cuda:") else 0
+    requested: list[str | tuple[str, dict[str, Any]]] = (
+        [(provider, {"device_id": device_id})] if provider == "CUDAExecutionProvider" else [provider]
+    )
+    session = _create_onnx_session(path, providers=requested)
+    if provider not in session.get_providers():
+        raise RuntimeError(f"ONNX session did not activate requested provider {provider}.")
+    if device != "auto" and provider == "CUDAExecutionProvider" and hasattr(session, "disable_fallback"):
+        session.disable_fallback()
+    input_info = _single_input("ONNX", session.get_inputs())
+    dtype = _onnx_dtype(input_info.type)
+    # A symbolic or unnamed ONNX dimension is a str or None; only an int fixes the axis.
+    shape = [size if isinstance(size, int) else None for size in input_info.shape]
+    _check_input_interface("ONNX", metadata, input_info.name, shape, dtype)
+    outputs = session.get_outputs()
+    output_names = [item.name for item in outputs]
+    _check_output_interface("ONNX", metadata, output_names)
+
+    # On the CUDA provider, the batch is prepared on the GPU and bound in place, so it never goes through host memory.
+    # That needs torch to see the GPU, every output to lead with the input's batch axis (the same symbol or size, so a
+    # scalar or fixed-size auxiliary output stays on the host path) and every other axis to be static, so its buffer can
+    # be allocated.
+    batch_axis = input_info.shape[0] if input_info.shape else None
+    on_device = (
+        provider == "CUDAExecutionProvider"
+        and torch.cuda.is_available()
+        and batch_axis is not None
+        and all(
+            len(item.shape) >= 1
+            and item.shape[0] == batch_axis
+            and all(isinstance(size, int) for size in item.shape[1:])
+            for item in outputs
+        )
+    )
+
+    def execute(batch: Any) -> dict[str, Any]:
+        """Map one raw ONNX result by graph output name."""
+        if on_device:
+            return dict(
+                zip(output_names, _run_onnx_bound(session, input_info.name, _input_tensor(batch, metadata), outputs))
+            )
+        return dict(zip(output_names, _run_onnx_raw(session, input_info.name, _input_array(batch, metadata))))
+
+    return ExportRuntime(
+        "onnx",
+        metadata,
+        session=session,
+        device_policy=provider,
+        execute=execute,
+        device=torch.device("cuda", device_id) if on_device else torch.device("cpu"),
+        borrowed_outputs=False,
+    )
+
+
+def _create_onnx_session(
+    model_path: str | Path, providers: list[str | tuple[str, dict[str, Any]]] | None = None
+) -> Any:
     """Load an ONNX model and create an ONNX Runtime inference session.
 
     Imports ``onnxruntime`` at call time so that the rest of the package remains usable without it installed.  Input and
     output names / shapes are logged at DEBUG level for troubleshooting.
 
+    When ``providers`` is ``None``, the session auto-selects the best available backend: CUDA if ``onnxruntime-gpu`` is
+    installed, otherwise CPU (with a warning).  Pass an explicit list to pin the backend — useful for benchmarking
+    CPU vs CUDA side-by-side.
+
+    The session's CPU intra-op thread pool -- the one actually created under this function's default sequential
+    execution mode -- is configured to block rather than busy-spin while idle, since spinning would otherwise contend
+    for CPU with any other work sharing the process for as long as the session lives, including this module's own
+    ``preprocess_to_nchw`` step, which prefers torchvision when it is installed. The inter-op entry is set for the
+    same reason but has no effect here: ONNX Runtime only creates an inter-op thread pool under
+    ``ExecutionMode.ORT_PARALLEL``, which this function never requests.
+
     Args:
         model_path: Path to the ``.onnx`` model file.
+        providers: Ordered list of ORT execution providers, e.g.
+            ``["CUDAExecutionProvider", "CPUExecutionProvider"]``.  When ``None`` (default), the best available
+            provider is selected automatically.
 
     Returns:
         An ``onnxruntime.InferenceSession`` ready for inference.
@@ -52,7 +222,30 @@ def _create_onnx_session(model_path: str | Path) -> Any:
             "ONNX Runtime inference requires 'onnxruntime'. Install it: `pip install onnxruntime`"
         ) from exc
 
-    session = ort.InferenceSession(str(model_path))
+    if providers is None:
+        _preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        _available = ort.get_available_providers()
+        providers = [p for p in _preferred if p in _available] or ["CPUExecutionProvider"]
+        if providers[0] == "CPUExecutionProvider":
+            logger.warning(
+                "CUDAExecutionProvider not available — running ONNX inference on CPU. "
+                "Install onnxruntime-gpu for GPU acceleration: `pip install onnxruntime-gpu`"
+            )
+    session_options = ort.SessionOptions()
+    # ORT's default CPU intra-op thread pool busy-spins while idle instead of blocking, trading
+    # wake-up latency for CPU usage between calls. That spinning contends for CPU with any other
+    # work in this process -- including this module's own torchvision-based preprocessing in
+    # ``preprocess_to_nchw`` -- for as long as the session lives, and measurably slows down the
+    # session's own next call too. Disabling it only changes how idle threads wait, not computed
+    # values. This session never sets ``execution_mode``, so it stays at ORT's default
+    # ExecutionMode.ORT_SEQUENTIAL, under which ORT never creates an inter-op thread pool at all --
+    # that pool only exists under ORT_PARALLEL. The inter-op entry below is set defensively for
+    # that case; it has no effect on this function's own (sequential) behavior, applies identically
+    # regardless of the requested execution provider, and does not change computed values either way.
+    session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    session_options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    session = ort.InferenceSession(str(model_path), sess_options=session_options, providers=providers)
+    logger.debug("ONNX Runtime providers in use: %s", session.get_providers())
     for inp in session.get_inputs():
         logger.debug("Input  : name=%s  shape=%s  type=%s", inp.name, inp.shape, inp.type)
     for out in session.get_outputs():
@@ -64,7 +257,9 @@ def _run_inference(
     session: Any,
     image_path: str | Path,
     threshold: float = 0.3,
-) -> tuple[sv.Detections, PILImage.Image]:
+    num_select: int | None = None,
+    background_class_id: int | None = -1,
+) -> tuple[Detections, PILImage.Image]:
     """Preprocess one image, run ONNX Runtime inference, and decode detections.
 
     Reads input shape from the session (NCHW ``float32``), resizes and normalises the image with ImageNet statistics,
@@ -73,11 +268,15 @@ def _run_inference(
 
     **Input contract** (must match ``RFDETR.predict()`` preprocessing exactly):
 
-    - Image is opened as-is and converted to ``"RGB"`` (3-channel) or ``"L"``
-      (1-channel greyscale) depending on the model's channel count.
-    - Resize uses ``PIL.Image.Resampling.BILINEAR`` — matching
-      ``torchvision.transforms.functional.resize()`` which defaults to ``InterpolationMode.BILINEAR``.  Using PIL's
-      default (``BICUBIC``) would produce slightly different pixel values and can degrade confidence.
+    - Image is opened with Pillow and converted to ``"RGB"`` (3-channel) or ``"L"``
+      (1-channel greyscale) depending on the model's channel count. PIL is used only to decode and
+      convert — never to resize.
+    - Resize follows ``RFDETR.predict()``'s exact convention — bilinear, half-pixel centers,
+      ``antialias=False`` — applied by :func:`~rfdetr.export._runtime.preprocess.preprocess_to_nchw` via
+      ``torchvision`` when importable
+      (bit-exact) or the pure-NumPy ``_bilinear_resize_half_pixel`` fallback. PIL's own BILINEAR/BICUBIC
+      filters apply adaptive antialiasing when downscaling and would shift pixel values away from predict(),
+      degrading confidence.
     - Pixel values are scaled to ``[0, 1]`` then normalised with ImageNet
       statistics: ``mean=[0.485, 0.456, 0.406]``, ``std=[0.229, 0.224, 0.225]``.
     - The tensor is kept as ``[1, C, H, W]`` (NCHW) — unlike the TFLite helper
@@ -90,6 +289,11 @@ def _run_inference(
         image_path: Path to the input image (any format supported by Pillow).
             RGB images are used as-is; RGBA / palette images are converted.
         threshold: Confidence threshold; detections below this are discarded.
+        num_select: Maximum query/class pairs selected before thresholding. ``None`` uses the exported model's query
+            count, matching shipped RF-DETR configurations; pass an explicit value for custom exports.
+        background_class_id: Exported class slot to exclude before selection. The default ``-1`` preserves the common
+            final-slot background convention. Pass ``None`` for sparse COCO checkpoints, whose final slot is class 90,
+            or ``0`` for legacy background-first keypoint checkpoints.
 
     Returns:
         A tuple of ``(detections, pil_img)`` where ``detections`` contains pixel-space ``xyxy`` boxes and ``pil_img`` is
@@ -108,32 +312,10 @@ def _run_inference(
     # ONNX NCHW: [batch, channels, height, width]
     _, channels, height, width = inputs[0].shape
 
-    _imagenet_mean = [0.485, 0.456, 0.406]
-    _imagenet_std = [0.229, 0.224, 0.225]
-    mean = np.array([_imagenet_mean[i % 3] for i in range(channels)], dtype=np.float32)
-    std = np.array([_imagenet_std[i % 3] for i in range(channels)], dtype=np.float32)
+    with PILImage.open(image_path) as pil_img:
+        inp_tensor = preprocess_to_nchw(pil_img, height, width, channels)
 
-    pil_img = PILImage.open(image_path)
-    pil_mode = "L" if channels == 1 else "RGB"
-    # Use BILINEAR resampling to match torchvision.transforms.functional.resize()
-    # which defaults to InterpolationMode.BILINEAR.  PIL's default (None → BICUBIC)
-    # produces different pixel values and can cause a measurable confidence drop.
-    arr = (
-        np.array(
-            pil_img.convert(pil_mode).resize((width, height), PILImage.Resampling.BILINEAR),
-            dtype=np.float32,
-        )
-        / 255.0
-    )
-    if arr.ndim == 2:  # "L" → (height, width); needs (height, width, 1)
-        arr = arr[:, :, np.newaxis]
-
-    # Normalise HWC, then transpose to CHW for ONNX (NCHW)
-    arr = (arr - mean) / std
-    arr = arr.transpose(2, 0, 1)  # HWC → CHW
-    inp_tensor = arr[np.newaxis].astype(np.float32)  # (1, C, H, W)
-
-    raw_outputs = session.run(None, {input_name: inp_tensor})
+    raw_outputs = _run_onnx_raw(session, input_name, inp_tensor)
 
     # RF-DETR ONNX output names: "dets" = pred_boxes, "labels" = pred_logits.
     # Match by name so the code is robust to output reordering.
@@ -176,34 +358,17 @@ def _run_inference(
             )
 
     boxes_cwh = raw_outputs[boxes_idx][0]  # (Q, 4) normalised cxcywh
-    # Drop last logit column: RF-DETR adds +1 to num_classes (no-object slot, criterion.py:323).
-    # Keeping it causes class_id == len(class_names) → IndexError at display time.
-    logits = raw_outputs[logits_idx][0, :, :-1]  # (Q, num_classes)
+    # Background placement is checkpoint-dependent and cannot be inferred from the tensor width alone.
+    logits = raw_outputs[logits_idx][0]
 
-    # RF-DETR uses per-class sigmoid (not softmax) — mirrors PostProcess.forward in postprocess.py.
-    logger.debug(
-        "Logits stats: shape=%s min=%.3f max=%.3f mean=%.3f",
-        logits.shape,
-        float(logits.min()),
-        float(logits.max()),
-        float(logits.mean()),
+    decoded = decode_detections(
+        boxes_cwh,
+        logits,
+        pil_img.size,
+        threshold=threshold,
+        num_select=num_select,
+        background_class_id=background_class_id,
     )
-    one = np.asarray(1, dtype=logits.dtype)
-    scores_all = one / (one + np.exp(-logits.clip(-88, 88)))
-    scores = scores_all.max(axis=-1)
-    cls = scores_all.argmax(axis=-1)
-    logger.debug(
-        "Scores stats: min=%.3f max=%.3f — detections above threshold %.2f: %d",
-        float(scores.min()),
-        float(scores.max()),
-        threshold,
-        int((scores > threshold).sum()),
-    )
-    keep = scores > threshold
 
-    cx, cy, bw, bh = boxes_cwh[keep].T
-    ow, oh = pil_img.size
-    xyxy = np.stack([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], axis=1)
-    xyxy *= np.array([ow, oh, ow, oh], dtype=np.float32)
-
-    return sv.Detections(xyxy=xyxy, confidence=scores[keep], class_id=cls[keep].astype(int)), pil_img
+    detections = Detections(xyxy=decoded.xyxy, confidence=decoded.confidence, class_id=decoded.class_id.astype(int))
+    return detections, pil_img

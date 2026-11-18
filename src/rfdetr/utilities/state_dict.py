@@ -5,11 +5,14 @@
 # ------------------------------------------------------------------------
 """Checkpoint and state-dict helpers."""
 
+from __future__ import annotations
+
+import contextlib
 import os
-import tempfile
 from collections import OrderedDict
 from typing import Any
 
+from rfdetr.utilities.files import _mkstemp_default_mode, _replace_keeping_mode
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
@@ -21,9 +24,21 @@ _PTL_COMPAT_KEYS = (
     "global_step",
     "pytorch-lightning_version",
     "loops",
+    # Per-callback state (BestModelCallback's own best-tracking high-water marks,
+    # RFDETREMACallback's average model state, RFDETREarlyStopping's wait_count, etc.),
+    # keyed by Callback.state_key — see BestModelCallback._build_checkpoint_payload.
+    # Without this, trainer.fit(ckpt_path="checkpoint_best_total.pth") silently resets
+    # every callback's state even though the regular/EMA source checkpoint it was copied
+    # from does carry it.
+    "callbacks",
     "optimizer_states",
     "lr_schedulers",
 )
+
+#: Where a ``backbone_lora=True`` run saves the DINOv2 encoder's keys. PEFT nests the wrapped encoder at
+#: ``PeftModel.base_model.model``, so ``backbone.0.encoder.encoder.…`` is saved as
+#: ``backbone.0.encoder.base_model.model.encoder.…``.
+_LORA_ENCODER_KEY_PREFIX = "backbone.0.encoder.base_model.model."
 
 
 def _raise_patch_size_mismatch(ckpt_patch_size: int, model_patch_size: int) -> None:
@@ -64,7 +79,7 @@ def _ckpt_args_get(args: Any, field: str, default: Any = None) -> Any:
     return getattr(args, field, default)
 
 
-def _make_fit_loop_state(epoch: int) -> dict:
+def _make_fit_loop_state(epoch: int) -> dict[str, Any]:
     """Build a minimal ``fit_loop`` state dict that restores the epoch counter.
 
     ``BestModelCallback`` stores ``trainer.current_epoch`` as ``"epoch"`` in the checkpoint.  That value is captured
@@ -130,28 +145,49 @@ def _make_fit_loop_state(epoch: int) -> dict:
     }
 
 
-def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
+def strip_checkpoint(
+    checkpoint: str | os.PathLike[str],
+    extra_metadata: dict[str, Any] | None = None,
+) -> None:
     """Strip a checkpoint file down to ``model``, ``args``, and PTL-compatible keys.
 
-    Preserves ``model_name`` (when present) so that ``RFDETR.from_checkpoint()`` can still resolve the model class from
-    the stripped file.  Also preserves ``rfdetr_version`` (when present) for provenance tracking.
+    Preserves ``model_name`` and ``model_config`` (when present) so that ``RFDETR.from_checkpoint()`` can still resolve
+    the model class and rebuild the trained architecture (e.g. ``resolution``, ``num_queries``, ``dec_layers``) from the
+    stripped file.  Also preserves ``rfdetr_version`` (when present) for provenance tracking.
 
     Also preserves ``state_dict``, ``global_step``, ``pytorch-lightning_version``, ``loops``, ``optimizer_states``, and
     ``lr_schedulers`` when present so the stripped checkpoint can still be used directly with
     ``trainer.fit(ckpt_path=...)``.
 
-    Overwrites the file atomically so a partial write cannot corrupt it.
+    Overwrites the file atomically so a partial write cannot corrupt it, keeping the permission bits it already had.
 
     Args:
         checkpoint: Path to the ``.pth`` checkpoint file to strip in place.
+        extra_metadata: Optional key/value pairs merged into the stripped checkpoint. Used to record provenance that is
+            not derivable from the surviving keys (e.g. ``{"best_total_source": "ema"}`` for
+            ``checkpoint_best_total.pth``). Keys overwrite same-named preserved keys.
+
+    Examples:
+        >>> import tempfile
+        >>> import torch
+        >>> path = tempfile.NamedTemporaryFile(suffix=".pth", delete=False).name
+        >>> torch.save({"model": {}, "args": {}, "optimizer_states": [1]}, path)
+        >>> strip_checkpoint(path, extra_metadata={"best_total_source": "ema"})
+        >>> torch.load(path, weights_only=False)["best_total_source"]
+        'ema'
     """
+    from pathlib import Path
+
     import torch
+
+    from rfdetr.utilities.io import _safe_torch_load
 
     # `checkpoint_best_total.pth` is produced by local RF-DETR training and can
     # contain non-tensor metadata under "args" (e.g. `types.SimpleNamespace`).
     # PyTorch 2.6 changed `torch.load` default `weights_only=True`, which rejects
-    # these objects. This utility intentionally operates on trusted checkpoints.
-    state_dict = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    # these objects. This utility intentionally operates on trusted, locally
+    # produced checkpoints, so trust=True permits the full-pickle fallback.
+    state_dict = _safe_torch_load(Path(checkpoint), trust=True)
     new_state_dict = {
         "model": state_dict["model"],
         "args": state_dict["args"],
@@ -159,6 +195,10 @@ def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
     # Preserve model_name when present (#887).
     if "model_name" in state_dict:
         new_state_dict["model_name"] = state_dict["model_name"]
+    # Preserve model_config when present: without it from_checkpoint rebuilds the class-default
+    # architecture (e.g. resolution) around weights trained with a different one.
+    if "model_config" in state_dict:
+        new_state_dict["model_config"] = state_dict["model_config"]
     # Preserve rfdetr_version when present for provenance tracking.
     if "rfdetr_version" in state_dict:
         new_state_dict["rfdetr_version"] = state_dict["rfdetr_version"]
@@ -166,17 +206,31 @@ def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
     for key in _PTL_COMPAT_KEYS:
         if key in state_dict:
             new_state_dict[key] = state_dict[key]
+    # Backfill validate_loop/test_loop stubs so old checkpoints (saved before the stubs
+    # were added to _build_checkpoint_payload) can be passed as ckpt_path to
+    # trainer.validate() / trainer.test() without a KeyError from PTL restore_loops().
+    if "loops" in new_state_dict:
+        loops = new_state_dict["loops"]
+        for loop_key in ("validate_loop", "test_loop"):
+            if loop_key not in loops:
+                loops[loop_key] = {"state_dict": {}}
+    # Merge caller-supplied provenance last so it wins over any preserved key of the same name.
+    if extra_metadata:
+        new_state_dict.update(extra_metadata)
     # Create the temp file in the destination directory so os.replace stays on the same filesystem (atomic).
     checkpoint_dir = os.path.dirname(os.path.abspath(os.fspath(checkpoint)))
-    with tempfile.NamedTemporaryFile(dir=checkpoint_dir, delete=False) as tmp_file:
-        tmp_path = tmp_file.name
+    tmp_fd, tmp_path = _mkstemp_default_mode(checkpoint_dir)
     try:
+        os.close(tmp_fd)
         torch.save(new_state_dict, tmp_path)
         # Atomic replace avoids leaving a partially written checkpoint on save failures/interruption.
-        os.replace(tmp_path, checkpoint)
+        _replace_keeping_mode(tmp_path, checkpoint)
     finally:
+        # Best-effort: after a successful replace the temp path is gone; after a failure it is stray, and a failed
+        # removal must not replace the error that got us here.
         if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+            with contextlib.suppress(OSError):
+                os.remove(tmp_path)
 
 
 def clean_state_dict(state_dict: dict[str, Any]) -> OrderedDict[str, Any]:
@@ -196,6 +250,47 @@ def clean_state_dict(state_dict: dict[str, Any]) -> OrderedDict[str, Any]:
     return new_state_dict
 
 
+def remap_projector_to_cross_attn(state_dict: dict[str, Any], model: object) -> dict[str, Any]:
+    """Clone backbone projector weights into ``cross_attn_projector`` for dual-projector models.
+
+    Older checkpoints can contain only ``backbone.0.projector.*`` keys. Dual-projector models expect an additional
+    ``backbone.0.cross_attn_projector.*`` branch; this helper seeds it by cloning projector weights when missing.
+
+    Args:
+        state_dict: Checkpoint model-state dictionary (mutated in place).
+        model: Instantiated model used to detect whether dual projector mode is active.
+
+    Returns:
+        The same ``state_dict`` object for convenience.
+    """
+    backbone = model.backbone[0] if hasattr(model, "backbone") else None
+    if backbone is None:
+        return state_dict
+
+    # Real dual-projector backbones expose cross_attn_projector; compatibility shims may only carry dual_projector.
+    has_cross_attn_projector = getattr(backbone, "cross_attn_projector", None) is not None
+    dual_projector_enabled = bool(getattr(backbone, "dual_projector", False)) or has_cross_attn_projector
+    if not dual_projector_enabled:
+        return state_dict
+
+    if any(key.startswith("backbone.0.cross_attn_projector.") for key in state_dict):
+        return state_dict
+
+    projector_keys = {key: value for key, value in state_dict.items() if key.startswith("backbone.0.projector.")}
+    if not projector_keys:
+        return state_dict
+
+    logger.info(
+        "Cloning %d backbone projector key(s) into cross_attn_projector for dual-projector compatibility.",
+        len(projector_keys),
+    )
+    for key, value in projector_keys.items():
+        new_key = key.replace("backbone.0.projector.", "backbone.0.cross_attn_projector.", 1)
+        state_dict[new_key] = value.clone()
+
+    return state_dict
+
+
 def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: Any) -> None:
     """Validate that a checkpoint is compatible with the model configuration.
 
@@ -211,7 +306,9 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
         checkpoint: Loaded checkpoint dictionary, expected to contain an optional
             ``"args"`` key with training namespace attributes or a plain dict.
         model_args: Namespace (e.g. ``types.SimpleNamespace``) with at least
-            ``segmentation_head`` and ``patch_size`` attributes describing the current model.
+            ``segmentation_head`` and ``patch_size`` attributes describing the current model. The class-count check also
+            reads the optional ``num_classes`` and ``model_fields_set`` (the names of fields set explicitly, as on a
+            pydantic config); a namespace without ``model_fields_set`` is treated as having ``num_classes`` unset.
 
     Raises:
         ValueError: If ``segmentation_head`` or ``patch_size`` in the checkpoint
@@ -224,21 +321,26 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
 
         When ``"args"`` is absent or ``args.patch_size`` is not set, a fallback infers ``patch_size`` from the DINOv2
         patch-embedding projection weight shape (key
-        ``backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight``). This fallback **can raise**
-        :class:`ValueError` on a mismatch, providing a clear error before the cryptic :class:`RuntimeError` from
-        :meth:`~torch.nn.Module.load_state_dict` would otherwise fire. For all other attributes (e.g.
-        ``segmentation_head``), if either side is missing, that check is skipped silently — preserving backward
-        compatibility.
+        ``backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight``, or
+        ``backbone.0.encoder.base_model.model.encoder.embeddings.patch_embeddings.projection.weight`` in a checkpoint
+        saved by a ``backbone_lora=True`` run). This fallback **can raise** :class:`ValueError` on a mismatch,
+        providing a clear error before the cryptic :class:`RuntimeError` from :meth:`~torch.nn.Module.load_state_dict`
+        would otherwise fire. For all other attributes (e.g. ``segmentation_head``), if either side is missing, that
+        check is skipped silently — preserving backward compatibility.
 
-        Two class-count scenarios are distinguished:
+        Three class-count scenarios are distinguished:
 
         * Backbone pretrain: the checkpoint head was trained with more classes
           than the current ``model_args.num_classes``. In this case the detection head is typically reinitialized or
           trimmed externally to match the configured number of classes.
-        * Fine-tuned checkpoint: the checkpoint head was trained with fewer
-          classes than the current ``model_args.num_classes``. If you intend to reuse the checkpoint's classification
-          head as-is, set ``model_args.num_classes`` to ``ckpt_num_classes - 1`` (the value reported in the warning)
-          before loading the state dict to align the configuration and silence the warning.
+        * Fine-tuned checkpoint, ``num_classes`` not set: the checkpoint head was trained with fewer classes than the
+          default ``model_args.num_classes``. The checkpoint class count is used. If you intend to reuse the
+          checkpoint's classification head as-is, set ``model_args.num_classes`` to ``ckpt_num_classes - 1`` (the value
+          reported in the warning) before loading the state dict to align the configuration and silence the warning.
+        * Fine-tuned checkpoint, ``num_classes`` set: the checkpoint head was trained with fewer classes than a
+          ``model_args.num_classes`` that is in ``model_args.model_fields_set`` (any explicit value or later
+          assignment, such as by the caller, dataset alignment or a reloaded config). The warning says the configured
+          count is kept and the loaded head is resized to it, matching what ``load_pretrain_weights`` does.
     """
     # Emit actionable class-count mismatch warning early, before any reinit happens.
     ckpt_class_bias = checkpoint.get("model", {}).get("class_embed.bias", None)
@@ -254,6 +356,21 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
                     ckpt_num_classes - 1,
                     model_num_classes,
                     model_num_classes,
+                )
+            elif "num_classes" in getattr(model_args, "model_fields_set", set()):
+                # A num_classes in `model_fields_set` (any explicit value or later assignment) wins:
+                # `load_pretrain_weights` loads the checkpoint head, then resizes it to the configured size by
+                # tiling existing rows.
+                logger.warning(
+                    "Checkpoint has %d classes but model is configured for %d. "
+                    "Keeping num_classes=%d; the classification head grows from %d to %d classes, "
+                    "and the %d added class(es) start as copies of existing ones until fine-tuned.",
+                    ckpt_num_classes - 1,
+                    model_num_classes,
+                    model_num_classes,
+                    ckpt_num_classes - 1,
+                    model_num_classes,
+                    model_num_classes + 1 - ckpt_num_classes,
                 )
             else:
                 # Fine-tuned checkpoint loaded with wrong (larger) num_classes.
@@ -281,8 +398,13 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
         _ckpt_patch_size_from_args = _ckpt_args_get(_ckpt_args, "patch_size")
 
     if _ckpt_patch_size_from_args is None:
-        _patch_proj_key = "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight"
-        _ckpt_proj_w = checkpoint.get("model", {}).get(_patch_proj_key)
+        _patch_proj_suffix = "encoder.embeddings.patch_embeddings.projection.weight"
+        _ckpt_model = checkpoint.get("model", {})
+        # A backbone_lora=True run saves the same weight under the PEFT prefix, and its args (a TrainConfig dump)
+        # carry no patch_size, so this fallback is its only clear error before load_state_dict's (#1540).
+        _ckpt_proj_w = _ckpt_model.get(f"backbone.0.encoder.{_patch_proj_suffix}")
+        if _ckpt_proj_w is None:
+            _ckpt_proj_w = _ckpt_model.get(f"{_LORA_ENCODER_KEY_PREFIX}{_patch_proj_suffix}")
         _ckpt_proj_shape = getattr(_ckpt_proj_w, "shape", None)
         if _ckpt_proj_shape is not None and len(_ckpt_proj_shape) == 4 and _ckpt_proj_shape[2] == _ckpt_proj_shape[3]:
             _inferred_ps = int(_ckpt_proj_shape[-1])
@@ -316,3 +438,18 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
     model_patch_size: int | None = getattr(model_args, "patch_size", None)
     if ckpt_patch_size is not None and model_patch_size is not None and ckpt_patch_size != model_patch_size:
         _raise_patch_size_mismatch(ckpt_patch_size, model_patch_size)
+
+    ckpt_keypoint_head: bool | None = _ckpt_args_get(ckpt_args, "use_grouppose_keypoints")
+    model_keypoint_head: bool | None = getattr(model_args, "use_grouppose_keypoints", None)
+
+    if ckpt_keypoint_head is not None and model_keypoint_head is not None and ckpt_keypoint_head != model_keypoint_head:
+        if ckpt_keypoint_head:
+            raise ValueError(
+                "The checkpoint was trained with a keypoint head, but the current model does not have one. "
+                "Load the weights into a keypoint model (e.g. RFDETRKeypointPreview) instead of a detection model."
+            )
+        else:
+            raise ValueError(
+                "The current model has a keypoint head, but the checkpoint was trained without one. "
+                "Load the weights into a detection model (e.g. RFDETRNano) instead of a keypoint model."
+            )

@@ -8,13 +8,12 @@
 The ``BuilderArgs`` protocol documents the minimum attribute set consumed by ``build_model()``, ``build_backbone()``,
 ``build_transformer()``, and ``build_criterion_and_postprocessors()``.  It is satisfied structurally by any object that
 exposes the required attributes — including the ``SimpleNamespace`` produced by
-:func:`rfdetr._namespace.build_namespace` and, after Item #1 is complete, by
-``ModelConfig``/``TrainConfig`` directly.
+:func:`rfdetr._namespace.build_namespace` and, after Item #1 is complete, by ``ModelConfig``/``TrainConfig`` directly.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 
 @runtime_checkable
@@ -33,12 +32,21 @@ class BuilderArgs(Protocol):
 
     # --- Architecture ---
     encoder: str
-    out_feature_indexes: List[int]
+    out_feature_indexes: list[int]
+    drop_path: float
     dec_layers: int
     freeze_encoder: bool
     backbone_lora: bool
     two_stage: bool
-    projector_scale: List[str]
+    use_grouppose_keypoints: bool
+    keypoint_cross_attn: bool
+    inter_instance_kp_attn: bool
+    grouppose_keypoint_dim_downscale: int
+    dual_projector: bool
+    dual_projector_kp_only: bool
+    num_keypoints_per_class: list[int]
+    num_decoder_registers: int
+    projector_scale: list[str]
     hidden_dim: int
     patch_size: int
     num_windows: int
@@ -48,9 +56,8 @@ class BuilderArgs(Protocol):
     bbox_reparam: bool
     lite_refpoint_refine: bool
     layer_norm: bool
-    amp: bool
     num_classes: int
-    pretrain_weights: Optional[str]
+    pretrain_weights: str | None
     device: str
     resolution: int
     group_detr: int
@@ -64,13 +71,13 @@ class BuilderArgs(Protocol):
     num_select: int
     # --- Legacy / hardcoded defaults (present on Namespace, absent on raw configs) ---
     vit_encoder_num_layers: int
-    window_block_indexes: Optional[List[int]]
+    window_block_indexes: list[int] | None
     position_embedding: str
     rms_norm: bool
     force_no_pretrain: bool
     dim_feedforward: int
     use_cls_token: bool
-    pretrained_encoder: Optional[str]
+    pretrained_encoder: str | None
     backbone_only: bool
     encoder_only: bool
     # --- Criterion ---
@@ -90,6 +97,10 @@ class BuilderArgs(Protocol):
     use_varifocal_loss: bool
     use_position_supervised_loss: bool
     sum_group_losses: bool
+    keypoint_l1_loss_coef: float
+    keypoint_findable_loss_coef: float
+    keypoint_visible_loss_coef: float
+    keypoint_nll_loss_coef: float
     mask_ce_loss_coef: float
     mask_dice_loss_coef: float
     mask_point_sample_ratio: int

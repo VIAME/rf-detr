@@ -24,13 +24,28 @@ import torch
 from pytorch_lightning import LightningModule
 
 from rfdetr import RFDETRNano
-from rfdetr.config import RFDETRBaseConfig, RFDETRNanoConfig, RFDETRSegNanoConfig, SegmentationTrainConfig, TrainConfig
+from rfdetr.config import RFDETRNanoConfig, RFDETRSegNanoConfig, SegmentationTrainConfig, TrainConfig
 from rfdetr.detr import RFDETR
 from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+def _read_num_classes(dataset_dir: Path) -> int:
+    """Count the categories in a dataset's ``train/_annotations.coco.json``.
+
+    Examples:
+        >>> import tempfile
+        >>> root = Path(tempfile.mkdtemp())
+        >>> (root / "train").mkdir()
+        >>> _ = (root / "train" / "_annotations.coco.json").write_text('{"categories": [{"id": 1}, {"id": 2}]}')
+        >>> _read_num_classes(root)
+        2
+    """
+    with open(dataset_dir / "train" / "_annotations.coco.json") as f:
+        return len(json.load(f)["categories"])
 
 
 def _make_ptl_module_from(rfdetr_obj: RFDETR, dataset_dir: Path, output_dir: Path) -> RFDETRModelModule:
@@ -46,6 +61,10 @@ def _make_ptl_module_from(rfdetr_obj: RFDETR, dataset_dir: Path, output_dir: Pat
 
     Returns:
         Weight-synced :class:`~rfdetr.training.RFDETRModelModule` in eval mode.
+
+    Example:
+        >>> _make_ptl_module_from.__name__
+        '_make_ptl_module_from'
     """
     train_config = TrainConfig(
         dataset_file="roboflow",
@@ -67,10 +86,7 @@ def _make_ptl_module_from(rfdetr_obj: RFDETR, dataset_dir: Path, output_dir: Pat
 # ---------------------------------------------------------------------------
 
 
-def test_train_fast_dev_run(
-    tmp_path: Path,
-    synthetic_shape_dataset_dir: Path,
-) -> None:
+def test_train_fast_dev_run(tmp_path: Path, synthetic_shape_dataset_dir: Path) -> None:
     """Smoke-test the full PTL stack on a real synthetic dataset with fast_dev_run.
 
     Uses ``build_trainer(tc, mc, fast_dev_run=2)`` and ``trainer.fit(module, datamodule=datamodule)`` with a real model
@@ -80,8 +96,7 @@ def test_train_fast_dev_run(
     output_dir = tmp_path / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    with open(synthetic_shape_dataset_dir / "train" / "_annotations.coco.json") as f:
-        num_classes = len(json.load(f)["categories"])
+    num_classes = _read_num_classes(synthetic_shape_dataset_dir)
 
     mc = RFDETRNanoConfig(num_classes=num_classes, pretrain_weights=None, amp=False)
     tc = TrainConfig(
@@ -95,7 +110,6 @@ def test_train_fast_dev_run(
         tensorboard=False,
         multi_scale=False,
         expanded_scales=False,
-        do_random_resize_via_padding=False,
         drop_path=0.0,
         grad_accum_steps=1,
     )
@@ -113,34 +127,31 @@ def test_train_fast_dev_run(
 
 @pytest.mark.gpu
 @pytest.mark.flaky(reruns=1, only_rerun="AssertionError")
-def test_train_convergence_native_ptl(
-    tmp_path: Path,
-    synthetic_shape_dataset_dir: Path,
-) -> None:
+def test_train_convergence_native_ptl(tmp_path: Path, synthetic_shape_dataset_dir: Path) -> None:
     """Native PTL stack converges: ``RFDETRModelModule`` + ``RFDETRDataModule`` + ``Trainer.fit``.
 
     Uses ``Trainer.validate`` before and after ``Trainer.fit`` so only Lightning elements are exercised — no
-    ``engine.evaluate`` or legacy paths.
+    ``engine.evaluate`` or legacy paths.  The architecture is the same ``RFDETRNanoConfig`` that
+    :func:`test_train_convergence_rfdetr_api` trains, so the pair differs only by entry point.
 
     Assertions:
         - ``val/mAP_50`` before training ≤ 5 %.
-        - ``val/mAP_50`` after 10 epochs ≥ 35 %.
+        - ``val/mAP_50`` after 15 epochs ≥ 35 %.
     """
     output_dir = tmp_path / "train_output"
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir = synthetic_shape_dataset_dir
 
-    with open(dataset_dir / "train" / "_annotations.coco.json") as f:
-        num_classes = len(json.load(f)["categories"])
+    num_classes = _read_num_classes(dataset_dir)
 
     accelerator = "auto" if torch.cuda.is_available() else "cpu"
 
-    mc = RFDETRBaseConfig(num_classes=num_classes, pretrain_weights=None, amp=False)
+    mc = RFDETRNanoConfig(num_classes=num_classes, pretrain_weights=None, amp=False)
     tc = TrainConfig(
         dataset_file="roboflow",
         dataset_dir=str(dataset_dir),
         output_dir=str(output_dir),
-        epochs=10,
+        epochs=15,
         batch_size=4,
         grad_accum_steps=1,
         num_workers=max(1, (os.cpu_count() or 1) // 2),
@@ -173,10 +184,7 @@ def test_train_convergence_native_ptl(
 
 @pytest.mark.gpu
 @pytest.mark.flaky(reruns=1, only_rerun="AssertionError")
-def test_train_convergence_rfdetr_api(
-    tmp_path: Path,
-    synthetic_shape_dataset_dir: Path,
-) -> None:
+def test_train_convergence_rfdetr_api(tmp_path: Path, synthetic_shape_dataset_dir: Path) -> None:
     """``RFDETR.train()`` entry-point converges on synthetic data.
 
     Exercises the public ``model.train()`` API end-to-end.  Pre- and post-training mAP are measured via
@@ -184,28 +192,26 @@ def test_train_convergence_rfdetr_api(
 
     Assertions:
         - ``val/mAP_50`` before training ≤ 5 %.
-        - ``val/mAP_50`` after 10 epochs ≥ 35 %.
+        - ``val/mAP_50`` after 15 epochs ≥ 35 %.
     """
     output_dir = tmp_path / "train_output"
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir = synthetic_shape_dataset_dir
 
-    with open(dataset_dir / "train" / "_annotations.coco.json") as f:
-        num_classes = len(json.load(f)["categories"])
+    num_classes = _read_num_classes(dataset_dir)
 
     accelerator = "auto" if torch.cuda.is_available() else "cpu"
     device = None if torch.cuda.is_available() else "cpu"
 
     model = RFDETRNano(num_classes=num_classes, pretrain_weights=None, amp=False)
-    # Use the model's own config so RFDETRDataModule uses the correct resolution.
-    # RFDETRNano (patch_size=16, num_windows=2) requires block_size=32 divisibility;
-    # its resolution=384 satisfies this, while RFDETRBaseConfig resolution=560 does not.
+    # Model's own config keeps the datamodule resolution valid: RFDETRNano needs block_size=32 divisibility (384 ok).
+    # Matches RFDETRNanoConfig in test_train_convergence_native_ptl, so the tests differ only by entry point.
     mc = model.model_config
     tc = TrainConfig(
         dataset_file="roboflow",
         dataset_dir=str(dataset_dir),
         output_dir=str(output_dir),
-        epochs=10,
+        epochs=15,
         batch_size=4,
         grad_accum_steps=1,
         num_workers=max(1, (os.cpu_count() or 1) // 2),
@@ -231,7 +237,7 @@ def test_train_convergence_rfdetr_api(
         dataset_file="roboflow",
         dataset_dir=str(dataset_dir),
         output_dir=str(output_dir),
-        epochs=10,
+        epochs=15,
         batch_size=4,
         grad_accum_steps=1,
         num_workers=max(1, (os.cpu_count() or 1) // 2),
@@ -272,15 +278,14 @@ def test_train_convergence_segmentation(
 
     Assertions:
         - ``val/mAP_50`` before training ≤ 5 %.
-        - ``val/mAP_50`` after 5 epochs ≥ 10 %.
-        - ``val/segm_mAP_50`` after 5 epochs ≥ 5 %.
+        - ``val/mAP_50`` after 8 epochs ≥ 15 %.
+        - ``val/segm_mAP_50`` after 8 epochs ≥ 5 %.
     """
     output_dir = tmp_path / "train_output_seg"
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir = synthetic_shape_segmentation_dataset_dir
 
-    with open(dataset_dir / "train" / "_annotations.coco.json") as f:
-        num_classes = len(json.load(f)["categories"])
+    num_classes = _read_num_classes(dataset_dir)
 
     accelerator = "auto" if torch.cuda.is_available() else "cpu"
 
@@ -289,7 +294,7 @@ def test_train_convergence_segmentation(
         dataset_file="roboflow",
         dataset_dir=str(dataset_dir),
         output_dir=str(output_dir),
-        epochs=5,
+        epochs=8,
         batch_size=4,
         grad_accum_steps=1,
         num_workers=max(1, (os.cpu_count() or 1) // 2),

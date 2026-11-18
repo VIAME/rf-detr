@@ -26,12 +26,20 @@ jobs:
       - name: 🐍 Install uv and set Python
         uses: astral-sh/setup-uv@61cb8a9741eeb8a550a1b8544337180c0fc8476b # v7.2.0
         with:
+          version: "0.9.26"
           python-version: "3.10"
           activate-environment: true
 
       - name: 🏗️ Install dependencies
         timeout-minutes: 5
+        env:
+          UV_TORCH_BACKEND: "cpu"
         run: uv pip install -e ".[plus]" --group docs
+
+      - name: 📦 Restore shared model weights
+        uses: ./.github/actions/cache-model-weights
+        with:
+          save: "false"
 
       - name: 🧪 Test Docs Build
         run: uv run --no-sync mkdocs build --verbose

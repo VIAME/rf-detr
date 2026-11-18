@@ -3,6 +3,7 @@ ci:
   autoupdate_schedule: monthly
   autofix_commit_msg: "fix(pre-commit): 🎨 auto format pre-commit hooks"
   autoupdate_commit_msg: "chore(pre-commit): ⬆ pre_commit autoupdate"
+  skip: [mypy]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -16,7 +17,7 @@ repos:
       - id: check-toml
       - id: check-case-conflict
       - id: check-added-large-files
-        args: ["--maxkb=200", "--enforce-all"]
+        args: ["--maxkb=250", "--enforce-all"]
         exclude: uv.lock
       - id: detect-private-key
       - id: pretty-format-json
@@ -26,7 +27,7 @@ repos:
       - id: mixed-line-ending
 
   - repo: https://github.com/JoC0de/pre-commit-prettier
-    rev: v3.8.3 # using tag; previously pinned SHA when tags were not persistent
+    rev: v3.9.10 # using tag; previously pinned SHA when tags were not persistent
     hooks:
       - id: prettier
         files: \.(ya?ml|toml)$
@@ -34,7 +35,7 @@ repos:
         args: ["--print-width=120"]
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.17.3
     hooks:
       - id: ruff-check
         args: ["--exit-non-zero-on-fix"]
@@ -43,24 +44,13 @@ repos:
         exclude: ^notebooks/.*\.py$
 
   - repo: https://github.com/PyCQA/docformatter
-    rev: v1.7.7
+    rev: v1.7.8
     hooks:
       - id: docformatter
-        language_version: python3.10
+        # untokenize 0.1.1 cannot build on Python 3.14 (removed ast.Constant.s).
+        language_version: python3.11
         additional_dependencies: [tomli]
         args: ["--in-place"]
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.20.2
-    hooks:
-      - id: mypy
-        # The hook runs in an isolated env without torch/torchvision/etc.
-        # Full strict checking (matching pyproject.toml) runs in CI via ci-typing.yml.
-        args: ["--ignore-missing-imports"]
-        exclude: ^docs/(hooks|scripts)/.*\.py$
-        additional_dependencies:
-          - "types-PyYAML"
-          - "types-requests"
 
   - repo: https://github.com/executablebooks/mdformat
     rev: 1.0.0
@@ -70,10 +60,10 @@ repos:
         additional_dependencies:
           - "mdformat-mkdocs[recommended]>=2.1.0"
           - "mdformat-ruff"
-        args: ["--number"]
+        args: ["--number", "--wrap=no"]
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.4.2
+    rev: v2.4.3
     hooks:
       - id: codespell
         # args: [--write-changes]
@@ -92,9 +82,33 @@ repos:
     hooks:
       - id: insert-license
         files: \.py$
-        exclude: ^notebooks/
+        exclude: ^(notebooks|docs)/
         args:
           - --license-filepath
           - .github/LICENSE_HEADER.txt
           - --comment-style
           - "#"
+
+  - repo: local
+    hooks:
+      - id: no-optional-dependency-probes-in-tests
+        name: no importorskip or find_spec probes in tests
+        description: >-
+          Gate optional-dependency tests with a skipif built from an _IS_<PACKAGE>_INSTALLED flag, never importorskip or
+          a local find_spec probe (see AGENTS.md, Test Organization).
+        language: pygrep
+        entry: '\b(importorskip|find_spec)\('
+        files: ^tests/.*\.py$
+        # Two groups of files stay out. Fake import finders and module-path lookups call find_spec on purpose:
+        # test_detr_shim, test_fused_adamw_ema_routing, test_from_checkpoint, test_public_facades, test_export.
+        # test_tensorrt_int8 keeps one module-level importorskip("onnx"), because its parametrized cases build ONNX nodes at
+        # collection time; moving them behind local imports is a follow-up.
+        exclude: >-
+          ^tests/(training/test_detr_shim|training/test_fused_adamw_ema_routing|inference/test_from_checkpoint|export/test_public_facades|export/test_export|export/tensorrt/test_tensorrt_int8)\.py$
+
+      - id: mypy
+        name: mypy
+        # Run through the project environment, matching ci-typing.yml.
+        entry: uv run --group typing --extra train --extra cli --extra visual mypy src/rfdetr/ scripts/ --no-error-summary
+        language: system
+        pass_filenames: false

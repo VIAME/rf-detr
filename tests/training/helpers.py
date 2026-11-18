@@ -6,9 +6,9 @@
 """Shared test helpers for the rfdetr.training test suite.
 
 Plain classes and functions (not pytest fixtures) shared across multiple test modules to avoid verbatim duplication.
-Import with a relative import::
+Import with an absolute import::
 
-    from .helpers import _FakeCriterion, _FakeDataset, _TinyModel
+    from tests.training.helpers import _FakeCriterion, _FakeDataset, _TinyModel
 """
 
 from __future__ import annotations
@@ -51,9 +51,14 @@ class _FakeCriterion:
 
     weight_dict = {"loss_ce": 1.0}
 
-    def __call__(self, outputs, targets):
+    def num_boxes_for_targets(self, outputs, targets):
         dummy = outputs.get("dummy", torch.zeros(1))
-        return {"loss_ce": dummy.mean()}
+        return torch.ones((), dtype=dummy.dtype, device=dummy.device)
+
+    def __call__(self, outputs, targets, num_boxes=None):
+        dummy = outputs.get("dummy", torch.zeros(1))
+        denominator = self.num_boxes_for_targets(outputs, targets) if num_boxes is None else num_boxes
+        return {"loss_ce": dummy.mean() / denominator}
 
 
 class _FakeDataset(torch.utils.data.Dataset):
@@ -104,7 +109,16 @@ class _FakePostProcess:
 
 
 def _fake_postprocess(outputs, orig_sizes):
-    """Return one non-empty prediction per image so COCOEvalCallback has something to score."""
+    """Return one non-empty prediction per image so COCOEvalCallback has something to score.
+
+    Examples:
+        >>> import torch
+        >>> batch = _fake_postprocess({}, torch.zeros(2, 2))
+        >>> len(batch)
+        2
+        >>> sorted(batch[0])
+        ['boxes', 'labels', 'scores']
+    """
     n = orig_sizes.shape[0]
     return [
         {
@@ -117,5 +131,14 @@ def _fake_postprocess(outputs, orig_sizes):
 
 
 def _make_param_dicts(model: nn.Module) -> list[dict]:
-    """Build a minimal param-dict list for AdamW from all trainable parameters."""
+    """Build a minimal param-dict list for AdamW from all trainable parameters.
+
+    Examples:
+        >>> model = _TinyModel()
+        >>> groups = _make_param_dicts(model)
+        >>> len(groups)
+        1
+        >>> groups[0]["lr"]
+        0.0001
+    """
     return [{"params": p, "lr": 1e-4} for p in model.parameters() if p.requires_grad]

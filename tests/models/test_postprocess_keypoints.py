@@ -1,0 +1,416 @@
+# ------------------------------------------------------------------------
+# RF-DETR
+# Copyright (c) 2025 Roboflow. All Rights Reserved.
+# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# ------------------------------------------------------------------------
+"""Unit tests for keypoint decoding in PostProcess."""
+
+import pytest
+import torch
+
+from rfdetr.models.postprocess import PostProcess
+
+_DTYPES = [
+    pytest.param(torch.float16, id="float16"),
+    pytest.param(torch.bfloat16, id="bfloat16"),
+    pytest.param(torch.float32, id="float32"),
+    pytest.param(torch.float64, id="float64"),
+]
+
+
+def _count_scalar_reads(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Patch ``Tensor.__bool__`` to count scalar reads and return a one-item list holding the running count.
+
+    Args:
+        monkeypatch: Patches ``Tensor.__bool__`` for the duration of the test.
+
+    Examples:
+        >>> with pytest.MonkeyPatch.context() as patch:
+        ...     reads = _count_scalar_reads(patch)
+        ...     _ = bool(torch.tensor(True))
+        >>> reads
+        [1]
+    """
+    reads = [0]
+    original_bool = torch.Tensor.__bool__
+
+    def counting_bool(tensor: torch.Tensor) -> bool:
+        reads[0] += 1
+        return original_bool(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "__bool__", counting_bool)
+    return reads
+
+
+def _single_detection_outputs(
+    logits: list[float], num_slots: int, channels: dict[tuple[int, int], float]
+) -> dict[str, torch.Tensor]:
+    """Return PostProcess outputs for one query, with zero keypoints except the given ``(slot, channel)`` values.
+
+    Args:
+        logits: Per-class logits of the single query.
+        num_slots: Number of flat keypoint slots (``num_classes * max_num_keypoints``).
+        channels: Values to write into the 8-channel keypoint tensor, keyed by ``(slot, channel)``.
+
+    Examples:
+        >>> outputs = _single_detection_outputs([0.0], 1, {(0, 2): 10.0})
+        >>> outputs["pred_keypoints"][0, 0, 0, 2].item(), outputs["pred_logits"].shape
+        (10.0, torch.Size([1, 1, 1]))
+    """
+    keypoints = torch.zeros((1, 1, num_slots, 8), dtype=torch.float32)
+    for (slot, channel), value in channels.items():
+        keypoints[0, 0, slot, channel] = value
+    return {
+        "pred_logits": torch.tensor([[logits]], dtype=torch.float32),
+        "pred_boxes": torch.tensor([[[0.5, 0.5, 0.5, 0.5]]], dtype=torch.float32),
+        "pred_keypoints": keypoints,
+    }
+
+
+class TestKeypointTracePrecision:
+    """Trace fusion must retain finite predictions across inference dtypes."""
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    def test_multiple_detections_preserve_score_dtype(self, dtype: torch.dtype) -> None:
+        """Vector trace fusion preserves score dtype and finite identity-covariance scores."""
+        postprocess = PostProcess(num_select=2, num_keypoints_per_class=[2])
+        keypoints = torch.zeros(1, 2, 2, 8, dtype=dtype)
+        keypoints[..., 2] = -20.0
+        outputs = {
+            "pred_logits": torch.full((1, 2, 1), 4.0, dtype=dtype),
+            "pred_boxes": torch.full((1, 2, 4), 0.5, dtype=dtype),
+            "pred_keypoints": keypoints,
+        }
+        original_keypoints = keypoints.clone()
+
+        result = postprocess(outputs, torch.tensor([[48, 64]]))[0]
+
+        object_probability = torch.tensor(4.0, dtype=torch.float64).sigmoid()
+        fused_probability = object_probability * 2.0**-postprocess.trace_alpha
+        expected = (fused_probability / (1.0 + fused_probability)).expand(2)
+        assert result["scores"].dtype == dtype
+        torch.testing.assert_close(result["scores"].double(), expected, rtol=0.005, atol=1e-6)
+        torch.testing.assert_close(keypoints, original_keypoints, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("dtype", _DTYPES)
+    @pytest.mark.parametrize("findable_logit", [-100.0, -20.0, -8.0, 0.0, 8.0])
+    def test_log_mean_trace_matches_covariance(self, dtype: torch.dtype, findable_logit: float) -> None:
+        """Compare batched log traces with an independently inverted precision matrix."""
+        active_keypoints = torch.zeros(2, 3, 8, dtype=dtype)
+        active_keypoints[..., 2] = torch.tensor([findable_logit, findable_logit + 1, findable_logit - 1], dtype=dtype)
+        active_keypoints[1, :, 4:7] = torch.tensor(
+            [[0.125, 0.375, -0.5], [-0.25, -0.5, 0.25], [0.5, 0.0, -0.125]], dtype=dtype
+        )
+        reference = active_keypoints.double()
+        cholesky = torch.zeros(2, 3, 2, 2, dtype=torch.float64)
+        cholesky[..., 0, 0] = reference[..., 4].exp()
+        cholesky[..., 1, 0] = reference[..., 5]
+        cholesky[..., 1, 1] = reference[..., 6].exp()
+        inverse = torch.linalg.inv(cholesky)
+        covariance = inverse.transpose(-1, -2) @ inverse
+        traces = covariance.diagonal(dim1=-2, dim2=-1).sum(-1)
+        weights = reference[..., 2].sigmoid().clamp(min=1e-12)
+        expected = ((traces * weights).sum(-1) / weights.sum(-1)).log()
+
+        actual = PostProcess._keypoint_log_mean_trace(active_keypoints)
+
+        torch.testing.assert_close(actual.double(), expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    ("schema", "expected_scalar_reads"),
+    [
+        pytest.param([17], 1, id="single-active-class"),
+        pytest.param([0, 17], 3, id="legacy-background-first"),
+        pytest.param([0, 3, 0, 5], 5, id="mixed-detection-and-keypoint-classes"),
+    ],
+)
+def test_static_keypoint_schema_avoids_redundant_device_presence_checks(
+    monkeypatch: pytest.MonkeyPatch, schema: list[int], expected_scalar_reads: int
+) -> None:
+    """Zero-keypoint slots and a lone valid class must not trigger scalar tensor reads.
+
+    The remaining reads are one global valid-class guard plus one presence guard in each of the decode and trace-fusion
+    loops for every active class in a multi-class schema. Calling ``Tensor.__bool__`` on the scalar returned by
+    ``class_mask.any()`` synchronizes CUDA, so the count must depend on active rather than padded classes.
+    """
+    num_classes = len(schema)
+    max_keypoints = max(schema)
+    postprocess = PostProcess(num_select=num_classes, num_keypoints_per_class=schema)
+    outputs = {
+        "pred_logits": torch.arange(num_classes, dtype=torch.float32).view(1, 1, num_classes),
+        "pred_boxes": torch.full((1, 1, 4), 0.5),
+        "pred_keypoints": torch.randn(1, 1, num_classes * max_keypoints, 8),
+    }
+    target_sizes = torch.tensor([[100, 200]])
+    scalar_reads = _count_scalar_reads(monkeypatch)
+
+    results = postprocess(outputs, target_sizes)
+
+    assert scalar_reads[0] == expected_scalar_reads
+    assert results[0]["keypoints"].shape == (num_classes, max_keypoints, 3)
+
+
+def test_static_keypoint_schema_skips_absent_active_class_without_stale_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An active keypoint class fully absent from an image's detections must still decode to zeros.
+
+    The parametrized test above always builds ``pred_logits`` with ``arange``, which picks the single active class every
+    time, so it never exercises the ``class_mask.any()`` branch actually returning ``False`` for a present-in-schema
+    class. This drives the real checkpoint schema ``[0, 17]`` with every detection classified as the zero-keypoint
+    background class, so the active class (1) has zero matches and the presence check must still run once per loop and
+    correctly skip.
+    """
+    postprocess = PostProcess(num_select=2, num_keypoints_per_class=[0, 17])
+    outputs = {
+        "pred_logits": torch.tensor([[[10.0, -10.0], [10.0, -10.0]]], dtype=torch.float32),
+        "pred_boxes": torch.full((1, 2, 4), 0.5),
+        "pred_keypoints": torch.randn(1, 2, 34, 8),
+    }
+    target_sizes = torch.tensor([[100, 200]])
+    scalar_reads = _count_scalar_reads(monkeypatch)
+
+    results = postprocess(outputs, target_sizes)
+
+    assert scalar_reads[0] == 3
+    keypoints = results[0]["keypoints"]
+    assert keypoints.shape == (2, 17, 3)
+    assert torch.equal(keypoints, torch.zeros_like(keypoints))
+
+
+def test_emits_keypoints_and_precision_for_top_detections() -> None:
+    """PostProcess should emit keypoints and raw precision parameters for top detections."""
+    postprocess = PostProcess(num_select=2, num_keypoints_per_class=[17])
+    outputs = {
+        "pred_logits": torch.tensor([[[10.0, -10.0], [9.0, -10.0]]], dtype=torch.float32),
+        "pred_boxes": torch.tensor([[[0.5, 0.5, 0.5, 0.5], [0.4, 0.6, 0.2, 0.3]]], dtype=torch.float32),
+        "pred_keypoints": torch.zeros((1, 2, 17, 8), dtype=torch.float32),
+    }
+    outputs["pred_keypoints"][0, :, :, 0] = 0.5
+    outputs["pred_keypoints"][0, :, :, 1] = 0.25
+    outputs["pred_keypoints"][0, :, :, 2] = 3.0
+    outputs["pred_keypoints"][0, :, :, 4] = 0.25
+    outputs["pred_keypoints"][0, :, :, 5] = 0.5
+    outputs["pred_keypoints"][0, :, :, 6] = -0.25
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+    keypoints = results[0]["keypoints"]
+    keypoint_precision = results[0]["keypoint_precision_cholesky"]
+
+    assert keypoints.shape == (2, 17, 3)
+    assert torch.allclose(keypoints[:, :, 0], torch.full((2, 17), 100.0))
+    assert torch.allclose(keypoints[:, :, 1], torch.full((2, 17), 25.0))
+    assert torch.all((keypoints[:, :, 2] > 0) & (keypoints[:, :, 2] < 1))
+    assert keypoint_precision.shape == (2, 17, 3)
+    torch.testing.assert_close(keypoint_precision[:, :, 0], torch.full((2, 17), 0.25))
+    torch.testing.assert_close(keypoint_precision[:, :, 1], torch.full((2, 17), 0.5))
+    torch.testing.assert_close(keypoint_precision[:, :, 2], torch.full((2, 17), -0.25))
+
+
+def test_gather_keypoints_for_queries_repeats_duplicated_indices() -> None:
+    """Duplicated and out-of-order query indices must each reproduce that query's exact keypoint rows.
+
+    Top-k selection can pick the same query under two classes, so the gather has to copy the full per-query keypoint
+    block verbatim for every occurrence.
+    """
+    out_keypoints_i = torch.randn(4, 17, 8)
+    query_indices = torch.tensor([3, 1, 3])  # query 3 selected twice, out of order
+
+    gathered = PostProcess._gather_keypoints_for_queries(out_keypoints_i, query_indices)
+
+    assert gathered.shape == (3, 17, 8)
+    assert torch.equal(gathered[0], out_keypoints_i[3])
+    assert torch.equal(gathered[1], out_keypoints_i[1])
+    assert torch.equal(gathered[2], out_keypoints_i[3])
+
+
+def test_decodes_duplicated_and_out_of_order_queries() -> None:
+    """Duplicated and out-of-order query selection must decode each occurrence from the correct source query.
+
+    Drives dupe/out-of-order ``topk_boxes`` through the full class-filtering path (``_decode_keypoints_for_image``)
+    rather than the raw gather helper: two detections that select the same query under the same class must produce
+    identical decoded keypoints, while an interleaved detection must decode a different query's block.
+    """
+    postprocess = PostProcess(num_keypoints_per_class=[2, 2])
+    out_keypoints = torch.randn(1, 4, 4, 8)  # (B, Q, num_classes * max_kpts, D); D >= 7 for precision cols
+    topk_boxes = torch.tensor([[2, 1, 2]])  # query 2 selected twice, query 1 interleaved (out of order)
+    labels = torch.zeros(1, 3, dtype=torch.long)  # all class 0 so the two query-2 picks decode identically
+    scores = torch.rand(1, 3)
+    boxes = torch.zeros(1, 3, 4)
+    target_sizes = torch.tensor([[100, 200]])  # (h, w)
+
+    results = postprocess._postprocess_keypoints(out_keypoints, scores, labels, boxes, topk_boxes, target_sizes)
+    keypoints = results[0]["keypoints"]  # (3, max_num_keypoints=2, 3)
+
+    assert keypoints.shape == (3, 2, 3)
+    assert torch.equal(keypoints[0], keypoints[2])  # same query + class → identical decoded keypoints
+    # Independent decode of query 1's class-0 block (flat slots 0,1) confirms out-of-order gather picks the right query.
+    img_h, img_w = 100, 200
+    q1_class0 = out_keypoints[0, 1, 0:2]
+    expected1 = torch.stack([q1_class0[:, 0] * img_w, q1_class0[:, 1] * img_h, q1_class0[:, 2].sigmoid()], dim=-1)
+    torch.testing.assert_close(keypoints[1], expected1)
+
+
+def test_selects_class_specific_keypoint_slots() -> None:
+    """Class-specific keypoint slots should be selected from padded per-class keypoint tensors."""
+    postprocess = PostProcess(num_select=1, num_keypoints_per_class=[2, 1])
+    # class 0 slots: [0, 1], class 1 slots: [2, 3]
+    outputs = _single_detection_outputs([0.0, 10.0], 4, {(2, 0): 0.25, (2, 1): 0.4, (2, 2): 2.0})
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+    keypoints = results[0]["keypoints"]
+    keypoint_precision = results[0]["keypoint_precision_cholesky"]
+
+    assert keypoints.shape == (1, 2, 3)
+    assert torch.allclose(keypoints[0, 0, 0], torch.tensor(50.0))
+    assert torch.allclose(keypoints[0, 0, 1], torch.tensor(40.0))
+    assert 0.0 < keypoints[0, 0, 2].item() < 1.0
+    torch.testing.assert_close(keypoints[0, 1], torch.zeros(3))
+    torch.testing.assert_close(keypoint_precision[0, 1], torch.full((3,), float("nan")), equal_nan=True)
+
+
+def test_trace_alpha_rescores_active_keypoints_only() -> None:
+    """Trace fusion should use active keypoints for the predicted class and ignore padded slots."""
+    postprocess = PostProcess(num_select=1, num_keypoints_per_class=[2, 1], trace_alpha=1.0)
+    # class 1 has one active slot at flat index 2 and one padded inactive slot at flat index 3.
+    outputs = _single_detection_outputs(
+        [-10.0, 0.0], 4, {(2, 2): 10.0, (2, 4): 0.0, (2, 5): 0.0, (2, 6): 0.0, (3, 2): 10.0, (3, 4): -2.0, (3, 6): -2.0}
+    )
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+
+    expected_score = torch.tensor([0.2], dtype=torch.float32)
+    torch.testing.assert_close(results[0]["scores"], expected_score, rtol=1e-4, atol=1e-6)
+
+
+def test_trace_alpha_normalizes_large_fused_scores() -> None:
+    """Trace-fused keypoint scores should be bounded after empirical normalization."""
+    postprocess = PostProcess(num_select=1, num_keypoints_per_class=[1], trace_alpha=1.0)
+    outputs = _single_detection_outputs([10.0], 1, {(0, 2): 10.0, (0, 4): 2.0, (0, 5): 0.0, (0, 6): 2.0})
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+
+    original_score = torch.sigmoid(torch.tensor([10.0], dtype=torch.float32))
+    mean_trace = torch.tensor([2.0], dtype=torch.float32) * torch.exp(torch.tensor([-4.0], dtype=torch.float32))
+    fused_score = original_score * mean_trace.pow(-1.0)
+    expected_score = fused_score / (1.0 + fused_score)
+    assert fused_score.item() > 1.0
+    assert 0.0 < results[0]["scores"].item() < 1.0
+    torch.testing.assert_close(results[0]["scores"], expected_score, rtol=1e-4, atol=1e-6)
+
+
+def test_trace_alpha_clamps_overflowing_fused_scores() -> None:
+    """Trace fusion should stay finite and strictly below 1.0 when the raw fused score overflows."""
+    postprocess = PostProcess(num_select=1, num_keypoints_per_class=[1], trace_alpha=1.0)
+    outputs = _single_detection_outputs([0.0], 1, {(0, 2): 10.0, (0, 4): 50.0, (0, 5): 0.0, (0, 6): 50.0})
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+
+    score = results[0]["scores"]
+    expected_score = torch.nextafter(torch.ones_like(score), torch.zeros_like(score))
+    assert torch.isfinite(score).all()
+    assert 0.0 < score.item() < 1.0
+    torch.testing.assert_close(score, expected_score, rtol=0.0, atol=0.0)
+
+
+def test_trace_alpha_uses_log_space_for_extreme_trace() -> None:
+    """Trace fusion should stay finite for extreme covariance terms."""
+    postprocess = PostProcess(num_select=1, num_keypoints_per_class=[1])
+    outputs = _single_detection_outputs([0.0], 1, {(0, 2): 10.0, (0, 4): -50.0, (0, 5): 0.0, (0, 6): 0.0})
+
+    target_sizes = torch.tensor([[100, 200]], dtype=torch.int64)
+    results = postprocess(outputs, target_sizes)
+
+    expected_score = torch.tensor([0.5], dtype=torch.float32) * torch.exp(torch.tensor([-20.0], dtype=torch.float32))
+    torch.testing.assert_close(results[0]["scores"], expected_score, rtol=1e-4, atol=1e-12)
+
+
+def _mask_and_keypoint_outputs() -> dict[str, torch.Tensor]:
+    """Return PostProcess outputs for three one-class queries whose mask and keypoints encode the query index.
+
+    Query ``q`` has object logit ``[2, 0, 1][q]``, a mask that is positive only in column ``q``, and keypoint
+    ``x = (q + 1) / 10``. Query 0 alone has a broad keypoint covariance, so trace fusion ranks it below query 2.
+
+    Examples:
+        >>> outputs = _mask_and_keypoint_outputs()
+        >>> outputs["pred_masks"].shape, outputs["pred_keypoints"].shape
+        (torch.Size([1, 3, 4, 4]), torch.Size([1, 3, 2, 8]))
+    """
+    masks = torch.full((1, 3, 4, 4), -1.0)
+    keypoints = torch.zeros((1, 3, 2, 8))
+    for query in range(3):
+        masks[0, query, :, query] = 1.0
+        keypoints[0, query, :, 0] = (query + 1) / 10
+    keypoints[0, 0, :, 4] = -10.0
+    keypoints[0, 0, :, 6] = -10.0
+    return {
+        "pred_logits": torch.tensor([[[2.0], [0.0], [1.0]]]),
+        "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2]] * 3]),
+        "pred_masks": masks,
+        "pred_keypoints": keypoints,
+    }
+
+
+class TestMasksAndKeypointsTogether:
+    """A model with both heads gets one row-aligned result holding masks and keypoints."""
+
+    def test_returns_every_field_for_every_selected_row(self) -> None:
+        """Without a threshold all selected rows carry masks, keypoints and precision parameters."""
+        postprocess = PostProcess(num_select=3, num_keypoints_per_class=[2])
+
+        (result,) = postprocess(_mask_and_keypoint_outputs(), torch.tensor([[4, 4]]))
+
+        assert set(result) == {"scores", "labels", "boxes", "masks", "keypoints", "keypoint_precision_cholesky"}
+        assert result["scores"].shape == (3,)
+        assert result["boxes"].shape == (3, 4)
+        assert result["masks"].shape == (3, 1, 4, 4)
+        assert result["keypoints"].shape == (3, 2, 3)
+        assert result["keypoint_precision_cholesky"].shape == (3, 2, 3)
+
+    def test_scores_match_the_keypoint_only_path(self) -> None:
+        """The returned scores are the uncertainty-fused ones the keypoint path reports."""
+        postprocess = PostProcess(num_select=3, num_keypoints_per_class=[2])
+        outputs = _mask_and_keypoint_outputs()
+        keypoint_only = {key: value for key, value in outputs.items() if key != "pred_masks"}
+
+        (result,) = postprocess(outputs, torch.tensor([[4, 4]]))
+        (expected,) = postprocess(keypoint_only, torch.tensor([[4, 4]]))
+
+        torch.testing.assert_close(result["scores"], expected["scores"], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(result["keypoints"], expected["keypoints"], rtol=0.0, atol=0.0)
+
+    @pytest.mark.parametrize("score_threshold", [None, 0.0, 0.3, 0.45, 0.99])
+    def test_rows_stay_aligned_under_score_threshold(self, score_threshold: float | None) -> None:
+        """Masks and keypoints of a kept row come from the same query, and the fused score decides what is kept."""
+        postprocess = PostProcess(num_select=3, num_keypoints_per_class=[2])
+        outputs = _mask_and_keypoint_outputs()
+        (unfiltered,) = postprocess(outputs, torch.tensor([[4, 4]]))
+        keep = unfiltered["scores"] > (-1.0 if score_threshold is None else score_threshold)
+
+        (result,) = postprocess(outputs, torch.tensor([[4, 4]]), score_threshold=score_threshold)
+
+        for key, value in unfiltered.items():
+            torch.testing.assert_close(result[key], value[keep], rtol=0.0, atol=0.0, equal_nan=True)
+        # Column q of the mask and keypoint x = (q + 1) / 10 * width both identify query q.
+        mask_query = result["masks"][:, 0, 0, :].int().argmax(dim=1)
+        keypoint_query = (result["keypoints"][:, 0, 0] / 4 * 10).round().long() - 1
+        torch.testing.assert_close(mask_query, keypoint_query)
+
+    def test_threshold_uses_fused_scores(self) -> None:
+        """A row whose raw score passes the threshold but whose fused score does not is dropped."""
+        postprocess = PostProcess(num_select=3, num_keypoints_per_class=[2])
+        outputs = _mask_and_keypoint_outputs()
+        raw_top_score = outputs["pred_logits"].sigmoid().max().item()
+
+        (unfiltered,) = postprocess(outputs, torch.tensor([[4, 4]]))
+        (result,) = postprocess(outputs, torch.tensor([[4, 4]]), score_threshold=0.3)
+
+        # Query 0 has the highest raw score and the lowest fused score.
+        assert raw_top_score > 0.3
+        assert unfiltered["scores"][0].item() < 0.3
+        assert result["scores"].shape == (2,)
+        assert (result["scores"] > 0.3).all()
