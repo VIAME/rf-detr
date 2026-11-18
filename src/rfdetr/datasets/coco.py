@@ -66,7 +66,7 @@ _IMAGE_READ_BACKOFF_SECONDS = 0.5
 _MAX_SUBSTITUTIONS = 10
 
 # PIL modes that carry a fourth channel (RGB + alpha/motion); such images are kept 4-channel as RGBA.
-_FOUR_CHANNEL_MODES = frozenset({"RGBA", "LA", "CMYK"})
+_FOUR_CHANNEL_MODES = frozenset({"RGBA", "LA"})
 
 _Resolution = int | tuple[int, int]
 
