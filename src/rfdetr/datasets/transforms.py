@@ -37,6 +37,20 @@ from rfdetr.util.logger import get_logger
 logger = get_logger()
 
 
+def image_wh(image: Any) -> Tuple[int, int]:
+    """Return ``(width, height)`` for a PIL image or an HWC array."""
+    if isinstance(image, np.ndarray):
+        return int(image.shape[1]), int(image.shape[0])
+    return image.size
+
+
+def array_to_image(array: np.ndarray) -> Any:
+    """Wrap an HWC array as a PIL image, or pass it through when PIL cannot hold it (more than 4 channels)."""
+    if array.ndim == 3 and array.shape[2] > 4:
+        return array
+    return Image.fromarray(array)
+
+
 class Normalize(object):
     def __init__(
         self,
@@ -683,7 +697,7 @@ class AlbumentationsWrapper:
             if "area" in target_out:
                 boxes = target_out["boxes"]
                 target_out["area"] = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-        image_out = Image.fromarray(augmented["image"])
+        image_out = array_to_image(augmented["image"])
         if masks_list is not None and "masks" in augmented:
             height, width = augmented["image"].shape[:2]
             masks_aug = augmented["masks"]
@@ -770,7 +784,7 @@ class AlbumentationsWrapper:
                 )
             else:
                 augmented = self.transform(image=image_np)
-            return Image.fromarray(augmented["image"]), None
+            return array_to_image(augmented["image"]), None
 
         # === Input Validation ===
         if not isinstance(target, dict):
@@ -797,13 +811,13 @@ class AlbumentationsWrapper:
         else:
             # Non-geometric path: transform image only
             augmented = self.transform(image=image_np)
-            image_out = Image.fromarray(augmented["image"])
+            image_out = array_to_image(augmented["image"])
             target_out = target.copy()
 
         # Ensure 'size' (if present) matches the transformed image size (h, w)
         if "size" in target_out:
             # PIL.Image.size is (width, height); many detectors expect (height, width)
-            width, height = image_out.size
+            width, height = image_wh(image_out)
             target_out["size"] = torch.as_tensor([height, width], dtype=torch.int64)
         return image_out, target_out
 

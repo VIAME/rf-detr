@@ -22,14 +22,16 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.utils.data
 import torchvision
+from torchvision import tv_tensors
 from PIL import Image
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
 
 from rfdetr.datasets.aug_config import AUG_CONFIG
-from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
+from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize, image_wh
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.shapes import as_pair
 
@@ -185,6 +187,20 @@ def convert_coco_poly_to_mask(segmentations: List[Any], height: int, width: int)
     return torch.stack(masks, dim=0)
 
 
+class _ToImage(ToImage):
+    """``ToImage`` that also takes the HWC frame stack of a video sample.
+
+    Given a bare array, the stock transform has no image type to anchor on and converts the
+    target's box tensor to an image as well, so the array is wrapped here and the target left alone.
+    """
+
+    def forward(self, *inputs: Any) -> Any:
+        if len(inputs) == 2 and isinstance(inputs[0], np.ndarray):
+            array = np.ascontiguousarray(inputs[0])
+            return tv_tensors.Image(torch.from_numpy(array).permute(2, 0, 1)), inputs[1]
+        return super().forward(*inputs)
+
+
 class CocoDetection(torchvision.datasets.CocoDetection):
     """COCO detection dataset with optional sparse-to-contiguous category ID remapping.
 
@@ -254,7 +270,23 @@ class CocoDetection(torchvision.datasets.CocoDetection):
         # Override torchvision's RGB-forcing loader so imagery with an appended
         # motion/flow channel (saved as 4-channel RGBA) keeps all its channels.
         # Standard 3-channel imagery is still returned as RGB.
-        path = self.coco.loadImgs(id)[0]["file_name"]
+        info = self.coco.loadImgs(id)[0]
+        image = self._open_frame(info["file_name"])
+        context_files = info.get("temporal_files")
+        if not context_files:
+            return image
+
+        # Video sample: stack [reference, context...] along the channel axis. PIL cannot hold
+        # more than 4 channels, so the stack travels through the transforms as an HWC array.
+        reference = np.asarray(image)
+        frames = [reference]
+        for context_file in context_files:
+            frame = np.asarray(self._open_frame(context_file).convert(image.mode))
+            # A context frame of another size cannot be fused; fall back to the reference.
+            frames.append(frame if frame.shape == reference.shape else reference)
+        return np.concatenate(frames, axis=2)
+
+    def _open_frame(self, path: str) -> Image.Image:
         image = Image.open(str(Path(self.root) / path))
         if image.mode in ("RGBA", "LA", "CMYK") or (
             image.mode == "P" and "transparency" in image.info
@@ -387,7 +419,7 @@ class ConvertCoco(object):
         self.num_keypoints = num_keypoints
 
     def __call__(self, image: Image.Image, target: Dict[str, Any]) -> Tuple[Image.Image, Dict[str, Any]]:
-        w, h = image.size
+        w, h = image_wh(image)
 
         image_id = target["image_id"]
         image_id = torch.tensor([image_id])
@@ -634,7 +666,7 @@ def make_coco_transforms(
     Raises:
         ValueError: If ``image_set`` is not one of the recognised split names.
     """
-    to_image = ToImage()
+    to_image = _ToImage()
     to_float = ToDtype(torch.float32, scale=True)
     normalize = Normalize()
 
@@ -723,7 +755,7 @@ def make_coco_transforms_square_div_64(
     Returns:
         A ``Compose`` object containing the composed image transforms appropriate for the specified ``image_set``.
     """
-    to_image = ToImage()
+    to_image = _ToImage()
     to_float = ToDtype(torch.float32, scale=True)
     normalize = Normalize()
 
