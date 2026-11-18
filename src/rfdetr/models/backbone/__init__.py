@@ -69,6 +69,8 @@ def build_backbone(
     patch_size,
     num_windows,
     positional_encoding_size,
+    temporal_frames=1,
+    temporal_context_grad=False,
 ):
     """
     Useful args:
@@ -99,6 +101,8 @@ def build_backbone(
         patch_size=patch_size,
         num_windows=num_windows,
         positional_encoding_size=positional_encoding_size,
+        temporal_frames=temporal_frames,
+        temporal_context_grad=temporal_context_grad,
     )
 
     model = Joiner(backbone, position_embedding)

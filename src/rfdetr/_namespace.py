@@ -38,6 +38,8 @@ _MC_NAMESPACE_FIELDS = {
     "keypoint_head",
     "num_keypoints",
     "num_channels",
+    "temporal_frames",
+    "temporal_context_grad",
     "num_classes",
     "num_queries",
     "num_select",

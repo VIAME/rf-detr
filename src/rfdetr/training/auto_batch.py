@@ -360,7 +360,7 @@ def resolve_auto_batch_config(
         max_targets_per_image=max_targets_per_image,
         safety_margin=safety_margin,
         max_micro_batch=max_micro_batch,
-        num_channels=getattr(model_config, "num_channels", 3),
+        num_channels=getattr(model_config, "num_channels", 3) * getattr(model_config, "temporal_frames", 1),
     )
 
     use_ema = getattr(train_config, "use_ema", False)

@@ -107,6 +107,11 @@ class ModelConfig(BaseConfig):
     layer_norm: bool = True
     amp: bool = True
     num_channels: int = Field(default=3, ge=1)
+    # Video input: frames per sample, stacked along the channel axis with the reference frame first.
+    # num_channels stays the per-frame count; the backbone is shared and the frames are fused after the projector.
+    temporal_frames: int = Field(default=1, ge=1)
+    # Backpropagate through the context frames too (about temporal_frames x the activation memory).
+    temporal_context_grad: bool = False
     num_classes: int = 90
     pretrain_weights: Optional[str] = None
     # torch.device values are accepted at validation time and normalized to string.

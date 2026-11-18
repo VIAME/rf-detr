@@ -210,6 +210,10 @@ class RFDETR:
     _model_config_class: type[ModelConfig] = ModelConfig
     _train_config_class: type[TrainConfig] = TrainConfig
 
+    def _input_channels(self) -> int:
+        """Channels of one input tensor: per-frame channels times frames per sample."""
+        return int(self.model_config.num_channels) * int(getattr(self.model_config, "temporal_frames", 1) or 1)
+
     def __init__(self, **kwargs):
         self.model_config = self.get_model_config(**kwargs)
         self.maybe_download_pretrain_weights()
@@ -217,11 +221,16 @@ class RFDETR:
         self.callbacks = defaultdict(list)
 
         # repeat means and stds for non-rgb images
-        if self.model_config.num_channels != 3:
+        input_channels = self._input_channels()
+        if input_channels != 3:
             from itertools import cycle
 
-            self.means = [val for _, val in zip(range(self.model_config.num_channels), cycle(self.means))]
-            self.stds = [val for _, val in zip(range(self.model_config.num_channels), cycle(self.stds))]
+            # Cycles per frame too: stacked video frames repeat the per-frame statistics.
+            per_frame = self.model_config.num_channels
+            self.means = [val for _, val in zip(range(per_frame), cycle(self.means))]
+            self.stds = [val for _, val in zip(range(per_frame), cycle(self.stds))]
+            self.means = [val for _, val in zip(range(input_channels), cycle(self.means))]
+            self.stds = [val for _, val in zip(range(input_channels), cycle(self.stds))]
 
         self.model.inference_model = None
         self._is_optimized_for_inference = False
@@ -788,7 +797,7 @@ class RFDETR:
                         self.model.inference_model,
                         torch.randn(
                             batch_size,
-                            self.model_config.num_channels,
+                            self._input_channels(),
                             *as_pair(self.model.resolution),
                             device=self.model.device,
                             dtype=dtype,
@@ -1338,10 +1347,10 @@ class RFDETR:
                 raise ValueError(
                     "Image has pixel values below 0. Please ensure the image is normalized (scaled to [0, 1]).",
                 )
-            if img.shape[0] != self.model_config.num_channels:
+            if img.shape[0] != self._input_channels():
                 raise ValueError(
                     "Invalid tensor image shape. Tensor inputs to `predict()` must be in (C, H, W) format "
-                    f"with C matching the model configuration ({self.model_config.num_channels} channels). "
+                    f"with C matching the model configuration ({self._input_channels()} channels). "
                     f"Received tensor with shape {tuple(img.shape)}."
                 )
             img_tensor = img

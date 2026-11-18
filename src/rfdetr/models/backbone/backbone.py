@@ -20,6 +20,7 @@ import torch.nn.functional as F  # noqa: N812
 from rfdetr.models.backbone.base import BackboneBase
 from rfdetr.models.backbone.dinov2 import DinoV2
 from rfdetr.models.backbone.projector import MultiScaleProjector
+from rfdetr.models.backbone.temporal import TemporalFusion
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.tensors import NestedTensor
 
@@ -51,6 +52,8 @@ class Backbone(BackboneBase):
         patch_size: int = 14,
         num_windows: int = 4,
         positional_encoding_size: int = 0,
+        temporal_frames: int = 1,
+        temporal_context_grad: bool = False,
     ):
         super().__init__()
         # an example name here would be "dinov2_base" or "dinov2_registers_windowed_base"
@@ -107,7 +110,43 @@ class Backbone(BackboneBase):
             rms_norm=rms_norm,
         )
 
+        # Video input: each sample stacks temporal_frames frames along the channel axis, reference first.
+        self.temporal_frames = int(temporal_frames)
+        self.temporal_context_grad = bool(temporal_context_grad)
+        self.temporal_fusion = None
+        if self.temporal_frames > 1:
+            self.temporal_fusion = TemporalFusion(out_channels, self.temporal_frames, len(scale_factors))
+
         self._export = False
+
+    def _encode(self, tensors: torch.Tensor):
+        """Encoder + projector; with temporal_frames > 1 the frames share both and are fused after."""
+        if self.temporal_fusion is None:
+            return self.projector(self.encoder(tensors))
+
+        frames_per_sample = self.temporal_frames
+        batch, stacked_channels, height, width = tensors.shape
+        if stacked_channels % frames_per_sample != 0:
+            raise ValueError(
+                f"Input has {stacked_channels} channels, which does not split into "
+                f"{frames_per_sample} frames. Stack the frames along the channel axis, reference first."
+            )
+        frames = tensors.reshape(batch, frames_per_sample, -1, height, width)
+
+        if self.temporal_context_grad or not torch.is_grad_enabled():
+            feats = self.projector(self.encoder(frames.flatten(0, 1)))
+            feats = [f.reshape(batch, frames_per_sample, *f.shape[1:]) for f in feats]
+        else:
+            # Context frames skip autograd: the encoder still trains through the reference
+            # frame, and activation memory stays near the single-frame cost.
+            ref = self.projector(self.encoder(frames[:, 0]))
+            with torch.no_grad():
+                ctx = self.projector(self.encoder(frames[:, 1:].flatten(0, 1)))
+            feats = [
+                torch.cat([r.unsqueeze(1), c.reshape(batch, frames_per_sample - 1, *c.shape[1:])], dim=1)
+                for r, c in zip(ref, ctx)
+            ]
+        return self.temporal_fusion(feats)
 
     def export(self):
         self._export = True
@@ -133,8 +172,7 @@ class Backbone(BackboneBase):
     def forward(self, tensor_list: NestedTensor):
         """"""
         # (H, W, B, C)
-        feats = self.encoder(tensor_list.tensors)
-        feats = self.projector(feats)
+        feats = self._encode(tensor_list.tensors)
         # x: [(B, C, H, W)]
         out = []
         for feat in feats:
@@ -145,8 +183,7 @@ class Backbone(BackboneBase):
         return out
 
     def forward_export(self, tensors: torch.Tensor):
-        feats = self.encoder(tensors)
-        feats = self.projector(feats)
+        feats = self._encode(tensors)
         out_feats = []
         out_masks = []
         for feat in feats:
